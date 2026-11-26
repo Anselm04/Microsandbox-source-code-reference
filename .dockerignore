@@ -1,0 +1,41 @@
+# Folders to ignore
+build/
+ignore/
+vendor/
+.git/
+.github/
+.menv/
+.vscode/
+.claude/
+assets/
+examples/**/rootfs-alpine/
+examples/**/qcow2-alpine/
+examples/**/sample-images/
+sdk/**/node_modules/
+sdk/python/.venv/
+sdk/**/dist/
+
+# Temporary and cache files
+**/*.o
+**/*.a
+**/*.so
+**/*.dylib
+**/*.tmp
+**/*.temp
+**/.DS_Store
+**/Thumbs.db
+**/*.swp
+**/*.swo
+target/
+**/target/
+
+# Specific files that aren't needed
+**/*.log
+**/*.md
+**/*.yaml
+**/*.yml
+**/*.sh
+**/*.entitlements
+**/*.env
+**/*.example
+**/*.test

@@ -1,0 +1,842 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "name": "microsandbox",
+  "logo": {
+    "light": "/images/microsandbox-banner-light.svg",
+    "dark": "/images/microsandbox-banner-dark.svg",
+    "href": "https://microsandbox.dev"
+  },
+  "favicon": "/logo/favicon.png",
+  "colors": {
+    "primary": "#BF84FE",
+    "light": "#BF84FE",
+    "dark": "#BF84FE"
+  },
+  "thumbnails": {
+    "appearance": "dark",
+    "background": "/images/og-background.png"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/superradcompany/microsandbox"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "icon": "rocket",
+            "pages": [
+              "getting-started/introduction",
+              "getting-started/quickstart",
+              "getting-started/managed-cloud",
+              "getting-started/agents"
+            ]
+          },
+          {
+            "group": "Sandboxes",
+            "icon": "box",
+            "pages": [
+              "sandboxes/overview",
+              "sandboxes/lifecycle",
+              "sandboxes/commands",
+              "sandboxes/filesystem",
+              "sandboxes/secrets",
+              "images/overview",
+              "sandboxes/volumes",
+              "sandboxes/services",
+              "sandboxes/ssh",
+              "sandboxes/snapshots",
+              "sandboxes/tuning",
+              "sandboxes/labels",
+              "sandboxes/logs",
+              "sandboxes/metrics",
+              "sandboxes/bootstrap"
+            ]
+          },
+          {
+            "group": "Networking",
+            "icon": "network-wired",
+            "pages": [
+              "networking/overview",
+              "networking/tls",
+              "networking/dns",
+              "networking/outbound-proxy",
+              "networking/host-sockets"
+            ]
+          },
+          {
+            "group": "Deep dive",
+            "icon": "gauge",
+            "pages": [
+              "operations/configuration",
+              "observability/msb-metrics",
+              "sandboxes/optimization"
+            ]
+          },
+          {
+            "group": "Troubleshooting",
+            "icon": "screwdriver-wrench",
+            "pages": [
+              "troubleshooting/linux",
+              "troubleshooting/macos",
+              "troubleshooting/windows"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "SDKs & CLI",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "icon": "flag",
+            "pages": [
+              "sdk/overview",
+              "sdk/setup",
+              "getting-started/versions",
+              "sdk/errors",
+              "configuration"
+            ]
+          },
+          {
+            "group": "SDKs",
+            "icon": "code",
+            "pages": [
+              {
+                "group": "TypeScript",
+                "icon": "js",
+                "expanded": false,
+                "pages": [
+                  "sdk/typescript/sandbox",
+                  "sdk/typescript/execution",
+                  "sdk/typescript/ssh",
+                  "sdk/typescript/filesystem",
+                  "sdk/typescript/volumes",
+                  "sdk/typescript/services",
+                  "sdk/typescript/networking",
+                  "sdk/typescript/proxies",
+                  "sdk/typescript/vsock",
+                  "sdk/typescript/secrets",
+                  "sdk/typescript/snapshots",
+                  "sdk/typescript/images",
+                  "sdk/typescript/agent-client"
+                ]
+              },
+              {
+                "group": "Rust",
+                "icon": "rust",
+                "expanded": false,
+                "pages": [
+                  "sdk/rust/sandbox",
+                  "sdk/rust/configuration",
+                  "sdk/rust/execution",
+                  "sdk/rust/ssh",
+                  "sdk/rust/filesystem",
+                  "sdk/rust/volumes",
+                  "sdk/rust/services",
+                  "sdk/rust/networking",
+                  "sdk/rust/proxies",
+                  "sdk/rust/vsock",
+                  "sdk/rust/secrets",
+                  "sdk/rust/snapshots",
+                  "sdk/rust/images",
+                  "sdk/rust/agent-client"
+                ]
+              },
+              {
+                "group": "Python",
+                "icon": "python",
+                "expanded": false,
+                "pages": [
+                  "sdk/python/sandbox",
+                  "sdk/python/execution",
+                  "sdk/python/ssh",
+                  "sdk/python/filesystem",
+                  "sdk/python/volumes",
+                  "sdk/python/services",
+                  "sdk/python/networking",
+                  "sdk/python/proxies",
+                  "sdk/python/vsock",
+                  "sdk/python/secrets",
+                  "sdk/python/snapshots",
+                  "sdk/python/images",
+                  "sdk/python/agent-client"
+                ]
+              },
+              {
+                "group": "Go",
+                "icon": "golang",
+                "expanded": false,
+                "pages": [
+                  "sdk/go/sandbox",
+                  "sdk/go/execution",
+                  "sdk/go/ssh",
+                  "sdk/go/filesystem",
+                  "sdk/go/volumes",
+                  "sdk/go/services",
+                  "sdk/go/images",
+                  "sdk/go/networking",
+                  "sdk/go/proxies",
+                  "sdk/go/vsock",
+                  "sdk/go/secrets",
+                  "sdk/go/snapshots",
+                  "sdk/go/agent-client"
+                ]
+              },
+              {
+                "group": "Ruby",
+                "icon": "gem",
+                "expanded": false,
+                "pages": [
+                  "sdk/ruby/sandbox",
+                  "sdk/ruby/configuration",
+                  "sdk/ruby/execution",
+                  "sdk/ruby/ssh",
+                  "sdk/ruby/filesystem",
+                  "sdk/ruby/volumes",
+                  "sdk/ruby/services",
+                  "sdk/ruby/networking",
+                  "sdk/ruby/vsock",
+                  "sdk/ruby/snapshots",
+                  "sdk/ruby/images"
+                ]
+              }
+            ]
+          },
+          {
+            "group": "CLI",
+            "icon": "terminal",
+            "pages": [
+              "cli/overview",
+              "cli/configuration",
+              "cli/sandbox-commands",
+              "cli/snapshot-commands",
+              "cli/ssh-commands",
+              "cli/volume-commands",
+              "cli/service-commands",
+              "cli/storage-commands",
+              "cli/image-commands",
+              "cli/registry-commands",
+              "cli/management"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Managed Cloud",
+        "groups": [
+          {
+            "group": "Managed Cloud",
+            "icon": "cloud",
+            "pages": [
+              "cloud/overview",
+              "cloud/connect",
+              "cloud/pricing",
+              "cloud/limitations"
+            ]
+          },
+          {
+            "group": "API Reference",
+            "icon": "book-open",
+            "pages": [
+              "api-reference/overview",
+              {
+                "group": "API keys",
+                "icon": "key",
+                "openapi": {
+                  "source": "/api-reference/openapi.json",
+                  "directory": "api-reference/endpoints"
+                },
+                "expanded": false
+              },
+              {
+                "group": "Personal tokens",
+                "icon": "user",
+                "openapi": {
+                  "source": "/api-reference/openapi.personal.json",
+                  "directory": "api-reference/personal"
+                },
+                "expanded": false
+              }
+            ],
+            "expanded": false
+          }
+        ]
+      },
+      {
+        "tab": "How-to guides",
+        "groups": [
+          {
+            "group": "How-to guides",
+            "pages": [
+              "how-to/overview",
+              {
+                "group": "Agents",
+                "expanded": false,
+                "icon": "robot",
+                "pages": [
+                  "how-to/agents/claude-code",
+                  "how-to/agents/codex",
+                  "how-to/agents/opencode",
+                  "how-to/agents/openclaw",
+                  "how-to/agents/goose",
+                  "how-to/agents/gemini-cli",
+                  "how-to/agents/hermes-agent",
+                  "how-to/agents/pi"
+                ]
+              },
+              {
+                "group": "Development",
+                "expanded": false,
+                "icon": "code",
+                "pages": [
+                  "how-to/development/vscode",
+                  "how-to/development/jetbrains-acp",
+                  "how-to/development/code-server",
+                  "how-to/development/jupyterlab",
+                  "how-to/development/vnc-desktop"
+                ]
+              },
+              {
+                "group": "Browser automation",
+                "expanded": false,
+                "icon": "globe",
+                "pages": [
+                  "how-to/browser-automation/browser-use",
+                  "how-to/browser-automation/playwright"
+                ]
+              },
+              {
+                "group": "Workloads",
+                "expanded": false,
+                "icon": "gears",
+                "pages": [
+                  "how-to/file-processing/ffmpeg",
+                  "how-to/file-processing/libreoffice-pdf",
+                  "how-to/plugins/terraform",
+                  "how-to/data/migration-rehearsal",
+                  "how-to/web-automation/scrapy",
+                  "how-to/automation/parallel-batch-jobs"
+                ]
+              },
+              {
+                "group": "Sandbox setup",
+                "expanded": false,
+                "icon": "box",
+                "pages": [
+                  "how-to/docker/docker-in-sandbox",
+                  "how-to/docker/local-images",
+                  "how-to/guest/systemd-services",
+                  "how-to/sandboxing/warm-workers"
+                ]
+              },
+              {
+                "group": "Deployment",
+                "expanded": false,
+                "icon": "server",
+                "pages": [
+                  "how-to/docker/docker",
+                  "how-to/sandboxing/kubernetes"
+                ]
+              },
+              {
+                "group": "Storage",
+                "expanded": false,
+                "icon": "database",
+                "pages": [
+                  "how-to/data/postgresql",
+                  "how-to/data/redis",
+                  "how-to/data/juicefs-s3"
+                ]
+              },
+              {
+                "group": "CI/CD",
+                "expanded": false,
+                "icon": "code-pull-request",
+                "pages": [
+                  "how-to/ci-cd/github-actions-runner",
+                  "how-to/ci-cd/pr-checks",
+                  "how-to/ci-cd/compose-tests",
+                  "how-to/ci-cd/preview-deploys",
+                  "how-to/automation/dependency-audits"
+                ]
+              },
+              {
+                "group": "Observability",
+                "expanded": false,
+                "icon": "chart-line",
+                "pages": [
+                  "how-to/metrics-backends/grafana-cloud",
+                  "how-to/metrics-backends/grafana-alloy",
+                  "how-to/metrics-backends/otel-collector",
+                  "how-to/metrics-backends/prometheus",
+                  "how-to/metrics-backends/datadog"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Enterprise",
+        "groups": [
+          {
+            "group": "Enterprise",
+            "pages": ["enterprise"]
+          },
+          {
+            "group": "Employee devices",
+            "pages": [
+              "enterprise/prepare-environment",
+              "enterprise/corporate-networking",
+              "enterprise/managed-configuration",
+              "enterprise/deploy-and-verify"
+            ]
+          },
+          {
+            "group": "Talk to us",
+            "pages": ["enterprise/contact"]
+          }
+        ]
+      },
+      {
+        "tab": "Security",
+        "pages": [
+          "security/overview",
+          "security/isolation",
+          "security/filesystem",
+          "security/network",
+          "security/secrets",
+          "security/hardening"
+        ]
+      },
+      {
+        "tab": "Changelog",
+        "groups": [
+          {
+            "group": "Migration guides",
+            "icon": "arrow-right-arrow-left",
+            "pages": [
+              "migrations/overview",
+              "migrations/v0.8",
+              "migrations/v0.7"
+            ]
+          },
+          {
+            "group": "Releases",
+            "icon": "tag",
+            "pages": [
+              "changelog/v0.8.0",
+              {
+                "group": "v0.7",
+                "expanded": false,
+                "pages": [
+                  "changelog/v0.7.16",
+                  "changelog/v0.7.15",
+                  "changelog/v0.7.14",
+                  "changelog/v0.7.13",
+                  "changelog/v0.7.12",
+                  "changelog/v0.7.11",
+                  "changelog/v0.7.10",
+                  "changelog/v0.7.9",
+                  "changelog/v0.7.8",
+                  "changelog/v0.7.7",
+                  "changelog/v0.7.6",
+                  "changelog/v0.7.5",
+                  "changelog/v0.7.4",
+                  "changelog/v0.7.3",
+                  "changelog/v0.7.2",
+                  "changelog/v0.7.1",
+                  "changelog/v0.7.0"
+                ],
+                "icon": "bolt"
+              },
+              {
+                "group": "Past updates",
+                "icon": "clock-rotate-left",
+                "pages": [
+                  {
+                    "group": "September 2026",
+                    "expanded": false,
+                    "pages": [
+                      "changelog/2026-09-25",
+                      "changelog/2026-09-11",
+                      "changelog/2026-09-04"
+                    ]
+                  },
+                  {
+                    "group": "August 2026",
+                    "expanded": false,
+                    "pages": [
+                      "changelog/2026-08-28",
+                      "changelog/2026-08-26",
+                      "changelog/2026-08-21",
+                      "changelog/2026-08-14",
+                      "changelog/2026-08-07"
+                    ]
+                  },
+                  {
+                    "group": "July 2026",
+                    "expanded": false,
+                    "pages": [
+                      "changelog/2026-07-31",
+                      "changelog/2026-07-24",
+                      "changelog/2026-07-17",
+                      "changelog/2026-07-10",
+                      "changelog/2026-07-05"
+                    ]
+                  },
+                  {
+                    "group": "June 2026",
+                    "expanded": false,
+                    "pages": [
+                      "changelog/2026-06-26",
+                      "changelog/2026-06-19",
+                      "changelog/2026-06-12",
+                      "changelog/2026-06-05"
+                    ]
+                  },
+                  {
+                    "group": "May 2026",
+                    "expanded": false,
+                    "pages": [
+                      "changelog/2026-05-29",
+                      "changelog/2026-05-22",
+                      "changelog/2026-05-15",
+                      "changelog/2026-05-01"
+                    ]
+                  },
+                  {
+                    "group": "April 2026",
+                    "expanded": false,
+                    "pages": [
+                      "changelog/2026-04-24",
+                      "changelog/2026-04-17",
+                      "changelog/2026-04-10",
+                      "changelog/2026-04-03"
+                    ]
+                  }
+                ],
+                "expanded": false
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "redirects": [
+    {
+      "source": "/getting-started/managed-cloud",
+      "destination": "/cloud/overview"
+    },
+    {
+      "source": "/operations/backends",
+      "destination": "/cloud/connect"
+    },
+    {
+      "source": "/cloud/compute-types",
+      "destination": "/cloud/pricing#standard-or-shared"
+    },
+    {
+      "source": "/cloud/supported-features",
+      "destination": "/cloud/limitations"
+    },
+    {
+      "source": "/getting-started/installation",
+      "destination": "/getting-started/versions"
+    },
+    {
+      "source": "/networking/security-model",
+      "destination": "/security/network"
+    },
+    {
+      "source": "/getting-started/windows-troubleshooting",
+      "destination": "/troubleshooting/windows"
+    },
+    {
+      "source": "/examples/kubernetes",
+      "destination": "/how-to/sandboxing/kubernetes"
+    },
+    {
+      "source": "/examples/automation/parallel-batch-jobs",
+      "destination": "/how-to/automation/parallel-batch-jobs"
+    },
+    {
+      "source": "/examples/browser-automation/browser-use",
+      "destination": "/how-to/browser-automation/browser-use"
+    },
+    {
+      "source": "/examples/web-automation/scrapy",
+      "destination": "/how-to/web-automation/scrapy"
+    },
+    {
+      "source": "/examples/overview",
+      "destination": "/how-to/overview"
+    },
+    {
+      "source": "/getting-started/backends",
+      "destination": "/cloud/connect"
+    },
+    {
+      "source": "/operations/backend-selection",
+      "destination": "/cloud/connect"
+    },
+    {
+      "source": "/observability/deep-dive",
+      "destination": "/observability/msb-metrics#metrics"
+    },
+    {
+      "source": "/optimization/overview",
+      "destination": "/sandboxes/optimization"
+    },
+    {
+      "source": "/sandboxes/cpu-placement",
+      "destination": "/sandboxes/optimization#cpu"
+    },
+    {
+      "source": "/images/disk-images",
+      "destination": "/images/overview#disk-images"
+    },
+    {
+      "source": "/networking/vsock",
+      "destination": "/networking/host-sockets"
+    },
+    {
+      "source": "/sandbox-config",
+      "destination": "/cli/configuration"
+    },
+    {
+      "source": "/recipes/use-cases/ai-coding-agent",
+      "destination": "/getting-started/agents"
+    },
+    {
+      "source": "/examples/use-cases/ai-coding-agent",
+      "destination": "/getting-started/agents"
+    },
+    {
+      "source": "/recipes",
+      "destination": "/how-to/overview"
+    },
+    {
+      "source": "/examples/data/juicefs-r2",
+      "destination": "/how-to/data/juicefs-s3"
+    },
+    {
+      "source": "/cloud/compatibility",
+      "destination": "/cloud/limitations"
+    },
+    {
+      "source": "/enterprise/offline-deployment",
+      "destination": "/enterprise/prepare-environment#prepare-offline-devices"
+    },
+    {
+      "source": "/recipes/overview",
+      "destination": "/how-to/overview"
+    },
+    {
+      "source": "/examples/agents/claude-code",
+      "destination": "/how-to/agents/claude-code"
+    },
+    {
+      "source": "/examples/agents/codex",
+      "destination": "/how-to/agents/codex"
+    },
+    {
+      "source": "/examples/agents/opencode",
+      "destination": "/how-to/agents/opencode"
+    },
+    {
+      "source": "/examples/agents/openclaw",
+      "destination": "/how-to/agents/openclaw"
+    },
+    {
+      "source": "/examples/agents/goose",
+      "destination": "/how-to/agents/goose"
+    },
+    {
+      "source": "/examples/agents/gemini-cli",
+      "destination": "/how-to/agents/gemini-cli"
+    },
+    {
+      "source": "/examples/agents/hermes-agent",
+      "destination": "/how-to/agents/hermes-agent"
+    },
+    {
+      "source": "/examples/agents/pi",
+      "destination": "/how-to/agents/pi"
+    },
+    {
+      "source": "/examples/development/vscode",
+      "destination": "/how-to/development/vscode"
+    },
+    {
+      "source": "/examples/development/jetbrains-acp",
+      "destination": "/how-to/development/jetbrains-acp"
+    },
+    {
+      "source": "/examples/development/code-server",
+      "destination": "/how-to/development/code-server"
+    },
+    {
+      "source": "/examples/development/jupyterlab",
+      "destination": "/how-to/development/jupyterlab"
+    },
+    {
+      "source": "/examples/development/vnc-desktop",
+      "destination": "/how-to/development/vnc-desktop"
+    },
+    {
+      "source": "/examples/ci-cd/github-actions-runner",
+      "destination": "/how-to/ci-cd/github-actions-runner"
+    },
+    {
+      "source": "/examples/ci-cd/pr-checks",
+      "destination": "/how-to/ci-cd/pr-checks"
+    },
+    {
+      "source": "/examples/ci-cd/compose-tests",
+      "destination": "/how-to/ci-cd/compose-tests"
+    },
+    {
+      "source": "/examples/ci-cd/preview-deploys",
+      "destination": "/how-to/ci-cd/preview-deploys"
+    },
+    {
+      "source": "/examples/automation/dependency-audits",
+      "destination": "/how-to/automation/dependency-audits"
+    },
+    {
+      "source": "/examples/sandboxing/warm-workers",
+      "destination": "/how-to/sandboxing/warm-workers"
+    },
+    {
+      "source": "/examples/browser-automation/playwright",
+      "destination": "/how-to/browser-automation/playwright"
+    },
+    {
+      "source": "/examples/file-processing/libreoffice-pdf",
+      "destination": "/how-to/file-processing/libreoffice-pdf"
+    },
+    {
+      "source": "/examples/file-processing/ffmpeg",
+      "destination": "/how-to/file-processing/ffmpeg"
+    },
+    {
+      "source": "/examples/docker/docker-in-sandbox",
+      "destination": "/how-to/docker/docker-in-sandbox"
+    },
+    {
+      "source": "/examples/docker/docker",
+      "destination": "/how-to/docker/docker"
+    },
+    {
+      "source": "/examples/docker/local-images",
+      "destination": "/how-to/docker/local-images"
+    },
+    {
+      "source": "/examples/guest/systemd-services",
+      "destination": "/how-to/guest/systemd-services"
+    },
+    {
+      "source": "/examples/plugins/terraform",
+      "destination": "/how-to/plugins/terraform"
+    },
+    {
+      "source": "/examples/data/juicefs-s3",
+      "destination": "/how-to/data/juicefs-s3"
+    },
+    {
+      "source": "/examples/data/postgresql",
+      "destination": "/how-to/data/postgresql"
+    },
+    {
+      "source": "/examples/data/migration-rehearsal",
+      "destination": "/how-to/data/migration-rehearsal"
+    },
+    {
+      "source": "/examples/data/redis",
+      "destination": "/how-to/data/redis"
+    },
+    {
+      "source": "/examples/metrics-backends/grafana-cloud",
+      "destination": "/how-to/metrics-backends/grafana-cloud"
+    },
+    {
+      "source": "/examples/metrics-backends/grafana-alloy",
+      "destination": "/how-to/metrics-backends/grafana-alloy"
+    },
+    {
+      "source": "/examples/metrics-backends/otel-collector",
+      "destination": "/how-to/metrics-backends/otel-collector"
+    },
+    {
+      "source": "/examples/metrics-backends/prometheus",
+      "destination": "/how-to/metrics-backends/prometheus"
+    },
+    {
+      "source": "/examples/metrics-backends/datadog",
+      "destination": "/how-to/metrics-backends/datadog"
+    },
+    {
+      "source": "/recipes/:slug*",
+      "destination": "/examples/:slug*"
+    },
+    {
+      "source": "/migrations/sdk-contexts",
+      "destination": "/migrations/v0.8#sdk-api-migration"
+    },
+    {
+      "source": "/migrations/sdk-distributions",
+      "destination": "/migrations/v0.8#sdk-distribution-migration"
+    },
+    {
+      "source": "/repairs/sandbox-storage",
+      "destination": "/migrations/v0.7#sandbox-storage-migration"
+    },
+    {
+      "source": "/repairs/file-permissions",
+      "destination": "/migrations/v0.7#repair-file-permissions"
+    },
+    {
+      "source": "/migrations/sandbox-storage",
+      "destination": "/migrations/v0.7#sandbox-storage-migration"
+    }
+  ],
+  "integrations": {
+    "posthog": {
+      "apiKey": "phc_mMJPTEQbarHl4JMTdFBcgw5v612dmQrvKv5mcK3KJ3O",
+      "apiHost": "https://g.microsandbox.dev"
+    }
+  },
+  "appearance": {
+    "default": "system"
+  },
+  "description": "Easy, fast microVMs for untrusted workloads, on your machine or in the cloud",
+  "seo": {
+    "organization": {
+      "id": "https://microsandbox.dev/#organization",
+      "name": "microsandbox",
+      "url": "https://microsandbox.dev",
+      "sameAs": [
+        "https://github.com/superradcompany/microsandbox",
+        "https://www.linkedin.com/company/superradcompany",
+        "https://x.com/microsandbox"
+      ]
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/superradcompany/microsandbox",
+      "discord": "https://discord.gg/T95Y3XnEAK",
+      "linkedin": "https://www.linkedin.com/company/superradcompany",
+      "x": "https://x.com/microsandbox"
+    }
+  }
+}

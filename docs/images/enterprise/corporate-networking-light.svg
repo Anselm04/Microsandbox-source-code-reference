@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 320" width="800" role="img" aria-labelledby="title description" font-family="ui-sans-serif, system-ui, sans-serif">
+<title id="title">Three network paths to configure</title>
+<desc id="description">Workload traffic crosses from the guest into host runtime policy and routing, with an optional SOCKS proxy. Guest DNS uses the host DNS forwarder. Image downloads originate in the host CLI or SDK. DNS and image downloads do not use the sandbox SOCKS proxy.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0 L10 5 L0 10Z" fill="#c4c4cc"/></marker></defs>
+<text x="83" y="27" text-anchor="middle" font-size="13" font-weight="600" fill="#606875">GUEST</text>
+<text x="370" y="27" text-anchor="middle" font-size="13" font-weight="600" fill="#606875">HOST</text>
+<text x="690" y="27" text-anchor="middle" font-size="13" font-weight="600" fill="#606875">DESTINATION</text>
+<path d="M165 42 V260" stroke="#c4c4cc" stroke-dasharray="5 5"/>
+<text x="83" y="85" text-anchor="middle" font-size="16" font-weight="600" fill="#1f2937">Workload</text>
+<path d="M139 80 L219 80" fill="none" stroke="#c4c4cc" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="224" y="51" width="292" height="58" rx="9" fill="#f3eaff" stroke="#7c3aed"/>
+<text x="370" y="76" text-anchor="middle" font-size="17" font-weight="600" fill="#7c3aed">Runtime policy + routing</text>
+<text x="370" y="97" text-anchor="middle" font-size="13" font-weight="400" fill="#606875">Optional SOCKS proxy</text>
+<path d="M522 80 L590 80" fill="none" stroke="#c4c4cc" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="690" y="85" text-anchor="middle" font-size="17" font-weight="600" fill="#1f2937">Services</text>
+<text x="83" y="166" text-anchor="middle" font-size="16" font-weight="600" fill="#1f2937">DNS query</text>
+<path d="M139 161 L219 161" fill="none" stroke="#c4c4cc" stroke-width="1.5" marker-end="url(#arrow)"/>
+<rect x="224" y="132" width="292" height="58" rx="9" fill="#faf9fc" stroke="#c4c4cc"/>
+<text x="370" y="157" text-anchor="middle" font-size="17" font-weight="600" fill="#1f2937">DNS forwarder</text>
+<text x="370" y="178" text-anchor="middle" font-size="13" font-weight="400" fill="#606875">Configured upstream</text>
+<path d="M522 161 L590 161" fill="none" stroke="#c4c4cc" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="690" y="166" text-anchor="middle" font-size="17" font-weight="600" fill="#1f2937">DNS resolver</text>
+<rect x="224" y="213" width="292" height="49" rx="9" fill="#faf9fc" stroke="#c4c4cc"/>
+<text x="370" y="243" text-anchor="middle" font-size="17" font-weight="600" fill="#1f2937">CLI / SDK image download</text>
+<path d="M522 237 L590 237" fill="none" stroke="#c4c4cc" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="690" y="243" text-anchor="middle" font-size="17" font-weight="600" fill="#1f2937">Image registry</text>
+<text x="400" y="292" text-anchor="middle" font-size="15" font-weight="400" fill="#606875">DNS and image downloads bypass the sandbox SOCKS proxy.</text>
+</svg>

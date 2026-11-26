@@ -1,0 +1,620 @@
+use microsandbox::sandbox::{
+    LogLevel as RustLogLevel, PullPolicy, RestoreBuilder, SecurityProfile,
+};
+use microsandbox::size::Mebibytes;
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
+
+use crate::error::to_napi_error;
+use crate::init_options_builder::JsInitOptionsBuilder;
+use crate::mount_builder::JsMountBuilder;
+use crate::network_builder::accept_queue_size;
+use crate::network_policy_builder::JsNetworkPolicyBuilder;
+use crate::outbound_proxy_builder::{JsOutboundProxyBuilder, take_selected_proxy};
+use crate::pull_progress::JsPullProgressStream;
+use crate::sandbox::Sandbox;
+use crate::sandbox_builder::{JsPullProgressCreate, parse_bind_addr};
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Snapshot restoration with explicit destination resource bindings.
+#[napi(js_name = "RestoreBuilder")]
+pub struct JsRestoreBuilder {
+    inner: Option<RestoreBuilder>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl JsRestoreBuilder {
+    pub(crate) fn from_builder(builder: RestoreBuilder) -> Self {
+        Self {
+            inner: Some(builder),
+        }
+    }
+}
+
+#[napi]
+impl JsRestoreBuilder {
+    /// Select an installed snapshot or archive; this does not start a VM.
+    #[napi(constructor)]
+    pub fn new(snapshot: String, reference_kind: Option<String>) -> Result<Self> {
+        // A remote path must stay a path even when it resembles a managed identifier.
+        let reference = match reference_kind.as_deref() {
+            None | Some("auto") => microsandbox::SnapshotReference::auto(snapshot),
+            Some("id") => microsandbox::SnapshotReference::id(snapshot),
+            Some("path") => microsandbox::SnapshotReference::path(snapshot),
+            Some(kind) => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown snapshot reference kind: {kind}"
+                )));
+            }
+        };
+        Ok(Self {
+            inner: Some(microsandbox::Sandbox::restore_ref(reference)),
+        })
+    }
+
+    /// Choose the destination sandbox name.
+    #[napi]
+    pub fn name(&mut self, name: String) -> Result<&Self> {
+        let inner = self.take_inner()?;
+        self.inner = Some(inner.name(name));
+        Ok(self)
+    }
+
+    /// Control retrieval of the snapshot's pinned base image without replacing it.
+    #[napi(js_name = "pullPolicy")]
+    pub fn pull_policy(&mut self, policy: String) -> Result<&Self> {
+        let policy = match policy.as_str() {
+            "always" => PullPolicy::Always,
+            "if-missing" => PullPolicy::IfMissing,
+            "never" => PullPolicy::Never,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "invalid pull policy `{other}`"
+                )));
+            }
+        };
+        self.inner = Some(self.take_inner()?.pull_policy(policy));
+        Ok(self)
+    }
+
+    /// Set the destination proxy before boot or resume, preserving captured guest identity.
+    #[napi(
+        ts_args_type = "configure: (arg: OutboundProxyBuilder) => HttpConnectProxyBuilder | Socks4ProxyBuilder | Socks5ProxyBuilder"
+    )]
+    pub fn proxy(
+        &mut self,
+        env: &Env,
+        configure: Function<ClassInstance<JsOutboundProxyBuilder>, Unknown<'_>>,
+    ) -> Result<&Self> {
+        let selector = JsOutboundProxyBuilder::new();
+        let selection = selector.selection();
+        configure.call(selector.into_instance(env)?)?;
+        let proxy = take_selected_proxy(&selection)?;
+        self.inner = Some(self.take_inner()?.proxy(|_| proxy));
+        Ok(self)
+    }
+
+    /// Default guest directory for new commands.
+    #[napi]
+    pub fn workdir(&mut self, value: String) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.workdir(value));
+        Ok(self)
+    }
+
+    /// Default shell for new commands; never executed by restoration.
+    #[napi]
+    pub fn shell(&mut self, value: String) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.shell(value));
+        Ok(self)
+    }
+
+    /// Entrypoint for future default workloads, not startup execution.
+    #[napi]
+    pub fn entrypoint(&mut self, value: Vec<String>) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.entrypoint(value));
+        Ok(self)
+    }
+
+    /// CMD for future default workloads; an empty array clears it.
+    #[napi]
+    pub fn cmd(&mut self, value: Vec<String>) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.cmd(value));
+        Ok(self)
+    }
+
+    /// Add an environment default for new commands, not captured processes.
+    #[napi]
+    pub fn env(&mut self, key: String, value: String) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.env(key, value));
+        Ok(self)
+    }
+
+    /// Add environment defaults; does not start a command.
+    #[napi]
+    pub fn envs(&mut self, values: std::collections::HashMap<String, String>) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.envs(values));
+        Ok(self)
+    }
+
+    /// Set destination CPUs; full execution restore requires the captured count.
+    #[napi]
+    pub fn cpus(&mut self, count: f64) -> Result<&Self> {
+        let count = crate::numeric::uint32(count, "count")?;
+        let count =
+            u8::try_from(count).map_err(|_| napi::Error::from_reason("cpus out of u8 range"))?;
+        self.inner = Some(self.take_inner()?.cpus(count));
+        Ok(self)
+    }
+
+    /// Set destination memory in MiB; full execution restore requires captured geometry.
+    #[napi]
+    pub fn memory(&mut self, mib: f64) -> Result<&Self> {
+        let mib = crate::numeric::uint32(mib, "mib")?;
+        self.inner = Some(self.take_inner()?.memory(Mebibytes::from(mib)));
+        Ok(self)
+    }
+
+    /// Set the CPU ceiling for disk boot; full resume requires the captured ceiling.
+    #[napi(js_name = "maxCpus")]
+    pub fn max_cpus(&mut self, count: f64) -> Result<&Self> {
+        let count = crate::numeric::uint32(count, "count")?;
+        let count = u8::try_from(count)
+            .map_err(|_| napi::Error::from_reason("max_cpus out of u8 range"))?;
+        self.inner = Some(self.take_inner()?.max_cpus(count));
+        Ok(self)
+    }
+
+    /// Set the memory ceiling in MiB; full resume requires the captured ceiling.
+    #[napi(js_name = "maxMemory")]
+    pub fn max_memory(&mut self, mib: f64) -> Result<&Self> {
+        let mib = crate::numeric::uint32(mib, "mib")?;
+        self.inner = Some(self.take_inner()?.max_memory(Mebibytes::from(mib)));
+        Ok(self)
+    }
+
+    /// Annotate the destination sandbox without changing its snapshot.
+    #[napi]
+    pub fn label(&mut self, key: String, value: String) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.label(key, value));
+        Ok(self)
+    }
+
+    /// Attach destination labels, replacing earlier values for matching keys.
+    #[napi]
+    pub fn labels(&mut self, labels: std::collections::HashMap<String, String>) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.labels(labels));
+        Ok(self)
+    }
+
+    /// Set guest PID 1 for disk boot. Full-memory resume rejects this request.
+    #[napi]
+    pub fn init(&mut self, cmd: String, args: Option<Vec<String>>) -> Result<&Self> {
+        self.inner = Some(
+            self.take_inner()?
+                .init_with(cmd, |init| init.args(args.unwrap_or_default())),
+        );
+        Ok(self)
+    }
+
+    /// Set guest PID 1, arguments and environment for disk boot only.
+    #[napi(js_name = "initWith")]
+    pub fn init_with(
+        &mut self,
+        env: &Env,
+        cmd: String,
+        configure: Function<
+            ClassInstance<JsInitOptionsBuilder>,
+            ClassInstance<JsInitOptionsBuilder>,
+        >,
+    ) -> Result<&Self> {
+        // Run the callback before consuming the destination builder so a thrown exception
+        // leaves it usable. The returned init builder is consumed exactly once.
+        let initial = JsInitOptionsBuilder::new().into_instance(env)?;
+        let mut returned = configure.call(initial)?;
+        let init = returned.take_inner_builder()?;
+        self.inner = Some(self.take_inner()?.init_with(cmd, |_| init));
+        Ok(self)
+    }
+
+    /// Set the guest hostname for disk boot; full-memory resume rejects replacement.
+    #[napi]
+    pub fn hostname(&mut self, hostname: String) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.hostname(hostname));
+        Ok(self)
+    }
+
+    /// Set only host-side network policy, without DNS, TLS, or guest bootstrap changes.
+    #[napi(js_name = "networkPolicyJson")]
+    pub fn network_policy_json(&mut self, json: String) -> Result<&Self> {
+        let value: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| napi::Error::from_reason(format!("invalid policy JSON: {e}")))?;
+        let fields = value
+            .as_object()
+            .ok_or_else(|| napi::Error::from_reason("restore network policy must be an object"))?;
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "default_egress" | "default_ingress" | "rules"))
+        {
+            return Err(napi::Error::from_reason(
+                "restore network policy accepts only default actions and rules",
+            ));
+        }
+        let policy = serde_json::from_value(value)
+            .map_err(|e| napi::Error::from_reason(format!("invalid policy JSON: {e}")))?;
+        self.inner = Some(self.take_inner()?.network_policy(policy));
+        Ok(self)
+    }
+
+    /// Set host-side policy from the existing policy builder.
+    #[napi(js_name = "networkPolicyFromBuilder")]
+    pub fn network_policy_from_builder(
+        &mut self,
+        builder: &JsNetworkPolicyBuilder,
+    ) -> Result<&Self> {
+        let policy = builder.build_rust_policy()?;
+        self.inner = Some(self.take_inner()?.network_policy(policy));
+        Ok(self)
+    }
+
+    /// @deprecated Use maxTcpConnections instead.
+    #[napi(js_name = "maxConnections")]
+    pub fn max_connections(&mut self, count: f64) -> Result<&Self> {
+        self.max_tcp_connections(count)
+    }
+
+    /// Cap destination host-side TCP connections; zero selects unlimited.
+    #[napi(js_name = "maxTcpConnections")]
+    pub fn max_tcp_connections(&mut self, count: f64) -> Result<&Self> {
+        let count = crate::numeric::safe_integer(count, "count")?;
+        self.inner = Some(self.take_inner()?.max_tcp_connections(count as usize));
+        Ok(self)
+    }
+
+    /// Cap destination host-side UDP sessions; zero selects unlimited.
+    #[napi(js_name = "maxUdpConnections")]
+    pub fn max_udp_connections(&mut self, count: f64) -> Result<&Self> {
+        let count = crate::numeric::safe_integer(count, "count")?;
+        self.inner = Some(self.take_inner()?.max_udp_connections(count as usize));
+        Ok(self)
+    }
+
+    /// Disable networking; full restore rejects removal of a captured NIC.
+    #[napi(js_name = "disableNetwork")]
+    pub fn disable_network(&mut self) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.disable_network());
+        Ok(self)
+    }
+
+    /// Set guest security for disk boot; explicit changes are rejected by full restore.
+    #[napi(ts_args_type = "profile: 'default' | 'restricted'")]
+    pub fn security(&mut self, profile: String) -> Result<&Self> {
+        let profile = match profile.as_str() {
+            "default" => SecurityProfile::Default,
+            "restricted" => SecurityProfile::Restricted,
+            _ => {
+                return Err(napi::Error::from_reason(
+                    "invalid security profile (expected default | restricted)",
+                ));
+            }
+        };
+        self.inner = Some(self.take_inner()?.security(profile));
+        Ok(self)
+    }
+
+    /// Explicit wall-clock policy; omission preserves the snapshot/default policy.
+    #[napi(js_name = "guestClock")]
+    pub fn guest_clock(&mut self, policy: String) -> Result<&Self> {
+        let policy = match policy.as_str() {
+            "sync" => microsandbox::sandbox::GuestClockPolicy::Sync,
+            "off" => microsandbox::sandbox::GuestClockPolicy::Off,
+            _ => return Err(napi::Error::from_reason("guest clock must be sync or off")),
+        };
+        self.inner = Some(self.take_inner()?.guest_clock(policy));
+        Ok(self)
+    }
+
+    /// Apply the destination host's maximum runtime in seconds; zero expires immediately.
+    #[napi(js_name = "maxDurationSeconds")]
+    pub fn max_duration(&mut self, secs: f64) -> Result<&Self> {
+        let seconds = crate::numeric::safe_integer(secs, "secs")?;
+        self.inner = Some(
+            self.take_inner()?
+                .max_duration(std::time::Duration::from_secs(seconds)),
+        );
+        Ok(self)
+    }
+
+    /// Apply the destination host's idle timeout in seconds; zero expires immediately.
+    #[napi(js_name = "idleTimeoutSeconds")]
+    pub fn idle_timeout(&mut self, secs: f64) -> Result<&Self> {
+        let seconds = crate::numeric::safe_integer(secs, "secs")?;
+        self.inner = Some(
+            self.take_inner()?
+                .idle_timeout(std::time::Duration::from_secs(seconds)),
+        );
+        Ok(self)
+    }
+
+    /// Accept missing restore resources without inheriting host resources.
+    #[napi]
+    pub fn allow_missing_resources(&mut self) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.allow_missing_resources());
+        Ok(self)
+    }
+
+    /// Explicitly reuse locally validated source resource bindings.
+    #[napi]
+    pub fn dangerously_inherit_resources(&mut self) -> Result<&Self> {
+        let inner = self.take_inner()?;
+        self.inner = Some(inner.dangerously_inherit_resources());
+        Ok(self)
+    }
+    /// Supply the base for omitted disk layers and RAM objects in a snapshot archive.
+    #[napi]
+    pub fn snapshot_base(&mut self, base: String) -> Result<&Self> {
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.snapshot_base(base));
+        Ok(self)
+    }
+
+    /// Cold-boot only the disk state carried by a full snapshot.
+    #[napi(js_name = "diskOnly")]
+    pub fn disk_only(&mut self) -> Result<&Self> {
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.disk_only());
+        Ok(self)
+    }
+
+    /// @deprecated Use cowMemory() instead.
+    #[napi]
+    pub fn forked(&mut self) -> Result<&Self> {
+        self.cow_memory()
+    }
+
+    /// Restore a full snapshot with private copy-on-write memory.
+    #[napi]
+    pub fn cow_memory(&mut self) -> Result<&Self> {
+        let prev = self
+            .inner
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("builder already consumed"))?;
+        self.inner = Some(prev.cow_memory());
+        Ok(self)
+    }
+
+    /// Validate authorized filesystem mappings strictly (default) or allow supported mismatches.
+    /// Neither policy inherits resources; unmapped filesystems remain unavailable.
+    #[napi(ts_args_type = "policy: 'strict' | 'relaxed'")]
+    pub fn external_mount_policy(&mut self, policy: String) -> Result<&Self> {
+        let policy = match policy.as_str() {
+            "strict" => microsandbox::sandbox::ExternalMountRestorePolicy::Strict,
+            "relaxed" => microsandbox::sandbox::ExternalMountRestorePolicy::Relaxed,
+            _ => {
+                return Err(napi::Error::from_reason(
+                    "external mount policy must be strict or relaxed",
+                ));
+            }
+        };
+        let previous = self.take_inner()?;
+        self.inner = Some(previous.external_mount_policy(policy));
+        Ok(self)
+    }
+
+    /// Override log verbosity: `"trace" | "debug" | "info" | "warn" | "error"`.
+    #[napi(js_name = "logLevel")]
+    pub fn log_level(&mut self, level: String) -> Result<&Self> {
+        let l = match level.as_str() {
+            "trace" => RustLogLevel::Trace,
+            "debug" => RustLogLevel::Debug,
+            "info" => RustLogLevel::Info,
+            "warn" => RustLogLevel::Warn,
+            "error" => RustLogLevel::Error,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "invalid log level `{other}`"
+                )));
+            }
+        };
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.log_level(l));
+        Ok(self)
+    }
+
+    /// Default running user.
+    #[napi]
+    pub fn user(&mut self, user: String) -> Result<&Self> {
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.user(user));
+        Ok(self)
+    }
+
+    /// Configure a volume mount via a callback. The callback receives a
+    /// `MountBuilder` already pre-bound to `guestPath`.
+    #[napi]
+    pub fn volume(
+        &mut self,
+        env: &Env,
+        guest_path: String,
+        configure: Function<ClassInstance<JsMountBuilder>, ClassInstance<JsMountBuilder>>,
+    ) -> Result<&Self> {
+        let initial = JsMountBuilder::new(guest_path.clone()).into_instance(env)?;
+        let mut returned = configure.call(initial)?;
+        let mount_builder = returned.take_inner_builder()?;
+        let prev = self.take_inner()?;
+        // The core's volume() signature is volume(guest_path, FnOnce(MountBuilder) -> MountBuilder).
+        // The MountBuilder we hand back already encodes the guest path
+        // (we constructed it that way above); the default supplied by
+        // the core is discarded.
+        self.inner = Some(prev.volume(guest_path, |_default| mount_builder));
+        Ok(self)
+    }
+
+    /// Publish a TCP port from host -> guest.
+    #[napi]
+    pub fn port(&mut self, host_port: f64, guest_port: f64) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
+        let h = u16::try_from(host_port)
+            .map_err(|_| napi::Error::from_reason("host port out of range"))?;
+        let g = u16::try_from(guest_port)
+            .map_err(|_| napi::Error::from_reason("guest port out of range"))?;
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.port(h, g));
+        Ok(self)
+    }
+
+    /// Publish a TCP port from host -> guest on a specific host bind address.
+    #[napi(js_name = "portBind")]
+    pub fn port_bind(&mut self, bind: String, host_port: f64, guest_port: f64) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
+        let bind = parse_bind_addr(&bind)?;
+        let h = u16::try_from(host_port)
+            .map_err(|_| napi::Error::from_reason("host port out of range"))?;
+        let g = u16::try_from(guest_port)
+            .map_err(|_| napi::Error::from_reason("guest port out of range"))?;
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.port_bind(bind, h, g));
+        Ok(self)
+    }
+
+    /// Publish a UDP port from host -> guest.
+    #[napi(js_name = "portUdp")]
+    pub fn port_udp(&mut self, host_port: f64, guest_port: f64) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
+        let h = u16::try_from(host_port)
+            .map_err(|_| napi::Error::from_reason("host port out of range"))?;
+        let g = u16::try_from(guest_port)
+            .map_err(|_| napi::Error::from_reason("guest port out of range"))?;
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.port_udp(h, g));
+        Ok(self)
+    }
+
+    /// Publish a UDP port from host -> guest on a specific host bind address.
+    #[napi(js_name = "portUdpBind")]
+    pub fn port_udp_bind(
+        &mut self,
+        bind: String,
+        host_port: f64,
+        guest_port: f64,
+    ) -> Result<&Self> {
+        let host_port = crate::numeric::uint32(host_port, "host_port")?;
+        let guest_port = crate::numeric::uint32(guest_port, "guest_port")?;
+        let bind = parse_bind_addr(&bind)?;
+        let h = u16::try_from(host_port)
+            .map_err(|_| napi::Error::from_reason("host port out of range"))?;
+        let g = u16::try_from(guest_port)
+            .map_err(|_| napi::Error::from_reason("guest port out of range"))?;
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.port_udp_bind(bind, h, g));
+        Ok(self)
+    }
+
+    /// Set the active inbound TCP cap; zero is unlimited. Omitted uses the runtime default.
+    #[napi(js_name = "maxInboundTcpConnections")]
+    pub fn max_inbound_tcp_connections(&mut self, value: f64) -> Result<&Self> {
+        let value = crate::numeric::safe_integer(value, "maxInboundTcpConnections")?;
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.max_inbound_tcp_connections(value as usize));
+        Ok(self)
+    }
+
+    /// Set the accept-queue depth for the child's published TCP listeners, 1..=2147483647.
+    #[napi(js_name = "tcpAcceptQueueSize")]
+    pub fn tcp_accept_queue_size(&mut self, size: f64) -> Result<&Self> {
+        let size = accept_queue_size(size).map_err(napi::Error::from_reason)?;
+        self.inner = Some(self.take_inner()?.tcp_accept_queue_size(size));
+        Ok(self)
+    }
+
+    /// Expose a host Unix stream socket or local Windows named pipe on a guest-to-host vsock port.
+    #[napi]
+    pub fn vsock(&mut self, host_path: String, port: f64) -> Result<&Self> {
+        let port = crate::numeric::uint32(port, "port")?;
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.vsock(host_path, port));
+        Ok(self)
+    }
+
+    /// Expose a host Unix datagram socket on a guest-to-host vsock port.
+    #[napi(js_name = "vsockDgram")]
+    pub fn vsock_dgram(&mut self, host_path: String, port: f64) -> Result<&Self> {
+        let port = crate::numeric::uint32(port, "port")?;
+        let prev = self.take_inner()?;
+        self.inner = Some(prev.vsock_dgram(host_path, port));
+        Ok(self)
+    }
+
+    /// Restore a detached sandbox and wait until ready.
+    ///
+    /// # Safety
+    /// The builder is consumed before suspension; callers must not reuse it.
+    #[napi]
+    pub async unsafe fn restore(&mut self) -> Result<Sandbox> {
+        let inner = self.take_inner()?;
+        Ok(Sandbox::from_rust(
+            inner.restore().await.map_err(to_napi_error)?,
+        ))
+    }
+
+    /// Restore with image, snapshot preparation and activation progress.
+    ///
+    /// # Safety
+    /// The builder is consumed before suspension; callers must not reuse it.
+    #[napi]
+    pub async unsafe fn restore_with_progress(&mut self) -> Result<JsPullProgressCreate> {
+        let (handle, task) = self
+            .take_inner()?
+            .restore_with_progress()
+            .map_err(to_napi_error)?;
+        Ok(JsPullProgressCreate {
+            stream: JsPullProgressStream::from_creation(handle),
+            abort: task.abort_handle(),
+            task: std::sync::Arc::new(tokio::sync::Mutex::new(Some(task))),
+        })
+    }
+}
+
+impl JsRestoreBuilder {
+    pub(crate) fn take_inner(&mut self) -> Result<RestoreBuilder> {
+        self.inner
+            .take()
+            .ok_or_else(|| napi::Error::from_reason("RestoreBuilder already consumed"))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use crate::network_builder::accept_queue_size;
+
+    #[test]
+    fn accept_queue_size_rejects_values_n_api_would_wrap_or_truncate() {
+        for value in [1.0, 4096.0, 2_147_483_647.0] {
+            assert_eq!(accept_queue_size(value).unwrap(), value as u32);
+        }
+        for value in [
+            0.0,
+            -1.0,
+            1.5,
+            4_294_967_297.0,
+            -4_294_967_295.0,
+            2_147_483_648.0,
+            f64::NAN,
+            f64::INFINITY,
+        ] {
+            assert!(accept_queue_size(value).is_err(), "{value}");
+        }
+    }
+}

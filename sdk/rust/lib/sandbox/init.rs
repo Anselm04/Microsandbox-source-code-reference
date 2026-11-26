@@ -1,0 +1,289 @@
+//! Guest init-handoff types for the sandbox boot path.
+//!
+//! When [`HandoffInit`] is set on a [`super::SandboxConfig`], agentd
+//! finishes its setup, forks, and the parent execve's into the
+//! configured init binary — typically `systemd`, but any init works.
+//! agentd continues as a normal process, serving host requests over
+//! virtio-serial.
+//!
+//! Users construct this via the builder methods on
+//! [`super::SandboxBuilder`]:
+//!
+//! ```ignore
+//! Sandbox::builder("dev")
+//!     .image("debian:bookworm")
+//!     .init("/lib/systemd/systemd")
+//!     .build().await?;
+//!
+//! Sandbox::builder("dev")
+//!     .image("debian:bookworm")
+//!     .init_with("/lib/systemd/systemd", |i| {
+//!         i.args(["--unit=multi-user.target"])
+//!          .env("container", "microsandbox")
+//!     })
+//!     .build().await?;
+//! ```
+
+use std::collections::BTreeMap;
+
+use microsandbox_protocol::HANDOFF_INIT_AUTO;
+
+use super::environment_provenance::{EnvironmentEntry, EnvironmentOrigin};
+
+use crate::{MicrosandboxError, MicrosandboxResult};
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Builder for the `args` + `env` portion of [`HandoffInit`].
+///
+/// The cmd is supplied positionally to
+/// [`super::SandboxBuilder::init_with`], not stored in this builder —
+/// matching how [`super::ExecOptionsBuilder`] omits the command name.
+#[derive(Default)]
+pub struct InitOptionsBuilder {
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    origins: BTreeMap<String, EnvironmentEntry>,
+}
+
+/// Keep the init payload and its private origin evidence together through builder handoff.
+pub(crate) struct PreparedInitOptions {
+    pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) origins: BTreeMap<String, EnvironmentEntry>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use microsandbox_types::HandoffInit;
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl InitOptionsBuilder {
+    /// Append a single argv entry.
+    pub fn arg(mut self, arg: impl Into<String>) -> Self {
+        self.args.push(arg.into());
+        self
+    }
+
+    /// Append multiple argv entries.
+    pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Set an env var for the init process. Repeatable; later entries
+    /// with the same key shadow earlier ones inside the guest.
+    pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        let (key, value) = (key.into(), value.into());
+        self.origins.insert(
+            key.clone(),
+            EnvironmentEntry::new(&value, EnvironmentOrigin::Literal),
+        );
+        self.env.push((key, value));
+        self
+    }
+
+    /// Set multiple env vars at once.
+    pub fn envs(
+        mut self,
+        vars: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
+    ) -> Self {
+        for (key, value) in vars {
+            self = self.env(key, value);
+        }
+        self
+    }
+
+    /// CLI bridge retaining host origin for an already-resolved value without rereading it.
+    #[doc(hidden)]
+    pub fn host_env(self, key: String, value: String) -> Self {
+        let mut builder = self.env(&key, &value);
+        builder
+            .origins
+            .insert(key, EnvironmentEntry::new(&value, EnvironmentOrigin::Host));
+        builder
+    }
+
+    /// Return argv, environment and private origin evidence together.
+    pub(crate) fn build(self) -> PreparedInitOptions {
+        PreparedInitOptions {
+            args: self.args,
+            env: self.env,
+            origins: self.origins,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Validation
+//--------------------------------------------------------------------------------------------------
+
+/// Validate a populated [`HandoffInit`] before it is persisted into
+/// [`super::SandboxConfig`] or serialized into the typed guest bootstrap.
+///
+/// Constraints (each violation produces an `InvalidConfig` error):
+/// - `cmd` must be either an absolute path or the literal sentinel
+///   [`HANDOFF_INIT_AUTO`] (which agentd resolves at boot time).
+/// - `cmd` must not contain a NUL byte (CString incompatibility).
+/// - `cmd` must not contain `\` — it's a guest (Linux) path, where
+///   backslash is a valid filename byte but in practice always means
+///   the caller built it with host `Path` APIs on Windows.
+/// - Each argv entry must be free of `\0` (CString terminator).
+/// - Each env key must be non-empty and free of `=` and `\0`
+///   (POSIX disallows `=` in keys).
+/// - Each env value must be free of `\0`.
+pub(crate) fn validate(spec: &HandoffInit) -> MicrosandboxResult<()> {
+    validate_cmd(&spec.cmd)?;
+    for (i, arg) in spec.args.iter().enumerate() {
+        validate_arg(i, arg)?;
+    }
+    for (k, v) in &spec.env {
+        validate_env_pair("init env", k, v)?;
+    }
+    Ok(())
+}
+
+fn validate_cmd(s: &str) -> MicrosandboxResult<()> {
+    if s.contains('\0') {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "init cmd path must not contain a NUL byte: {s:?}"
+        )));
+    }
+    if s.contains('\\') {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "init cmd is a guest (Linux) path and must not contain '\\' — use '/' separators: {s:?}"
+        )));
+    }
+    // The sentinel `auto` is resolved guest-side; everything else must be a
+    // Linux guest absolute path, checked textually — never via `Path::is_absolute`,
+    // which follows host semantics and treats `/sbin/init` as relative on Windows.
+    if s != HANDOFF_INIT_AUTO && !s.starts_with('/') {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "init cmd must be an absolute path or `{HANDOFF_INIT_AUTO}`, got: {s:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_arg(index: usize, arg: &str) -> MicrosandboxResult<()> {
+    if arg.contains('\0') {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "init arg #{index} must not contain a NUL byte"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_env_pair(field: &str, key: &str, value: &str) -> MicrosandboxResult<()> {
+    if key.is_empty() {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "{field} key must not be empty"
+        )));
+    }
+    if key.contains('=') {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "{field} key {key:?} must not contain '='"
+        )));
+    }
+    if key.contains('\0') {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "{field} key {key:?} must not contain NUL"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "{field} value for {key:?} must not contain NUL"
+        )));
+    }
+    Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ok(cmd: &str, args: &[&str], env: &[(&str, &str)]) -> HandoffInit {
+        HandoffInit {
+            cmd: cmd.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed() {
+        let spec = ok(
+            "/lib/systemd/systemd",
+            &["--unit=multi-user.target"],
+            &[("LANG", "C.UTF-8"), ("PATH", "/usr/bin:/bin")],
+        );
+        assert!(validate(&spec).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_unit_separator_in_arg() {
+        let spec = ok("/sbin/init", &["foo\x1fbar"], &[]);
+        assert!(validate(&spec).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_equals_in_env_key() {
+        let spec = ok("/sbin/init", &[], &[("BAD=KEY", "value")]);
+        let err = validate(&spec).unwrap_err();
+        assert!(format!("{err}").contains("must not contain '='"));
+    }
+
+    #[test]
+    fn validate_rejects_empty_env_key() {
+        let spec = ok("/sbin/init", &[], &[("", "value")]);
+        let err = validate(&spec).unwrap_err();
+        assert!(format!("{err}").contains("must not be empty"));
+    }
+
+    #[test]
+    fn validate_accepts_unit_separator_in_env_value() {
+        let spec = ok("/sbin/init", &[], &[("KEY", "v\x1fbad")]);
+        assert!(validate(&spec).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_nul_in_arg() {
+        let spec = ok("/sbin/init", &["foo\0bar"], &[]);
+        let err = validate(&spec).unwrap_err();
+        assert!(format!("{err}").contains("NUL"));
+    }
+
+    #[test]
+    fn validate_accepts_auto_sentinel() {
+        let spec = ok("auto", &[], &[]);
+        assert!(validate(&spec).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_relative_cmd_path() {
+        let spec = ok("sbin/init", &[], &[]);
+        let err = validate(&spec).unwrap_err();
+        assert!(format!("{err}").contains("absolute path or `auto`"));
+    }
+
+    #[test]
+    fn validate_rejects_backslash_in_cmd() {
+        let spec = ok("/opt\\init", &[], &[]);
+        let err = validate(&spec).unwrap_err();
+        assert!(format!("{err}").contains("guest (Linux) path"));
+    }
+}

@@ -1,0 +1,105 @@
+import { ClientError, defaultLimits, type ByteTransport, type ConnectOptions, type RequestOptions } from "@microsandbox/protocol-client";
+import { closeTransport, ControlAttempt, controlError, validateTimeout } from "./attempt.js";
+import type { ControlDialer } from "./dialer.js";
+import { ControlClientError } from "./error.js";
+import { JsonReply, jsonRuntimeCapabilities, type ControlMode } from "./json-reply.js";
+import { encodeJsonRequest, type ExtendedLegacyControlRequest } from "./legacy-request.js";
+import { DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_SETUP_TIMEOUT_MS, type RuntimeCapabilities } from "./records.js";
+
+/** Shared internal owner used by the explicit adapter and automatic connection. */
+export class JsonSession {
+  readonly #closed = new AbortController();
+  readonly #transports = new Set<ByteTransport>();
+  readonly options: ConnectOptions;
+  constructor(readonly dialer: ControlDialer, options: ConnectOptions, readonly expectedMode?: ControlMode) {
+    this.options = { ...options, limits: defaultLimits(options.limits) };
+    validateTimeout(options.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS);
+  }
+  isClosed(): boolean { return this.#closed.signal.aborted; }
+  async close(): Promise<void> {
+    this.#closed.abort(new ClientError("closed"));
+    await Promise.all([...this.#transports].map(closeTransport));
+  }
+  async discover(attempt: ControlAttempt): Promise<{ mode: ControlMode; capabilities: RuntimeCapabilities }> {
+    const reply = await this.exchange(encodeJsonRequest({ op: "capabilities" }), attempt, attempt, 64 * 1024);
+    const mode = reply.discoveryMode();
+    return { mode, capabilities: jsonRuntimeCapabilities(reply.value.get("capabilities")) };
+  }
+  async operation(request: ExtendedLegacyControlRequest, options: RequestOptions = {}): Promise<JsonReply> {
+    // Validate and serialize before discovery so unsupported/invalid native
+    // requests cannot cause network I/O. Legacy batches have no framed-size cap.
+    const configurationBlockCapacity = (request.op === "checkpoint_create" || request.op === "disk_checkpoint_create") && request.retain_configuration_block_capacity === true;
+    const configurationExecLimits = (request.op === "checkpoint_create" || request.op === "disk_checkpoint_create") && request.retain_configuration_exec_limits === true;
+    const configurationFreezeResources = (request.op === "checkpoint_create" || request.op === "disk_checkpoint_create") && request.retain_configuration_freeze_resources === true;
+    const configurationStorage = (request.op === "checkpoint_create" || request.op === "disk_checkpoint_create") && request.retain_configuration_storage === true;
+    const configurationCapture = configurationBlockCapacity || configurationExecLimits || configurationFreezeResources || configurationStorage || (request.op === "checkpoint_create" || request.op === "disk_checkpoint_create") && request.retain_configuration === true;
+    // Discovery and mutation use different sockets: pin their runtime identity independently.
+    if (configurationCapture && !this.dialer.verifier) throw new ClientError("unsupported_operation");
+    const line = encodeJsonRequest(request);
+    const attempt = new ControlAttempt(options.requestTimeoutMs ?? this.options.limits?.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS, [options.signal, this.#closed.signal]);
+    let setup: ControlAttempt | undefined;
+    try {
+      setup = new ControlAttempt(Math.min(attempt.remaining(), this.options.setupTimeoutMs ?? DEFAULT_SETUP_TIMEOUT_MS), [attempt.signal]);
+      if (configurationCapture || (this.expectedMode && !this.dialer.verifier)) {
+        let mode: ControlMode;
+        try {
+          const discovered = await this.discover(setup);
+          mode = discovered.mode;
+          if (configurationCapture && (!discovered.capabilities.configuration_capture || (configurationStorage && !discovered.capabilities.configuration_storage) || (configurationBlockCapacity && !discovered.capabilities.configuration_block_capacity) || (configurationExecLimits && !discovered.capabilities.configuration_exec_limits) || (configurationFreezeResources && !discovered.capabilities.configuration_freeze_resources))) throw new ClientError("unsupported_operation");
+        }
+        catch (error) {
+          // Discovery is read-only. Its lost reply says nothing about admission
+          // of the prepared mutation, which has not been written.
+          const failure = controlError(error);
+          throw failure instanceof ClientError ? failure.withDelivery("not_sent") : failure;
+        }
+        if (this.expectedMode && mode !== this.expectedMode) throw new ControlClientError("runtime_changed");
+      }
+      return await this.exchange(line, attempt, setup);
+    } catch (error) {
+      await this.close();
+      throw controlError(error);
+    } finally { line.fill(0); setup?.dispose(); attempt.dispose(); }
+  }
+  private async exchange(line: Uint8Array, attempt: ControlAttempt, setup: ControlAttempt, maxReply?: number): Promise<JsonReply> {
+    let transport: ByteTransport | undefined, admitted = false;
+    const chunks: Uint8Array[] = [];
+    try {
+      if (this.isClosed()) throw new ClientError("closed");
+      transport = await setup.connect(this.dialer.connector);
+      this.#transports.add(transport);
+      if (this.dialer.verifier) await setup.run(() => this.dialer.verifier!.verifySession(setup.context));
+      attempt.check(); setup.check();
+      if (this.isClosed()) throw new ClientError("closed");
+      const owned = transport;
+      await attempt.run(() => {
+        admitted = true; // A rejected/partial write may already have reached the peer.
+        return owned.write(line);
+      });
+      let total = 0;
+      for (;;) {
+        const chunk = await attempt.run(() => owned.read(8192));
+        if (chunk === null) {
+          if (total === 0) throw new ClientError("peer_closed");
+          break; // The historical protocol also permits a nonempty EOF delimiter.
+        }
+        if (chunk.length === 0 || chunk.length > 8192) throw new ClientError("invalid_data");
+        const newline = chunk.indexOf(10), count = newline < 0 ? chunk.length : newline + 1;
+        total += count;
+        if (maxReply !== undefined && total > maxReply) throw new ClientError("invalid_data");
+        chunks.push(chunk.slice(0, count));
+        if (newline >= 0) break;
+      }
+      const raw = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) { raw.set(chunk, offset); offset += chunk.length; }
+      try { return new JsonReply(raw); } finally { raw.fill(0); }
+    } catch (error) {
+      const failure = controlError(error);
+      throw failure instanceof ClientError ? failure.withDelivery(admitted ? "unknown" : "not_sent") : failure;
+    } finally {
+      for (const chunk of chunks) chunk.fill(0);
+      if (transport) { this.#transports.delete(transport); await closeTransport(transport); }
+    }
+  }
+}

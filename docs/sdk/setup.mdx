@@ -1,0 +1,486 @@
+---
+title: Runtime setup
+"og:title": Microsandbox SDK runtime setup
+description: Prepare a local runtime before creating your first sandbox.
+icon: "download"
+---
+
+Local sandboxes need `msb` and `libkrunfw`. Call the setup helper once at application startup: it reuses an existing runtime or installs one when missing. Sandbox creation does not download it automatically. To use [our managed cloud](/cloud/overview), skip local runtime setup and connect with an API key.
+
+The setup helpers below describe full SDK distributions. Lean local providers exclude the runtime downloader: provision a compatible `msb`/`libkrunfw` pair separately and use runtime discovery. Lean remote providers need neither host runtime file. See [distribution migration](/migrations/v0.8#sdk-distribution-migration) for package selection and Go’s separate FFI setup.
+
+## Set up the runtime
+
+<CodeGroup>
+```typescript TypeScript
+import { ensureRuntime } from "microsandbox";
+
+const runtime = await ensureRuntime();
+console.log(runtime.msbPath, runtime.libkrunfwPath);
+```
+
+```rust Rust
+use microsandbox::{config::GlobalConfig, setup::{InstallOptions, ensure_runtime}};
+
+let runtime = ensure_runtime(&GlobalConfig::default(), InstallOptions::default()).await?;
+```
+
+```python Python
+from microsandbox import ensure_runtime
+
+runtime = await ensure_runtime()
+print(runtime.msb_path, runtime.libkrunfw_path)
+```
+
+```go Go
+import (
+    "fmt"
+    m "github.com/superradcompany/microsandbox/sdk/go"
+)
+
+runtime, err := m.EnsureRuntime(ctx, m.RuntimeConfig{}, m.InstallOptions{})
+if err != nil {
+    return err
+}
+fmt.Println(runtime.MSBPath, runtime.LibkrunfwPath)
+```
+
+```ruby Ruby
+require "microsandbox"
+
+Microsandbox.install unless Microsandbox.installed?
+```
+</CodeGroup>
+
+The default installation directory is `~/.microsandbox` (`%USERPROFILE%\.microsandbox` on Windows). Keep `msb` and `libkrunfw` from the same runtime bundle.
+
+### Choose a setup operation {#resolve-check-install-and-ensure}
+
+Use ensure for normal startup. The calls below are alternatives; choose the one your application needs.
+
+<CodeGroup>
+```typescript TypeScript
+import * as msb from "microsandbox";
+
+await msb.ensureRuntime();  // Reuse or install if missing.
+msb.resolveRuntime();       // Require an existing runtime; never install.
+msb.isRuntimeInstalled();   // Check availability; returns a boolean.
+await msb.installRuntime(); // Install from the selected source.
+```
+
+```rust Rust
+use microsandbox::{config::GlobalConfig, setup};
+
+let config = GlobalConfig::default();
+
+// Reuse or install if missing.
+setup::ensure_runtime(&config, Default::default()).await?;
+// Require an existing runtime; never install.
+setup::resolve_runtime(&config)?;
+// Check availability; returns a boolean.
+setup::is_runtime_installed(&config);
+// Install from the selected source.
+setup::install_runtime(&config, Default::default()).await?;
+```
+
+```python Python
+import microsandbox as msb
+
+await msb.ensure_runtime()  # Reuse or install if missing.
+msb.resolve_runtime()       # Require an existing runtime; never install.
+msb.is_runtime_installed()  # Check availability; returns a boolean.
+await msb.install_runtime() # Install from the selected source.
+```
+
+```go Go
+import m "github.com/superradcompany/microsandbox/sdk/go"
+
+config := m.RuntimeConfig{}
+options := m.InstallOptions{}
+
+// Reuse or install if missing. Returns (ResolvedRuntime, error).
+m.EnsureRuntime(ctx, config, options)
+// Require an existing runtime. Returns (ResolvedRuntime, error).
+m.ResolveRuntime(config)
+// Check availability; returns bool.
+m.IsRuntimeInstalled(config)
+// Install from the selected source. Returns (ResolvedRuntime, error).
+m.InstallRuntime(ctx, config, options)
+```
+```ruby Ruby
+require "microsandbox"
+
+Microsandbox.installed? # Check availability; returns a boolean.
+Microsandbox.install   # Install using the default source and options.
+
+# Reuse or install if missing:
+Microsandbox.install unless Microsandbox.installed?
+# Ruby does not expose resolve or per-call installation options.
+```
+</CodeGroup>
+
+Ensure does not repair incomplete installations or ignore invalid explicit paths.
+
+## How runtime selection works {#choose-a-runtime}
+
+The SDK checks these locations in order:
+
+It first checks **explicit paths**: environment variables, process-level setters, then configured paths. Next it checks the **runtime home**: configured `home`, then `MSB_HOME`, then `~/.microsandbox`. Finally it checks the **SDK package** for bundled binaries, when available.
+
+<Accordion title="Path resolution, backend lifetime, and runtime versions">
+
+A local backend captures its effective home, relative directory overrides, configured runtime paths, and registry CA certificate path when it is constructed. Later changes to the working directory or `MSB_HOME` do not move that backend's files. Construct a new backend to select another home.
+
+Relative host paths in global `config.json` and managed configuration resolve against the contributing file’s directory. Programmatic paths and environment defaults use the caller’s working directory.
+
+Process-level SDK runtime setters capture relative paths when registered; environment runtime overrides are captured during backend construction, below managed policy. Existing saved sandbox records retain their legacy relative-path interpretation without rewriting.
+
+A complete home installation wins over bundled Python and Node runtimes, even if its version differs from the SDK. Updating an SDK does not replace that installation. Go also reuses a complete home installation. [Managed runtime paths](/enterprise/deploy-and-verify#apply-configuration-updates) override user choices.
+
+</Accordion>
+
+To use a custom installation, set both `MSB_PATH` and `MSB_LIBKRUNFW_PATH` before constructing a backend. See [path overrides](/sdk/setup#override-runtime-paths) for SDK setters and precedence details.
+
+## Advanced setup
+
+### Inspect legacy storage
+
+Storage diagnostics require an explicit list of sandbox names or an explicit whole-home selection. They report readiness, blockers, candidate views, and estimated staging space without installing a runtime or migrating sandbox data. Running results are provisional; SQLite may maintain its normal WAL read-lock sidecars.
+
+- **Rust:** `setup::diagnose_storage(GlobalConfigPatch, StorageSelection)`; recover stopped storage with `Sandbox::recover_storage(name, StorageRecoveryOptions)`.
+- **Python:** `diagnose_storage(names, *, all_sandboxes=False, config=None)`; `Sandbox.recover_storage(name, ...)`.
+- **TypeScript:** `diagnoseStorage(selection, config?)`; `Sandbox.recoverStorage(name, options?)`.
+- **Go:** `DiagnoseStorage(ctx, config, selection)`; `RecoverStorage(ctx, name, options)`.
+- **Ruby:** `Microsandbox.diagnose_storage(names:, all_sandboxes:, home:)`; `Microsandbox::Sandbox.recover_storage(name, ...)`.
+
+Recovery never starts or stops a VM. macOS legacy recovery requires the explicit `legacy_writers_stopped` confirmation (`legacyWritersStopped` in TypeScript, `LegacyWritersStopped` in Go) under the maintenance conditions in the repair guide. Empty selections import or resume the validated current view; explicit candidate selection requires acknowledgement that it may omit later writes. See [sandbox storage repair](/migrations/v0.7#sandbox-storage-migration) for the CLI workflow and recovery limits.
+
+### Bring your own runtime
+
+Use an existing `msb` executable and its matching `libkrunfw` library instead of downloading a runtime at application startup. Install the pair with the [CLI installer](/getting-started/quickstart), or provision it yourself.
+
+Set both paths before starting your application. Replace these example paths with your installation:
+
+<CodeGroup>
+```bash Linux
+export MSB_PATH="/opt/microsandbox/bin/msb"
+export MSB_LIBKRUNFW_PATH="/opt/microsandbox/lib/libkrunfw.so.5"
+```
+
+```bash macOS
+export MSB_PATH="/opt/microsandbox/bin/msb"
+export MSB_LIBKRUNFW_PATH="/opt/microsandbox/lib/libkrunfw.dylib"
+```
+
+```powershell Windows
+$env:MSB_PATH = "C:\microsandbox\bin\msb.exe"
+$env:MSB_LIBKRUNFW_PATH = "C:\microsandbox\lib\libkrunfw.dll"
+```
+</CodeGroup>
+
+Use the [resolve helper](#resolve-check-install-and-ensure) to check that the pair is available without installing anything. These environment variables also select the runtime for subsequent sandbox operations; see [path overrides](#override-runtime-paths) for precedence.
+
+<Accordion title="SDK packaging and build options">
+
+All SDKs can use the runtime paths above. You still need to install the SDK itself, including its native bindings. The packaging details differ:
+
+<CodeGroup>
+```bash TypeScript
+# Keep optional dependencies: the platform package contains both the
+# bundled runtime and the required native addon.
+# --omit=optional removes that addon too.
+npm install microsandbox
+```
+
+```bash Rust
+# Embedding is opt-in. Disable the default Cargo-time runtime download:
+cargo add microsandbox --no-default-features --features local,net
+
+# These features still allow explicit setup::ensure_runtime() calls.
+```
+
+```bash Python
+# Wheels include the native extension and a bundled runtime.
+# The runtime paths above override the bundled runtime.
+python -m pip install --only-binary=:all: microsandbox
+```
+
+```bash Go
+# The module embeds its native FFI library and extracts it on first use.
+# Your msb and libkrunfw pair is separate from that library.
+go get github.com/superradcompany/microsandbox/sdk/go
+```
+
+```bash Ruby
+# The gem needs its native extension even with an existing runtime.
+# Installing a source gem requires a Rust toolchain (1.89+).
+gem install microsandbox
+```
+</CodeGroup>
+
+</Accordion>
+
+### Use a custom kernel
+
+If your workload needs additional Linux kernel features, build a custom `libkrunfw`, the library that bundles the guest kernel. This applies to local sandboxes; it does not change the managed cloud kernel.
+
+<Note>
+  Start from the `vendor/libkrunfw` revision pinned by your microsandbox release in our [libkrunfw fork](https://github.com/superradcompany/libkrunfw). It includes the kernel patches microsandbox relies on; an upstream build may not be compatible.
+</Note>
+
+1. Enable the required kernel options or apply your patches, then follow the [build instructions](https://github.com/superradcompany/libkrunfw#building) for your platform and architecture.
+2. Select the compatible `msb` executable and your rebuilt library before starting your application.
+
+For example, on Linux, replace these paths with your executable and custom library:
+
+<CodeGroup>
+```bash Linux
+export MSB_PATH="/opt/microsandbox/bin/msb"
+export MSB_LIBKRUNFW_PATH="/opt/custom-kernel/libkrunfw.so.5"
+```
+</CodeGroup>
+
+You can also use the [SDK path setters](#override-runtime-paths) before constructing a backend.
+
+Boot a fresh guest to use the new kernel. Running guests and full snapshots retain their existing kernel.
+
+### Offline installation
+
+Use a directory or archive source to install a pre-downloaded release bundle. To require an installation that already exists, call the resolve helper instead of ensure. See [installation examples and options](/sdk/setup#customize-installation) and [offline deployment](/enterprise/prepare-environment#prepare-offline-devices).
+
+### Embedded runtime
+
+If your SDK build includes an embedded runtime archive, you can install from it without downloading. Select the `embedded_archive` source in the [installation options](#customize-installation).
+
+Ensure reuses an existing runtime before extracting the archive. Resolve only finds an existing installation; it does not extract one.
+
+## Troubleshooting
+
+| Problem | What to do |
+| --- | --- |
+| Incomplete installation | Restore a matching executable and library. Setup does not repair a partial pair or fall back to bundled binaries. |
+| Invalid explicit path | Correct the override. Invalid paths do not fall through to another installation. |
+| Unexpected runtime version | Check explicit paths and the runtime home; both take precedence over bundled binaries. |
+| Feature unsupported by an older runtime | Upgrade the selected runtime. Updating the SDK alone may leave it unchanged. |
+| Embedded archive unavailable | Use a native SDK built with embedding, or choose a directory, archive, or download source. |
+
+For existing installations, see the [v0.7 migration guide](/migrations/v0.7) before upgrading a shared database. Helper details are available below.
+
+## API reference
+
+<AccordionGroup>
+
+<Accordion title="Customize installation" id="customize-installation">
+
+Per-call home and binary-path overrides layer on persisted global configuration. Environment binary-path overrides retain the highest priority.
+
+Use the directory source to provision a runtime from a flat release-bundle directory containing `msb` and `libkrunfw` side by side, without downloading:
+
+<CodeGroup>
+```typescript TypeScript
+import { installRuntime } from "microsandbox";
+
+const runtime = await installRuntime(
+  { home: "/opt/microsandbox" },
+  { source: "directory", sourcePath: "/opt/runtime-bundle" },
+);
+```
+
+```rust Rust
+use microsandbox::{
+    config::GlobalConfig,
+    setup::{InstallOptions, InstallSource, install_runtime},
+};
+
+let config = GlobalConfig { home: Some("/opt/microsandbox".into()), ..Default::default() };
+let runtime = install_runtime(&config, InstallOptions {
+    source: InstallSource::Directory("/opt/runtime-bundle".into()),
+    ..Default::default()
+}).await?;
+```
+
+```python Python
+from microsandbox import InstallOptions, RuntimeConfig, install_runtime
+
+runtime = await install_runtime(
+    RuntimeConfig(home="/opt/microsandbox"),
+    InstallOptions(source="directory", source_path="/opt/runtime-bundle"),
+)
+```
+
+```go Go
+runtime, err := m.InstallRuntime(ctx,
+    m.RuntimeConfig{Home: "/opt/microsandbox"},
+    m.InstallOptions{Source: m.InstallSourceDirectory, SourcePath: "/opt/runtime-bundle"},
+)
+if err != nil {
+    return err
+}
+```
+</CodeGroup>
+
+| Option | Behavior |
+|--------|----------|
+| Home and binary paths | Select the runtime home or explicit pair for this call. |
+| Source | `release_download` (default), `directory`, `archive`, or `embedded_archive`; directory and archive require a source path. |
+| Version | Select the release to download; defaults to the SDK's pinned release. |
+| Force | Replace a complete installation; never repair a partial pair. |
+| Verify | Verify the installed pair; enabled by default. |
+| Expected archive SHA-256 | Validate downloaded, local, or embedded archive bytes before publishing files. |
+
+An embedded source requires a native SDK built with an embedded runtime archive. If unavailable, explicit installation errors. Ensure still reuses an existing pair before acquisition, even when an embedded source is requested. To require a pre-provisioned runtime, call resolve directly. Each call uses its own configuration; Go no longer caches a process-wide successful setup result.
+
+</Accordion>
+
+<Accordion title="Override runtime paths" id="override-runtime-paths">
+
+Use process-wide SDK setters where available, or the environment variables below. See the language examples for per-call overrides. Call setters before creating a local sandbox. Automatic package discovery is a fallback and does not occupy the explicit setter slot. A public libkrunfw setter overrides the library for the selected executable, whether that executable comes from configured paths, home, or a package.
+
+<CodeGroup>
+```typescript TypeScript
+import { setRuntimeLibkrunfwPath } from "microsandbox";
+
+setRuntimeLibkrunfwPath("/opt/microsandbox/lib/libkrunfw.dylib");
+```
+
+```rust Rust
+use microsandbox::config::{set_sdk_libkrunfw_path, set_sdk_msb_path};
+
+// Process-wide configuration, not a SandboxBuilder method.
+// Set both paths before constructing the backend.
+set_sdk_msb_path("/opt/microsandbox/bin/msb");
+set_sdk_libkrunfw_path("/opt/microsandbox/lib/libkrunfw.dylib");
+```
+
+```python Python
+from microsandbox import set_libkrunfw_path
+
+set_libkrunfw_path("/opt/microsandbox/lib/libkrunfw.dylib")
+```
+
+```go Go
+// These overrides apply to this setup call.
+// Use MSB_PATH and MSB_LIBKRUNFW_PATH for subsequent sandbox operations.
+runtime, err := m.ResolveRuntime(m.RuntimeConfig{
+    MSBPath: "/opt/microsandbox/bin/msb",
+    LibkrunfwPath: "/opt/microsandbox/lib/libkrunfw.dylib",
+})
+if err != nil {
+    return err
+}
+```
+
+```ruby Ruby
+require "microsandbox"
+
+Microsandbox.set_runtime_libkrunfw_path("/opt/microsandbox/lib/libkrunfw.dylib")
+```
+</CodeGroup>
+
+
+Set runtime paths before constructing a backend. Each backend captures these settings; create a new backend to pick up changes. Environment variables work across the SDKs and take precedence over SDK-provided or user-configured paths. [Managed runtime paths](/enterprise/deploy-and-verify#apply-configuration-updates) take precedence over all three:
+
+| Variable | Purpose |
+|----------|---------|
+| `MSB_PATH` | Override the `msb` executable used by local SDK operations. |
+| `MSB_LIBKRUNFW_PATH` | Override the `libkrunfw` shared library loaded by the process. |
+| `MSB_AGENTD_PATH` | Override the Agentd guest executable read by `msb` before VM startup. |
+
+Set these process-wide overrides before creating any local sandbox. Prefer setting `MSB_PATH` and `MSB_LIBKRUNFW_PATH` together to select a matching pair. `MSB_PATH` alone may resolve a library adjacent to that executable; `MSB_LIBKRUNFW_PATH` alone is incomplete and fails closed. An incomplete explicit pair is not repaired by falling back to another installation. `MSB_AGENTD_PATH` takes precedence over global `paths.agentd`; the selected file is read eagerly and must name a compatible Linux ELF executable. These variables do not belong to an individual sandbox configuration.
+
+</Accordion>
+
+<Accordion title="Read a runtime version" id="read-a-runtime-version">
+
+TypeScript and Rust can read the Cargo package version embedded in an `msb` executable without running it. This is an optional inspection of the specified file; firmware and a complete runtime installation are not required.
+
+<CodeGroup>
+```typescript TypeScript
+import { resolveRuntimeVersion } from "microsandbox";
+
+const version = await resolveRuntimeVersion("/path/to/msb");
+```
+
+```rust Rust
+use microsandbox::setup::resolve_runtime_version;
+
+let version = resolve_runtime_version("/path/to/msb")?;
+```
+</CodeGroup>
+
+
+Executables without an embedded version return no version. Invalid executable metadata, malformed version sections and file access failures are errors. The reader supports ELF, PE and thin or universal Mach-O files, limits metadata reads to 4 MiB and version contents to 256 bytes, and never falls back to executing `msb --version`. Universal Mach-O slices must agree on the version, including section absence. The version identifies the build; it does not authenticate the executable or guarantee feature compatibility.
+
+Sandbox startup separately resolves a tested launch contract for the selected runtime. When embedded version metadata is absent, startup may run a bounded `msb --version` probe and cache the result for that native executable's identity within the SDK process. Replacing the executable invalidates that cache. This startup behavior does not change the read-only version inspection methods above.
+
+</Accordion>
+
+<Accordion title="Inspect Go versions" id="inspect-go-versions">
+
+Go setup helpers may load the SDK's embedded FFI library on first use; resolve does not install host runtime binaries.
+
+Go also exposes the SDK's pinned release version and the version reported by the loaded FFI library:
+
+<CodeGroup>
+```go Go
+sdkVersion := m.SDKVersion()
+
+runtimeVersion, err := m.RuntimeVersion()
+if err != nil {
+    return err
+}
+```
+</CodeGroup>
+
+
+`SDKVersion() string` does not load the FFI library. `RuntimeVersion() (string, error)` loads it automatically on first use and returns an error if loading fails.
+
+</Accordion>
+
+<Accordion title="Compatibility: setup APIs before v0.7" id="earlier-setup-apis">
+
+These APIs were replaced in v0.7.0. Use this mapping when upgrading from v0.6; new applications should use the current helpers above.
+
+| SDK | Replace | With |
+| --- | --- | --- |
+| TypeScript | `install` | `installRuntime` |
+| TypeScript | `isInstalled` | `isRuntimeInstalled` |
+| Python | `install` | `install_runtime` |
+| Python | `is_installed` | `is_runtime_installed` |
+| Go | `EnsureInstalled` | `EnsureRuntime` |
+| Go | `IsInstalled` | `IsRuntimeInstalled` |
+
+- **TypeScript:** replace the `setup` / `Setup` builder with runtime helpers accepting `RuntimeConfig` and `InstallOptions`.
+- **Go:** replace `SetupOption` with `RuntimeConfig` and `InstallOptions`. Replace `WithSkipDownload` with `ResolveRuntime` when installation must be avoided.
+
+Install and ensure now return the selected runtime paths. Rust's four helper names and Ruby's setup API are unchanged. See [setup operations](#resolve-check-install-and-ensure).
+
+</Accordion>
+
+</AccordionGroup>
+
+<span id="inspect-legacy-storage" />
+
+## Storage recovery
+
+Use storage diagnostics when an older sandbox cannot start because its storage needs repair. Select the sandbox names or the whole home explicitly. Diagnostics report problems and space requirements without migrating data; results for running sandboxes are provisional.
+
+Recovery never starts or stops a VM. macOS legacy recovery requires explicit confirmation that legacy writers are stopped, under the maintenance conditions in the migration guide. Empty selections import or resume the validated current view; explicit candidate selection requires acknowledgement that it may omit later writes. See [sandbox storage migration](/migrations/sandbox-storage) for the CLI workflow and recovery limits.
+
+<CodeGroup>
+```typescript TypeScript
+diagnoseStorage(selection, config?)
+```
+```python Python
+diagnose_storage(names, *, all_sandboxes=False, config=None)
+```
+```go Go
+DiagnoseStorage(ctx, config, selection)
+```
+```rust Rust
+setup::diagnose_storage(config, selection)
+```
+```ruby Ruby
+Microsandbox.diagnose_storage(names:, all_sandboxes:, home:)
+```
+</CodeGroup>

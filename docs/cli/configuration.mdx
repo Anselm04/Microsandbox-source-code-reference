@@ -1,0 +1,381 @@
+---
+title: Sandboxfile
+"og:title": Microsandbox CLI Sandboxfile reference
+description: Configure sandbox resources, networking, and storage with reusable microsandbox CLI YAML files.
+icon: "file-code"
+---
+
+Save reusable settings in a YAML file and load it with `--file Sandboxfile`. You can use another filename and include only the fields you need. Explicit CLI arguments override the file. See [configuration precedence](/operations/configuration#precedence) for global defaults.
+
+<Note>
+Common image, resource, lifecycle, environment, policy, secret, script, and patch fields work everywhere. Published ports, custom networking, flat OCI roots, full snapshots, replace behavior, and several runtime fields are unavailable on our managed cloud.
+</Note>
+
+<CodeGroup>
+```yaml Sandboxfile
+image: "python:3.12"
+cpus: 2
+memory: "1G"
+cmd: ["python", "--version"]
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Shell
+msb run --file Sandboxfile
+```
+</CodeGroup>
+
+This runs `python --version` in the sandbox. Use the same file with `msb create --file Sandboxfile --name agent` to create a named sandbox, or with `msb install --file Sandboxfile --name agent` to install it as a command.
+
+<Note>
+Common image, resource, lifecycle, environment, policy, secret, script, and patch fields work everywhere. Host-integrated networking, local rootfs forms, snapshots, replace behavior, and several runtime fields are unavailable on microsandbox cloud.
+</Note>
+
+## Combining files
+
+Start with `--file Sandboxfile` and add overrides in command-line order using `--file` or its alias `--conf`. An override file only needs the fields you want to change.
+
+<CodeGroup>
+```yaml local.yaml
+memory: "2G"
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Shell
+msb run --file Sandboxfile --conf local.yaml
+```
+</CodeGroup>
+
+The example keeps the image, CPUs, and command from `Sandboxfile` and uses 2 GiB of memory from `local.yaml`. An explicit flag such as `--memory 3G` overrides the value from both files. You can interleave [scoped config files](#scoped-config-files) in the same stack. See [configuration precedence](/operations/configuration#precedence) for global and managed settings.
+
+Relative host paths are resolved against the file that contains them. Paths inside a file listed by `patch_files` are resolved against that patch file. See [merge precedence](/operations/configuration#merge-precedence) for rules by value type.
+
+For sparse configuration without YAML, see [typed patches in the Rust reference](/sdk/rust/configuration#sandbox-configuration-patches), including merge behavior and migration from earlier patch types.
+
+## Sparse configuration
+
+Required fields are checked after merging files and CLI arguments. For example, supply the image separately from a network-only file:
+
+<CodeGroup>
+```yaml YAML
+# net-policy.yaml
+network:
+  policy: public
+  allow:
+    - "api.openai.com"
+  deny:
+    - "169.254.169.254"
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Shell
+msb run python --file net-policy.yaml
+```
+</CodeGroup>
+
+If neither the files nor the arguments provide an image, the command fails before pulling an image or creating sandbox state.
+
+## Scoped config files
+
+Scoped files contain one group of settings without its wrapper key. Unrelated fields are rejected.
+
+| Flag | Accepted fields |
+| --- | --- |
+| `--file PATH`, `--conf PATH` | Any sandbox configuration field |
+| `--net-conf PATH` | `policy`, `allow`, `deny`, `ports`, `dns`, `tls`, `strict`, `proxy`, `trust_host_cas`, `max_tcp_connections`, `max_udp_connections`, `max_inbound_tcp_connections`, `tcp_accept_queue_size` |
+| `--resource-conf PATH` | `cpus`, `memory`, `max_duration`, `idle_timeout`, `rlimits` |
+| `--runtime-conf PATH` | `workdir`, `shell`, `user`, `hostname`, `security`, `entrypoint`, `cmd`, `env`, `labels`, `init` |
+| `--fs-conf PATH` | `mounts`, `patch_files`, `patches` |
+| `--secret-conf PATH` | A map of secret names to secret definitions |
+| `--script-conf PATH` | A map of script names to shell snippets |
+
+For example, `--net-conf` expects this unwrapped document:
+
+<CodeGroup>
+```yaml YAML
+policy: public
+allow:
+  - "api.openai.com"
+deny:
+  - "169.254.169.254"
+```
+</CodeGroup>
+
+<CodeGroup>
+```bash Shell
+msb run python --net-conf net-policy.yaml
+```
+</CodeGroup>
+
+Pass a file containing the `network:` wrapper with `--file`. Use `--net-conf` for the fields inside that wrapper.
+
+`--net-conf` conflicts with `--net`, `--no-net`, `--net-rule`, and the `--net-default*` flags. When a root file supplies network policy, a policy flag can replace it. Rules passed with `--net-rule` are additive and evaluated before rules from the file.
+
+## Schema
+
+### Image and registry
+
+The common image form is a string. Local paths beginning with `.`, `..`, or `/` are resolved as bind roots or disk images; other strings are OCI references.
+
+<CodeGroup>
+```yaml YAML
+image: "python:3.12"
+pull_policy: missing       # missing | always | never
+registry:
+  username: "deploy"
+  password_env: "REGISTRY_TOKEN"
+```
+</CodeGroup>
+
+Use the object form to select a source explicitly:
+
+<CodeGroup>
+```yaml YAML
+image: { oci: "python:3.12", upper_size: "8G" }
+image: { snapshot: "prepared-agent" }
+image: { disk: "./ubuntu.qcow2", fstype: ext4 }
+image: { bind: "./rootfs" }
+```
+</CodeGroup>
+
+Exactly one source is allowed. Project layer references are not valid in single-sandbox configuration; consume a published layer as an OCI reference instead.
+
+### Resources and lifecycle
+
+<CodeGroup>
+```yaml YAML
+cpus: 2
+memory: "1G"
+max_duration: "12h"
+idle_timeout: "10m"
+rlimits:
+  - { resource: nofile, soft: 8192, hard: 16384 }
+  - { resource: nproc, soft: 512 }
+```
+</CodeGroup>
+
+When `hard` is omitted it equals `soft`.
+
+### Runtime
+
+<CodeGroup>
+```yaml YAML
+workdir: "/app"
+shell: "/bin/bash"
+user: "app"
+hostname: "api"
+security: restricted       # default | restricted
+entrypoint: ["/usr/bin/tini", "--"]
+cmd: ["python", "app.py"]
+env:
+  MODE: "production"
+labels:
+  team: "platform"
+init:
+  cmd: auto                # auto or an absolute guest path
+  args: []
+  env: {}
+```
+</CodeGroup>
+
+`cmd` is the default workload for `msb run`. `msb create` stores it without launching it.
+
+### Mounts
+
+A string mount is a config-relative bind mount using the same `SOURCE:TARGET[:OPTIONS]` option grammar as a bind passed to `-v/--volume`. Options include `ro`, `rw`, `noexec`, `nosuid`, `nodev`, `follow-root-symlinks`, `stat-virt=strict|relaxed|off`, `host-perms=private|mirror`, `quota=<size>`, and paired `uid=<N>,gid=<N>`:
+
+<CodeGroup>
+```yaml YAML
+mounts:
+  - "./src:/app"
+  - "./certs:/etc/app/certs:ro,noexec"
+  - "./workspace:/workspace:uid=1000,gid=1000"
+```
+</CodeGroup>
+
+Object mounts require exactly one source and a guest `target`:
+
+<CodeGroup>
+```yaml YAML
+mounts:
+  - bind: "./src"
+    target: "/app"
+    stat_virtualization: strict
+    host_permissions: private
+    uid: 1000
+    gid: 1000
+  - named: cache
+    target: "/var/cache/app"
+    create: ensure-exists
+  - tmpfs: { size: "256M" }
+    target: "/run"
+    noexec: true
+  - disk: "./seed.qcow2"
+    target: "/seed"
+    format: qcow2
+    fstype: ext4
+    readonly: true
+```
+</CodeGroup>
+
+All mount kinds accept `readonly`, `noexec`, `nosuid`, and `nodev`. `stat_virtualization`, `host_permissions`, and paired `uid`/`gid` apply only to bind and directory-backed named mounts. Ownership changes only the guest fallback for files without a per-file stat override; it does not change host inode ownership. Duplicate guest targets are rejected.
+
+### Rootfs patches
+
+Patch files run first in listed order, followed by inline patches:
+
+<CodeGroup>
+```yaml YAML
+patch_files:
+  - "./patches/common.yaml"
+patches:
+  - copy_file: { src: "./config.toml", dst: "/etc/app/config.toml", mode: "0644", replace: true }
+  - copy_dir: { src: "./certs", dst: "/etc/app/certs" }
+  - text: { path: "/etc/app/build.txt", content: "release", mode: "0644" }
+  - file: { path: "/etc/app/blob.bin", content_base64: "SGVsbG8=", mode: "0600" }
+  - mkdir: { path: "/var/cache/app", mode: "0755" }
+  - symlink: { target: "/etc/app/config.toml", link: "/etc/app/active.toml" }
+  - append: { path: "/etc/hosts", content: "10.0.0.5 db.internal\n" }
+  - remove: { path: "/etc/motd" }
+```
+</CodeGroup>
+
+A patch file has one top-level `patches` list using the same operations. File modes must be quoted four-digit octal strings.
+
+### Network
+
+Use a preset string for the common cases:
+
+<CodeGroup>
+```yaml YAML
+network: public             # none | public | open
+```
+</CodeGroup>
+
+`public`, the default, permits public internet access while blocking private, loopback, link-local, and metadata destinations. `none` denies ingress and egress. `open` is unrestricted.
+
+The object form adds rules and network services:
+
+<CodeGroup>
+```yaml YAML
+network:
+  policy: public
+  allow: ["api.openai.com", "*.stripe.com"]
+  deny: ["169.254.169.254"]
+  ports: ["8000:8000", "9100:9100/udp"]
+  dns:
+    rebind_protection: true
+    nameservers: ["1.1.1.1", "8.8.8.8"]
+    query_timeout: "5s"
+  tls:
+    enabled: true
+    bypass: ["*.internal.example"]
+    verify_upstream: true
+    block_quic: true
+  strict: true
+  trust_host_cas: false
+  max_tcp_connections: 256
+```
+</CodeGroup>
+
+A non-empty `allow` list implies deny-by-default egress. `strict` defaults to `true` and requires hostname-based allow rules to use an inspectable request authority. Plain HTTP exposes that authority in `Host`; HTTPS only exposes it when TLS interception is enabled and not bypassed. Without that visibility, strict mode denies HTTPS that would otherwise be allowed only by a hostname rule. Set `strict: false` to opt out. Top-level `ports` is shorthand for `network.ports`; when both are present, the lists are combined and duplicate host ports are rejected.
+
+Set `proxy` to an `http://IP:PORT`, `socks4://IP:PORT`, or `socks5://IP:PORT` URL. Authenticated proxies use an object:
+
+<CodeGroup>
+```yaml YAML
+network:
+  proxy:
+    url: socks5://127.0.0.1:1080
+    username: sandbox
+    password_env: SANDBOX_PROXY_PASSWORD
+```
+</CodeGroup>
+
+SOCKS4 accepts `user_id` instead of SOCKS5's `username` and `password_env`. SOCKS5 requires both authentication fields together. Literal password fields are rejected; `password_env` remains a destination environment reference until the existing credential resolver reads it. The same protocol and authentication checks apply to CLI flags and config files.
+
+A higher-priority file replaces the complete `proxy` value, including authentication; it cannot change the endpoint while inheriting credentials for the previous endpoint. The object therefore always requires `url`. A plain URL selects an unauthenticated proxy. An omitted or null `proxy` leaves lower-priority settings in place. Explicit `--proxy` and its authentication flags replace the file's complete proxy setting. These settings work for image-backed and snapshot-backed create/run. Older CLIs without this additive file field reject the configuration; existing files that omit it retain their behavior.
+
+Both `ports` lists accept inclusive, equal-length host and guest ranges, including bind addresses and `/tcp` or `/udp`:
+
+<CodeGroup>
+```yaml YAML
+network:
+  policy: open
+  ports:
+    - "0.0.0.0:10240-11264:10240-11264/udp"
+    - "8000-8002:80-82"
+```
+</CodeGroup>
+
+Ranges pair ports in ascending order and expand into individual mappings before launch. Endpoints must be from 1 to 65535; reversed, malformed, out-of-bounds, and unequal-length ranges are rejected. The first entry opens 1,025 host sockets, so provision host socket/file-descriptor capacity accordingly. See [Published ports](/cli/sandbox-commands#published-ports) for bind addresses and resource considerations.
+
+### Secrets
+
+Every secret requires a non-empty destination allowlist. When `value` is omitted, the host environment variable with the same name is used. An exact `${NAME}` value records `NAME` as the host-side source instead of copying its plaintext into durable config.
+
+<CodeGroup>
+```yaml YAML
+secrets:
+  OPENAI_API_KEY:
+    allow: ["api.openai.com"]
+  DATABASE_URL:
+    value: "${DB_DSN}"
+    allow: ["db.internal"]
+    substitution:
+      headers: false
+      query: false
+      body: true
+    passthrough: ["audit.internal"]
+    violation_action: block-and-terminate
+    require_tls_identity: true
+```
+</CodeGroup>
+
+`substitution` controls headers, query parameters, and request bodies independently; it defaults to headers only, and Basic authentication follows the header setting. On credential-allowed hosts that pass the secret's identity checks, disabled locations forward the placeholder unchanged. Other destinations must appear in `passthrough` or follow the violation action. `secret_violation_action` sets the sandbox-wide blocking action, while a per-secret `violation_action` overrides it. Declaring a secret enables TLS interception and DNS-rebind protection.
+
+### Scripts
+
+Scripts are named shell snippets installed as executables in `/.msb/scripts`, which is on `PATH`. The sandbox configuration's `shell` selects their shebang and defaults to `/bin/sh`.
+
+<CodeGroup>
+```yaml YAML
+shell: "/bin/bash"
+scripts:
+  start: "python app.py"
+  migrate: "alembic upgrade head"
+```
+</CodeGroup>
+
+Run a script like any other guest command:
+
+<CodeGroup>
+```bash Shell
+msb run --file Sandboxfile -- migrate
+```
+</CodeGroup>
+
+## Validation
+
+Sandbox configuration is data, not a templating language. The loader rejects unknown fields, duplicate keys, multiple YAML documents, anchors, aliases, merge keys, and custom tags. Bare YAML 1.1 booleans such as `yes`, `no`, `on`, and `off` are rejected. Quote modes, sizes, durations, ports, domains, image references, and other typed strings.
+
+Only `${NAME}` environment substitution is supported. Substituted variables must exist when the config is loaded; an exact secret `value: "${NAME}"` is the exception because it records a host-side source that is resolved when the sandbox starts. Shell-style operators such as `${NAME:-fallback}`, includes, templates, loops, and expressions are not supported.
+
+Project envelope fields such as `sandboxes`, `volumes`, and `layers`, plus per-project fields such as `depends_on`, are rejected in single-sandbox configuration.
+
+### UDP session limit
+
+Set `max_udp_connections` in the network configuration, or pass `--max-udp-connections 512`. The default is unlimited in single-tenant mode and 1,024 relay sessions in multi-tenant mode; zero explicitly selects unlimited. At capacity, new sessions evict the least recently active session.
+
+`max_connections` and `--max-connections` remain deprecated TCP-only aliases for `max_tcp_connections` and `--max-tcp-connections`. Specifying both TCP names in one configuration or command is an error. The UDP limit is independent.
+
+### Published-port accept queue size
+
+Set `tcp_accept_queue_size` in the network configuration, or pass `--tcp-accept-queue-size 4096`, to change how many not-yet-accepted connections each published TCP port queues on the host. The default is 1,024, and values from 1 to 2,147,483,647 are accepted; the host kernel caps the effective depth at its own `somaxconn`. See [Published ports](/cli/sandbox-commands#published-ports).
+
+### Published-port connection limit
+
+`max_inbound_tcp_connections` (or `--max-inbound-tcp-connections`) limits active inbound TCP connections across published ports; zero means unlimited. Omission uses the runtime default: unlimited in **0.7.9+**, or **256** in older versions. Unsupported overrides fail with an upgrade-required error. Also applies to restore and fork children. See [Published ports](/cli/sandbox-commands#published-ports).

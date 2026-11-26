@@ -1,0 +1,570 @@
+---
+title: Error handling
+"og:title": Microsandbox SDK errors and resource cleanup
+description: Handle sandbox errors and clean up resources across the microsandbox SDKs.
+icon: "triangle-exclamation"
+---
+
+Use typed errors to handle specific failures without parsing messages. The examples show each SDK’s matching and cleanup conventions.
+
+TypeScript exposes native failures such as `SnapshotNotFoundError`, `ExecFailedError` and `InvalidCursorError` as subclasses of `MicrosandboxError`. Each retains its code and original cause.
+
+## Matching errors
+
+<CodeGroup>
+```typescript TypeScript
+// Each error variant has a dedicated subclass; match it with instanceof.
+import {
+    ExecTimeoutError,
+    RuntimeError,
+    Sandbox,
+} from "microsandbox";
+
+const sb = await Sandbox.builder("worker")
+    .image("python")
+    .connectOrCreate();
+
+try {
+    const output = await sb.exec("python", ["script.py"]);
+    if (!output.success) {
+        console.error(`Failed (exit ${output.code}):`, output.stderr());
+    }
+} catch (e) {
+    if (e instanceof ExecTimeoutError) {
+        console.error(`Timed out after ${e.timeoutMs}ms`);
+    } else if (e instanceof RuntimeError) {
+        console.error("Runtime:", e.message);
+    } else {
+        throw e;
+    }
+}
+```
+
+```rust Rust
+// Match variants of the MicrosandboxError enum.
+use microsandbox::{MicrosandboxError, Sandbox};
+
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .connect_or_create()
+    .await?;
+
+match sb.exec("python", ["script.py"]).await {
+    Ok(output) if output.status().success => {
+        println!("{}", output.stdout()?);
+    }
+    Ok(output) => {
+        eprintln!("Exit {}: {}", output.status().code, output.stderr()?);
+    }
+    Err(MicrosandboxError::ExecTimeout(_)) => eprintln!("Timed out"),
+    Err(MicrosandboxError::Runtime(msg)) => eprintln!("Runtime: {msg}"),
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+# Match dedicated exception classes.
+from microsandbox import ExecTimeoutError, Sandbox
+
+sb = await Sandbox.connect_or_create("worker", image="python")
+
+try:
+    output = await sb.exec("python", ["script.py"])
+    if not output.success:
+        print(f"Exit {output.exit_code}: {output.stderr_text}")
+except ExecTimeoutError:
+    print("Timed out")
+```
+
+```go Go
+// *Error carries an ErrorKind; inspect it with IsKind or errors.As.
+import (
+    "context"
+    "errors"
+    "log"
+
+    m "github.com/superradcompany/microsandbox/sdk/go"
+)
+
+sb, err := m.ConnectOrCreateSandbox(ctx, "worker", m.WithImage("python"))
+if err != nil {
+    log.Fatal(err)
+}
+
+out, err := sb.Exec(ctx, "python", []string{"script.py"})
+switch {
+case err == nil && !out.Success():
+    log.Printf("exit %d: %s", out.ExitCode(), out.Stderr())
+case m.IsKind(err, m.ErrExecTimeout):
+    log.Println("timed out")
+case err != nil:
+    // errors.As for deeper inspection.
+    var me *m.Error
+    if errors.As(err, &me) {
+        log.Printf("kind=%s message=%s", me.Kind, me.Message)
+    }
+}
+```
+
+```ruby Ruby
+# Typed Error subclasses expose stable code strings.
+# Failures without a dedicated subclass still use Microsandbox::Error.
+require "microsandbox"
+
+sb = Microsandbox::Sandbox.connect_or_create("worker", image: "python")
+
+begin
+  output = sb.exec("python", ["script.py"])
+  warn "Exit #{output.exit_code}: #{output.stderr}" unless output.success?
+rescue Microsandbox::ExecTimeoutError => error
+  warn "Timed out: #{error.message}"
+rescue Microsandbox::Error => error
+  warn error.message
+end
+```
+</CodeGroup>
+
+## Spawn-time exec failures
+
+`exec()` distinguishes between:
+
+**A program that ran and exited non-zero**: the call returns an `ExecOutput` with a non-zero `code`. This is *not* an error in the SDK sense; it's a normal result.
+**A program that never started**: the binary doesn't exist, isn't executable, the working directory is unreachable, etc. The call returns or raises an SDK error.
+
+<CodeGroup>
+```typescript TypeScript
+try {
+    const output = await sb.exec("nonexistent");
+    // program ran, check output.success / output.code
+} catch (e) {
+    console.error("Program could not be started:", e);
+}
+```
+
+```rust Rust
+use microsandbox::{MicrosandboxError, protocol::exec::ExecFailureKind};
+
+match sb.exec("nonexistent", []).await {
+    Ok(output) => { /* program ran, check output.status() */ }
+    Err(MicrosandboxError::ExecFailed(payload)) => {
+        match payload.kind {
+            ExecFailureKind::NotFound => {
+                eprintln!("Binary not found on PATH: {}", payload.message);
+            }
+            ExecFailureKind::PermissionDenied => {
+                eprintln!("Not executable (chmod +x?): {}", payload.message);
+            }
+            kind => {
+                eprintln!("Spawn failed ({:?}): {}", kind, payload.message);
+            }
+        }
+        // payload.errno, payload.errno_name, payload.stage are also available
+    }
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+from microsandbox import MicrosandboxError
+
+try:
+    output = await sb.exec("nonexistent")
+    # If the program ran, check output.success and output.exit_code.
+except MicrosandboxError as e:
+    print(f"Program could not be started: {e}")
+```
+
+```go Go
+// Streaming exec surfaces spawn-failure detail via ExecEventFailed.
+h, err := sb.ExecStream(ctx, "nonexistent", nil)
+if err != nil {
+    return err
+}
+defer h.Close()
+
+for {
+    ev, err := h.Recv(ctx)
+    if err != nil {
+        return err
+    }
+    switch ev.Kind {
+    case m.ExecEventExited:
+        // Program ran; inspect ev.ExitCode.
+    case m.ExecEventFailed:
+        f := ev.Failure // *m.ExecFailure
+        switch f.Kind {
+        case "not_found":
+            log.Printf("Binary not on PATH: %s", f.Message)
+        case "permission_denied":
+            log.Printf("Not executable (chmod +x?): %s", f.Message)
+        default:
+            log.Printf("Spawn failed (%s): %s", f.Kind, f.Message)
+        }
+        // f.Errno (*int), f.ErrnoName, f.Path are also available.
+    case m.ExecEventDone:
+        return nil
+    }
+}
+```
+
+```ruby Ruby
+require "microsandbox"
+
+begin
+  output = sandbox.exec("nonexistent")
+  # If the program ran, check output.success? and output.exit_code.
+rescue Microsandbox::Error => e
+  warn "Program could not be started: #{e.message}"
+end
+```
+</CodeGroup>
+
+<Accordion title="Structured spawn-failure details">
+
+See [Rust failure kinds](/sdk/rust/execution#execfailurekind) and [Go execution failures](/sdk/go/execution#execfailure) for structured payloads. The handling examples above show how to inspect them.
+
+</Accordion>
+
+The CLI maps these kinds to POSIX-style exit codes: `127` for `NotFound`, `126` for `PermissionDenied` and `NotExecutable`, and `1` otherwise.
+
+## Name conflicts
+
+Creating a sandbox with a name that's already in use (and without `replace`) surfaces a typed error. Branch on it to decide how to recover, such as resuming the existing sandbox or regenerating the name.
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox, SandboxAlreadyExistsError } from "microsandbox";
+
+try {
+    const sb = await Sandbox.builder("worker").image("alpine").create();
+} catch (e) {
+    if (e instanceof SandboxAlreadyExistsError) {
+        console.error("sandbox already exists; resume or pass replace()");
+    } else {
+        throw e;
+    }
+}
+```
+
+```rust Rust
+use microsandbox::{MicrosandboxError, Sandbox};
+
+match Sandbox::builder("worker").image("alpine").create().await {
+    Ok(sb) => { /* ... */ }
+    Err(MicrosandboxError::SandboxAlreadyExists(name)) => {
+        eprintln!("sandbox {name} already exists; resume or pass .replace()");
+    }
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+from microsandbox import Sandbox, SandboxAlreadyExistsError
+
+try:
+    sb = await Sandbox.create("worker", image="alpine")
+except SandboxAlreadyExistsError:
+    print("sandbox already exists; resume or pass replace=True")
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("alpine"))
+if m.IsKind(err, m.ErrSandboxAlreadyExists) {
+    log.Println("sandbox already exists; resume or pass WithReplace()")
+}
+```
+
+```ruby Ruby
+begin
+  sb = Microsandbox::Sandbox.create("worker", image: "alpine")
+rescue Microsandbox::SandboxAlreadyExistsError
+  warn "sandbox already exists; use connect_or_create to reuse it or replace: true to recreate it"
+end
+```
+</CodeGroup>
+
+Use `connect_or_create` and its language-specific equivalents to reuse the existing sandbox without changing its configuration. Pass `replace()` / `replace=True` / `replace: true` / `--replace` / `WithReplace()` only when you intend to stop the existing sandbox and create a new one. See [Naming conflicts](/sandboxes/overview#naming-conflicts) for the grace-period setting.
+
+## Service changes
+
+<Tooltip tip="Available only on microsandbox cloud; on the local backend, every Service call fails with an unsupported error (`ErrCloudOnly` in Go)."><span className="msb-badge-cloud">Cloud-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Service create, update, enable, disable, and remove each send one request and never retry. Some invalid values fail before any request is sent.
+
+A missing Service, an unavailable slug, and a missing target sandbox have their own errors. Other refusals, and changes whose outcome is unknown, raise a Service error with one of these reasons: `service_quota_exceeded`, `sandbox_service_limit_exceeded`, `service_conflict`, `service_detached`, `target_unreachable`, `sandbox_not_running`, `service_changes_paused`, or `outcome_unknown`. `target_unreachable` and `service_changes_paused` carry a retry delay when the response sets `Retry-After`. Any other refusal uses the `other` reason and keeps the raw error code, HTTP status, and message. The [TypeScript](/sdk/typescript/services#serviceerror), [Rust](/sdk/rust/services#serviceerror), [Python](/sdk/python/services#serviceerror), [Go](/sdk/go/services#serviceerror), and [Ruby](/sdk/ruby/services#serviceerror) references give each reason's name and what to do.
+
+Every Microsandbox error from a Service change carries a change state. Errors where nothing could have changed, such as invalid values, refusals, missing resources, and unavailable slugs, report `unchanged`; other failures report `unknown`.
+
+If the change state is unknown, the change may have been applied. Get the Service and check it before trying again:
+
+<CodeGroup>
+```typescript TypeScript
+import { MicrosandboxError, Service } from "microsandbox";
+
+const svc = await Service.get("my-app");
+try {
+  await svc.update({ target: { sandbox: "new-sandbox", port: 8080 } });
+} catch (error) {
+  if (!(error instanceof MicrosandboxError) || error.changed !== "unknown") throw error;
+  const current = await Service.get("my-app");
+  console.log(current.target);
+}
+```
+
+```rust Rust
+use microsandbox::{ChangeState, Service};
+
+let svc = Service::get("my-app").await?;
+match svc.update(|u| u.target("new-sandbox", 8080)).await {
+    Err(error) if error.changed() == ChangeState::Unknown => {
+        let current = Service::get("my-app").await?;
+        println!("{:?}", current.target());
+    }
+    result => { result?; }
+}
+```
+
+```python Python
+from microsandbox import ChangeState, MicrosandboxError, Service, ServiceTarget
+
+svc = await Service.get("my-app")
+try:
+    await svc.update(target=ServiceTarget("new-sandbox", 8080))
+except MicrosandboxError as error:
+    if error.changed is not ChangeState.UNKNOWN:
+        raise
+    current = await Service.get("my-app")
+    print(current.target)
+```
+
+```go Go
+svc, err := m.GetService(ctx, "my-app")
+if err != nil {
+    return err
+}
+_, err = svc.Update(ctx, m.ServiceTarget{Sandbox: "new-sandbox", Port: 8080})
+var e *m.Error
+if errors.As(err, &e) && e.Changed == m.ChangeUnknown {
+    current, err := m.GetService(ctx, "my-app")
+    if err != nil {
+        return err
+    }
+    log.Println(current.Target())
+} else if err != nil {
+    return err
+}
+```
+
+```ruby Ruby
+svc = Microsandbox::Service.get("my-app")
+begin
+  target = Microsandbox::ServiceTarget.new("new-sandbox", 8080)
+  svc.update(target: target)
+rescue Microsandbox::Error => error
+  raise unless error.changed == "unknown"
+
+  current = Microsandbox::Service.get("my-app")
+  puts current.target
+end
+```
+</CodeGroup>
+
+Every reason except outcome unknown means nothing changed. A call cancelled after its request is sent can also leave the outcome unknown; get the Service to check.
+
+## When a sandbox object is stale
+
+A `Sandbox` keeps the ID of the exact sandbox it represents. If that sandbox is removed and the name is reused, lifecycle methods refuse to act on the replacement and return a typed error.
+
+<CodeGroup>
+```typescript TypeScript
+import { SandboxReplacedError } from "microsandbox";
+
+try {
+  await staleHandle.destroy();
+} catch (error) {
+  if (!(error instanceof SandboxReplacedError)) throw error;
+}
+```
+
+```rust Rust
+use microsandbox::MicrosandboxError;
+
+match stale_handle.destroy().await {
+    Err(MicrosandboxError::SandboxReplaced { expected, actual, .. }) => {
+        eprintln!("refusing stale operation: {expected} -> {actual}");
+    }
+    result => result?,
+}
+```
+
+```python Python
+from microsandbox import SandboxReplacedError
+
+try:
+    await stale_handle.destroy()
+except SandboxReplacedError:
+    pass
+```
+
+```go Go
+if err := staleHandle.Destroy(ctx); m.IsKind(err, m.ErrSandboxReplaced) {
+    log.Println("refusing stale lifecycle operation")
+}
+```
+
+```ruby Ruby
+# No dedicated stale-identity subclass yet: Error and the stable
+# "was replaced" message are the contract. Replacement is never acted on.
+begin
+  stale_handle.destroy
+rescue Microsandbox::Error => error
+  raise unless error.message.include?("was replaced")
+end
+```
+</CodeGroup>
+
+## Stop observation timeouts
+
+A graceful-stop timeout ends the wait. It does not force-kill the sandbox.
+
+On our managed cloud, an accepted stop keeps running on the server and may still complete.
+
+The timeout error means the accepted stop may still complete. See your [SDK error reference](/sdk/overview#reference) for the error type.
+
+After a managed cloud timeout, poll the sandbox status or call the wait-until-stopped method if you still need confirmation. Calling `request_stop` first is useful when the application wants to submit the stop and control its own observation deadline.
+
+## Modification not confirmed
+
+On managed cloud, an unconfirmed modification raises a not-confirmed error. The change may be saved without being in effect on the running sandbox, or its result is unknown. The message reads `the change did not complete as asked: <cause>`, where the cause says which is known and, when sending the same change again retries it, says so. If another change arrived in between, the resend overwrites it.
+
+A running or failed Cloud sandbox answers each live change with `live` or this error. A change reads `next start` only when the sandbox is stopped or the next-start policy is used. Until the server knows the result, usually within seconds, starting the sandbox is refused. Local sandboxes never return this error.
+
+## Sandbox start failures
+
+When a sandbox process exits before startup completes, creation returns or raises an SDK error.
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+try {
+    const sb = await Sandbox.builder("svc").image("alpine").create();
+} catch (e) {
+    console.error("Sandbox failed to start:", e);
+}
+```
+
+```rust Rust
+// BootStart exposes the failure stage and underlying message.
+use microsandbox::{MicrosandboxError, Sandbox};
+
+match Sandbox::builder("svc").image("alpine").create().await {
+    Ok(sb) => { /* ... */ }
+    Err(MicrosandboxError::BootStart { name, err }) => {
+        eprintln!("Sandbox {name:?} failed at stage {:?}: {}", err.stage, err.message);
+    }
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+from microsandbox import MicrosandboxError, Sandbox
+
+try:
+    sb = await Sandbox.create("svc", image="alpine")
+except MicrosandboxError as e:
+    print(f"Sandbox failed to start: {e}")
+```
+
+```go Go
+_, err := m.CreateSandbox(ctx, "svc", m.WithImage("alpine"))
+if err != nil {
+    log.Printf("sandbox failed to start: %v", err)
+}
+```
+
+```ruby Ruby
+require "microsandbox"
+
+begin
+  sandbox = Microsandbox::Sandbox.create("svc", image: "alpine")
+rescue Microsandbox::Error => e
+  warn "Sandbox failed to start: #{e.message}"
+end
+```
+</CodeGroup>
+
+Startup errors include guest initialization failures, such as a user missing from the image.
+
+The CLI prints the startup failure before any captured log output so the immediate cause stays visible.
+
+## Resource cleanup
+
+<Tooltip tip="TypeScript await using and Rust drop do not stop our managed cloud sandboxes, because cloud handles do not own the host process; call stop() or remove() explicitly."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Sandboxes hold compute resources, so release them when done.
+
+<CodeGroup>
+```typescript TypeScript
+async function runTemporary(): Promise<string> {
+    // Node 22+: prefer `await using`; it calls Sandbox.stop() on scope exit.
+    await using sb = await Sandbox.builder("temp")
+        .image("python")
+        .replace()
+        .create();
+
+    const out = await sb.exec("python", ["-c", "print('hello')"]);
+    return out.stdout();
+}
+```
+
+```rust Rust
+use microsandbox::Sandbox;
+
+// Sandbox implements Drop, so resources are released when `sb` goes out of scope.
+// For explicit control, call stop() or kill().
+{
+    let sb = Sandbox::builder("temp")
+        .image("python")
+        .create()
+        .await?;
+
+    let output = sb.exec("python", ["-c", "print('hello')"]).await?;
+} // sb is dropped here, resources are cleaned up
+```
+
+```python Python
+# Use async context manager: auto-kills and removes on exit.
+async with await Sandbox.create("temp", image="python") as sb:
+    output = await sb.exec("python", ["-c", "print('hello')"])
+    print(output.stdout_text)
+```
+
+```go Go
+// Pair each CreateSandbox with deferred Stop and Close.
+sb, err := m.CreateSandbox(ctx, "temp",
+    m.WithImage("python"),
+    m.WithReplace(),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer func() {
+    stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    _ = sb.Stop(stopCtx)
+    _ = sb.Close()
+}()
+
+out, _ := sb.Exec(ctx, "python", []string{"-c", "print('hello')"})
+fmt.Println(out.Stdout())
+```
+
+```ruby Ruby
+Microsandbox::Sandbox.with("temp", image: "python", replace: true) do |sandbox|
+  output = sandbox.exec("python", ["-c", "print('hello')"])
+  puts output.stdout
+end
+```
+</CodeGroup>

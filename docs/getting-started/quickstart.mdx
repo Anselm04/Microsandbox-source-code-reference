@@ -1,0 +1,220 @@
+---
+title: Quickstart
+description: Get a sandbox running in under 5 minutes.
+icon: "bolt"
+---
+
+## Run your first sandbox
+
+<CodeGroup>
+```bash npx
+npx microsandbox run debian
+```
+
+```bash macOS & Linux
+curl -fsSL https://install.microsandbox.dev | sh
+msb run debian
+```
+
+```powershell Windows
+irm https://install.microsandbox.dev/windows | iex
+msb run debian
+```
+</CodeGroup>
+
+<Tip>
+  Prefer short commands such as `msb run debian` for everyday use. `msb sandbox run debian` and `msb sbx run debian` do the same thing, with the same flags. Explore the full group with `msb sandbox --help`.
+</Tip>
+
+Having trouble with a local installation? Choose your platform for setup checks and fixes.
+
+<div className="msb-platform-strip msb-platform-strip-three" role="list" aria-label="Installation troubleshooting">
+  <a className="msb-platform-item msb-platform-link" role="listitem" href="/troubleshooting/linux">
+    <span className="msb-platform-icon"><Icon icon="linux" size={18} /></span>
+    <span className="msb-platform-copy"><strong>Linux</strong><span>glibc 2.28+ and KVM</span></span>
+  </a>
+  <a className="msb-platform-item msb-platform-link" role="listitem" href="/troubleshooting/macos">
+    <span className="msb-platform-icon"><Icon icon="apple" size={18} /></span>
+    <span className="msb-platform-copy"><strong>macOS</strong><span>Apple Silicon</span></span>
+  </a>
+  <a className="msb-platform-item msb-platform-link" role="listitem" href="/troubleshooting/windows">
+    <span className="msb-platform-icon"><Icon icon="windows" size={18} /></span>
+    <span className="msb-platform-copy"><strong>Windows</strong><span>10+ · WHP</span></span>
+  </a>
+</div>
+
+For release candidates or an exact version, see [Versions](/getting-started/versions).
+
+<Steps>
+  <Step title="Install microsandbox">
+    For application code, install the SDK for your language. For terminal workflows, use one of the CLI options above. These examples run locally without a cloud account or daemon. You can [switch to our managed cloud](#next-steps) when you need hosted compute.
+
+    <CodeGroup>
+    ```bash TypeScript
+    npm install microsandbox
+    ```
+
+    ```bash Rust
+    cargo add microsandbox
+    ```
+
+    ```bash Python
+    pip install microsandbox
+    ```
+
+    ```bash Go
+    go get github.com/superradcompany/microsandbox/sdk/go
+    ```
+
+    ```bash Ruby
+    gem install microsandbox
+    ```
+
+    </CodeGroup>
+
+    You can also provision the runtime with the CLI installer above or explicit SDK setup helpers. See [Runtime setup](/sdk/setup#bring-your-own-runtime) for Node's bundled binaries and Rust's opt-out options.
+
+    Check local virtualization support with:
+
+    <CodeGroup>
+    ```bash Shell
+    msb doctor
+    ```
+    </CodeGroup>
+
+    For platform-specific setup notes, see [Linux troubleshooting](/troubleshooting/linux), [macOS troubleshooting](/troubleshooting/macos), or [Windows troubleshooting](/troubleshooting/windows).
+  </Step>
+
+  <Step title="Run code in a sandbox">
+    Create an ephemeral sandbox, execute code inside it, and stop it when finished. Ephemeral sandboxes are removed after stopping, so the example can reuse the same name.
+
+    <CodeGroup>
+    ```bash CLI
+    msb run python -- python3 -c "print('Hello from a microVM!')"
+    ```
+
+    ```typescript TypeScript
+    import { Sandbox } from "microsandbox";
+
+    const sb = await Sandbox.builder("hello")
+        .image("python")
+        .memory(512)
+        .ephemeral(true)
+        .create();
+
+    try {
+        const output = await sb.exec("python", ["-c", "print('Hello from a microVM!')"]);
+        console.log(output.stdout()); // Hello from a microVM!
+    } finally {
+        await sb.stop();
+    }
+    ```
+
+    ```rust Rust
+    use std::error::Error;
+
+    use microsandbox::Sandbox;
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn Error>> {
+        let sb = Sandbox::builder("hello")
+            .image("python")
+            .memory(512)
+            .ephemeral(true)
+            .create()
+            .await?;
+
+        let output = sb.exec("python", ["-c", "print('Hello from a microVM!')"]).await?;
+        println!("{}", output.stdout()?); // Hello from a microVM!
+
+        sb.stop().await?;
+        Ok(())
+    }
+    ```
+
+    ```python Python
+    import asyncio
+    from microsandbox import Sandbox
+
+    async def main():
+        sb = await Sandbox.create(
+            "hello",
+            image="python",
+            memory=512,
+            ephemeral=True,
+        )
+
+        try:
+            output = await sb.exec("python", ["-c", "print('Hello from a microVM!')"])
+            print(output.stdout_text)  # Hello from a microVM!
+        finally:
+            await sb.stop()
+
+    asyncio.run(main())
+    ```
+
+    ```go Go
+    sb, err := m.CreateSandbox(ctx, "hello",
+        m.WithImage("python"),
+        m.WithMemory(512),
+        m.WithEphemeral(true),
+    )
+    if err != nil {
+        return err
+    }
+    defer func() {
+        _ = sb.Stop(ctx)
+    }()
+
+    output, err := sb.Exec(ctx, "python", []string{"-c", "print('Hello from a microVM!')"})
+    if err != nil {
+        return err
+    }
+    fmt.Println(output.Stdout()) // Hello from a microVM!
+    ```
+
+    ```ruby Ruby
+    require "microsandbox"
+
+    Microsandbox.install unless Microsandbox.installed?
+
+    Microsandbox::Sandbox.with("hello", image: "python", memory: 512, ephemeral: true) do |sandbox|
+      output = sandbox.exec("python", ["-c", "print('Hello from a microVM!')"])
+      puts output.stdout
+    end
+    ```
+
+    </CodeGroup>
+  </Step>
+</Steps>
+
+If you already ran an older version of this example and retained a sandbox named `hello`, remove it with `msb stop hello` followed by `msb rm hello` on the same backend, or choose another name. Stopping a persistent sandbox retains it for later restart.
+
+## What just happened?
+
+Here's what the local runtime did when you created the sandbox:
+
+1. **Pulled the image** from Docker Hub, unless it was already cached.
+2. **Assembled a copy-on-write filesystem** so changes inside the sandbox do not modify the base image.
+3. **Booted a microVM** as a child process with the resource limits you configured.
+4. **Started the guest agent** so the SDK can run commands and move data in and out.
+
+The `exec` call uses the host-guest command channel, not SSH and not the sandbox network.
+
+<Tip>
+  Ready for hosted compute? Use a remote context in your SDK, or switch the CLI connection. Our managed cloud needs no local VM. See [managed cloud](/cloud/overview) to choose a connection at startup and keep your sandbox workflow.
+</Tip>
+
+## Next steps
+
+- [SDK references](/sdk/overview#reference): choose TypeScript, Rust, Python, Go, or Ruby for sandbox lifecycle and API details
+- [Protect API credentials](/sandboxes/secrets): let sandboxed code use an API without receiving the credential value
+- [Browse guides](/how-to/overview): set up agents, CI/CD, Docker, and more
+- [Run on our managed cloud](/cloud/overview): choose a connection and keep your sandbox workflow
+- [Modify live sandbox settings](/sandboxes/tuning): resize headroom, labels, secrets, and storage
+- [Troubleshoot Linux setup](/troubleshooting/linux): KVM, `/dev/kvm`, and permissions
+- [Troubleshoot macOS setup](/troubleshooting/macos): Apple Silicon and local runtime checks
+- [Troubleshoot Windows setup](/troubleshooting/windows): WHP, `msb doctor`, and runtime setup
+- [Run commands and stream output](/sandboxes/commands): `exec`, `shell`, `attach`, and streaming
+- [Control network access](/networking/overview): policies, DNS interception, and secret protection
+- [Manage sandboxes with the CLI](/cli/overview): create, inspect, and manage sandboxes from the terminal

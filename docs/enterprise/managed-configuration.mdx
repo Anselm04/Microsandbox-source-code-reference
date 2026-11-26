@@ -1,0 +1,112 @@
+---
+title: Enforce team settings
+sidebarTitle: Enforce settings
+description: Define the settings your team must use and protect them on employee devices
+icon: "file-shield"
+---
+
+Once your [pilot environment](/enterprise/prepare-environment) works with [company networking](/enterprise/corporate-networking), define which settings employees must use. A protected `managed.json` overrides user configuration and CLI or SDK options; omitted settings remain under employee control.
+
+<Frame>
+  <img className="block dark:hidden" src="/images/enterprise/managed-deployment-light.svg" alt="Configuration precedence: built-in defaults, user configuration, CLI or SDK options, then managed overrides. Later layers override supplied fields." />
+  <img className="hidden dark:block" src="/images/enterprise/managed-deployment-dark.svg" alt="Configuration precedence: built-in defaults, user configuration, CLI or SDK options, then managed overrides. Later layers override supplied fields." />
+</Frame>
+
+## Define managed settings
+
+Save the settings you want to enforce as `managed.json`:
+
+<CodeGroup>
+```json JSON
+{
+  "version": 1,
+  "overrides": {
+    "sandbox_defaults": {
+      "cpus": 2,
+      "memory_mib": 1024
+    },
+    "ssh": {
+      "inactivity_timeout_secs": 900
+    }
+  }
+}
+```
+</CodeGroup>
+
+This example enforces **two vCPUs and 1 GiB of memory** for new local and cloud sandboxes, plus a **15-minute inactivity timeout** for SSH sessions created through the CLI or SDK, including sessions to cloud sandboxes.
+
+- **`version`** identifies the managed file format and defaults to `1` when omitted. It is independent of the user config version.
+- **`overrides`** accepts the fields in [Global config](/configuration), including registries, paths, runtime settings, and [outbound proxies](/enterprise/corporate-networking#route-sandbox-traffic).
+- **Omitted settings** remain under employee control. Managed values are never written into the user's `config.json`.
+- **Unrecognized keys** are ignored with a warning listing their paths. Check warnings during rollout to catch misspelled settings.
+
+<Accordion title="How overrides are merged">
+  Precedence, from lowest to highest: **built-in defaults → user config → CLI/SDK options → managed overrides**.
+
+  | Value | Behavior |
+  | --- | --- |
+  | Omitted field | Keep the lower-layer value |
+  | `null` | Clear a nullable field |
+  | Nested section | Merge by field |
+  | Registry hosts | Merge by host and field; omitted auth keeps employee credentials |
+  | Other maps | Merge by key; replace each supplied entry |
+  | Array or tagged value | Replace the whole value |
+
+  Tagged values need their discriminator, such as `kind`, `mode`, or `protocol`. See [registry rules](/configuration#auth-resolution-order) and [backend selection](/cloud/connect#precedence) for their specific behavior.
+</Accordion>
+
+## Understand policy coverage
+
+To require remote execution, add `"allowed_backends": ["remote"]` under `overrides`. Use `["local"]` for local only, or `["local", "remote"]` for both. This checks permission even when an employee explicitly chooses a backend through the SDK. To also set the default, use `active_profile` to name a configured remote profile.
+
+An empty list is invalid. An omitted field inherits the user restriction; `null` clears it. `msb context list` shows prohibited profiles, while attempting to use one returns an error naming the restriction and its source.
+
+Supported CLI and SDK backends apply managed settings on the employee device. The file does not configure the cloud service or its hosted SSH gateway.
+
+| Setting | Applies to |
+| --- | --- |
+| Allowed backends | Construction of local and cloud CLI/SDK backends |
+| Sandbox defaults, such as CPU and memory | Local creation and outgoing cloud create requests; unsupported cloud options fail |
+| Outbound proxy | Local sandboxes; cloud creation fails while a proxy is enforced |
+| Registry settings | Host image pulls; cloud pulls use explicit or cloud-stored credentials |
+| Runtime and data paths | The local backend |
+| SSH inactivity timeout | New CLI/SDK SSH sessions, including connections to cloud sandboxes |
+| DNS, destination rules, guest CA trust, published ports | Per-sandbox configuration, rather than individual managed overrides |
+
+An enforced `multi-tenant` [deployment profile](/networking/overview#deployment-profiles) restricts several network settings together. Snapshot restores reject policy that conflicts with the captured root-disk layout or full-checkpoint CPU and memory geometry.
+
+### Keep credentials separate
+
+Employees can read `managed.json`. Distribute credential references rather than passwords or tokens, and provision the credentials separately. For registries, omit `auth` to preserve employee credentials, supply it to enforce an authentication configuration, or set it to `null` to require anonymous access. See the [registry example](/enterprise/corporate-networking#connect-to-private-registries).
+
+## Protect the policy file
+
+Your deployment tool must install the policy at the system location below and prevent employees from modifying or replacing it.
+
+### File location
+
+| Platform | Managed file |
+| --- | --- |
+| macOS | `/Library/Application Support/microsandbox/managed.json` |
+| Linux | `/etc/microsandbox/managed.json` |
+| Windows | System ProgramData folder + `microsandbox\managed.json`, usually `C:\ProgramData\microsandbox\managed.json` |
+
+`MSB_HOME` and `MSB_CONFIG_PATH` do not change this location. microsandbox needs no additional enrollment, daemon, plist, or mobileconfig.
+
+### File protection
+
+| Platform | Required deployment permissions |
+| --- | --- |
+| macOS / Linux | Root-owned directory `0755` and file `0644`; no employee write access through ACLs |
+| Windows | Administrators and SYSTEM have full control; employees can read the file and traverse the directory, without write or replacement access |
+
+On macOS and Linux, backend construction fails if the file or its immediate parent directory is not root-owned or is group- or world-writable, or if their permissions cannot be checked. An administrator must correct the reported ownership or permissions before retrying. These checks do not inspect ACLs or other ancestor directories; Windows permissions are not checked. Protect the complete path.
+
+<Note>
+  Deploy CLI and SDK versions that support `allowed_backends` before relying on it. Older versions ignore this field, and saving user config with an older version can remove it. Managed policy is never saved by user-config commands. Local administrators can remove policy or replace the runtime.
+</Note>
+
+
+## Next step
+
+[Deploy and verify](/enterprise/deploy-and-verify) the policy on a pilot group before rolling it out to the team.

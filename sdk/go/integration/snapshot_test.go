@@ -1,0 +1,378 @@
+//go:build integration && microsandbox_ffi_path
+
+package integration
+
+import (
+	"context"
+	"fmt"
+	"hash/fnv"
+	"path/filepath"
+	"testing"
+	"time"
+
+	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
+)
+
+// Snapshot behavior does not depend on the production-sized 4 GiB writable
+// layer. Keep these end-to-end artifacts small so copy, hash, and archive work
+// does not dominate the Go integration suite.
+const snapshotIntegrationRootDiskSizeMiB = 256
+
+func TestSandboxHandleSnapshotAndRestore(t *testing.T) {
+	ctx := integrationCtx(t)
+	baseName := uniqueIntegrationName(t, "go-sdk-snapshot-base")
+	forkName := uniqueIntegrationName(t, "go-sdk-snapshot-fork")
+	snapshotName := uniqueIntegrationName(t, "go-sdk-snapshot")
+	snapshotSelector := snapshotName + ":ready"
+
+	t.Cleanup(func() {
+		removeSandboxBestEffort(forkName)
+		removeSandboxBestEffort(baseName)
+		removeGroupBestEffort(snapshotName)
+	})
+
+	phaseStart := time.Now()
+	base, err := createSandbox(t, ctx, baseName,
+		microsandbox.WithImage(goIntegrationImage),
+		microsandbox.WithRootDisk(microsandbox.RootDisk.Managed(snapshotIntegrationRootDiskSizeMiB)),
+	)
+	if err != nil {
+		t.Fatalf("CreateSandbox base: %v", err)
+	}
+	logSnapshotPhase(t, "create base sandbox", phaseStart)
+	if _, err := base.Exec(ctx, "sh", []string{"-c", "printf restored-user-data > /root/snapshot-marker; sync"}); err != nil {
+		t.Fatal(err)
+	}
+
+	phaseStart = time.Now()
+	if err := base.Stop(ctx); err != nil {
+		t.Fatalf("Stop base: %v", err)
+	}
+	logSnapshotPhase(t, "stop base sandbox", phaseStart)
+	if err := base.Close(); err != nil {
+		t.Fatalf("Close base: %v", err)
+	}
+
+	baseHandle, err := microsandbox.GetSandbox(ctx, baseName)
+	if err != nil {
+		t.Fatalf("GetSandbox base: %v", err)
+	}
+	phaseStart = time.Now()
+	created, err := baseHandle.Snapshot(ctx, snapshotName, microsandbox.WithSnapshotCaptureConfig(microsandbox.SnapshotCaptureConfig{Name: "ready", RecordIntegrity: true}))
+	if err != nil {
+		t.Fatalf("SandboxHandle.Snapshot: %v", err)
+	}
+	logSnapshotPhase(t, "create snapshot", phaseStart)
+	artifact := created.Checkpoint
+	if artifact.Digest() == "" {
+		t.Fatal("Snapshot artifact has empty digest")
+	}
+	if liveSnapshotInfo(t, ctx, artifact).ImageRef == "" {
+		t.Fatal("Snapshot artifact has empty image ref")
+	}
+	if sizeBytes := liveSnapshotInfo(t, ctx, artifact).SizeBytes; sizeBytes == nil || *sizeBytes == 0 {
+		t.Fatalf("Snapshot artifact has invalid size: %v", sizeBytes)
+	}
+
+	phaseStart = time.Now()
+	report, err := artifact.Verify(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot.Verify: %v", err)
+	}
+	logSnapshotPhase(t, "verify snapshot", phaseStart)
+	if report.Digest == "" || report.Path == "" {
+		t.Fatalf("Verify returned incomplete report: %+v", report)
+	}
+
+	handle, err := microsandbox.GetSnapshot(ctx, snapshotSelector)
+	if err != nil {
+		t.Fatalf("Snapshot.Get: %v", err)
+	}
+	if handle.Digest() != artifact.Digest() {
+		t.Fatalf("Snapshot.Get digest = %q, want %q", handle.Digest(), artifact.Digest())
+	}
+	if gotName := handle.Name(); gotName == nil || *gotName != "ready" {
+		t.Fatalf("Snapshot.Get name = %v, want %q", gotName, "ready")
+	}
+
+	opened := handle
+	_, err = handle.Manifest(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot.Open: %v", err)
+	}
+	if opened.Digest() != artifact.Digest() {
+		t.Fatalf("Snapshot.Open digest = %q, want %q", opened.Digest(), artifact.Digest())
+	}
+
+	found := false
+	handles, err := microsandbox.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot.List: %v", err)
+	}
+	for _, h := range handles {
+		if h.Digest() == artifact.Digest() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Snapshot.List did not include digest %q", artifact.Digest())
+	}
+
+	phaseStart = time.Now()
+	fork, err := artifact.SpawnSandbox(ctx, forkName)
+	if err != nil {
+		t.Fatalf("RestoreSandbox: %v", err)
+	}
+	logSnapshotPhase(t, "restore sandbox from snapshot", phaseStart)
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = fork.Stop(stopCtx)
+		_ = fork.Close()
+	}()
+
+	// Verify the fork is a working sandbox sourced from the snapshot:
+	// /etc/alpine-release exists in the alpine image's rootfs, so reading
+	// it back via the fork confirms RestoreSandbox resolved + mounted the
+	// snapshot's rootfs rather than handing back an empty fs.
+	got, err := fork.FS().ReadString(ctx, "/etc/alpine-release")
+	if err != nil {
+		t.Fatalf("ReadString /etc/alpine-release from fork: %v", err)
+	}
+	if got == "" {
+		t.Fatalf("/etc/alpine-release empty in fork")
+	}
+
+	marker, err := fork.FS().ReadString(ctx, "/root/snapshot-marker")
+	if err != nil || marker != "restored-user-data" {
+		t.Fatalf("restored marker = %q, err = %v", marker, err)
+	}
+}
+
+func TestSnapshotCreateAndSnapshotDirectoryOps(t *testing.T) {
+	ctx := integrationCtx(t)
+	baseName := uniqueIntegrationName(t, "go-sdk-snapcreate-base")
+	snapshotName := uniqueIntegrationName(t, "go-sdk-snapcreate")
+
+	t.Cleanup(func() {
+		removeSandboxBestEffort(baseName)
+		removeGroupBestEffort(baseName)
+	})
+
+	phaseStart := time.Now()
+	base, err := createSandbox(t, ctx, baseName,
+		microsandbox.WithImage(goIntegrationImage),
+		microsandbox.WithRootDisk(microsandbox.RootDisk.Managed(snapshotIntegrationRootDiskSizeMiB)),
+	)
+	if err != nil {
+		t.Fatalf("CreateSandbox base: %v", err)
+	}
+	logSnapshotPhase(t, "create base sandbox", phaseStart)
+
+	phaseStart = time.Now()
+	if err := base.Stop(ctx); err != nil {
+		t.Fatalf("Stop base: %v", err)
+	}
+	logSnapshotPhase(t, "stop base sandbox", phaseStart)
+	if err := base.Close(); err != nil {
+		t.Fatalf("Close base: %v", err)
+	}
+
+	phaseStart = time.Now()
+	artifact, err := microsandbox.CreateSnapshot(ctx, microsandbox.SnapshotCreateOptions{
+		Name:        snapshotName,
+		FromSandbox: baseName,
+	})
+	if err != nil {
+		t.Fatalf("Snapshot.Create: %v", err)
+	}
+	logSnapshotPhase(t, "create snapshot", phaseStart)
+	snapshotDir := localSnapshotPath(t, artifact)
+	if filepath.Base(snapshotDir) != artifact.ID() {
+		t.Fatalf("Snapshot.Create path = %q, want stable ID basename %q", snapshotDir, artifact.ID())
+	}
+	update := artifact.HeadUpdate()
+	if update == nil || update.Group != baseName || (update.Head == nil || *update.Head != artifact.ID()) {
+		t.Fatalf("Snapshot.Create missing group head outcome: %#v", update)
+	}
+	head, err := microsandbox.SnapshotGroupHead(ctx, baseName)
+	if err != nil || head == nil || *head != artifact.ID() {
+		t.Fatalf("Snapshot.GroupHead = %#v, err = %v", head, err)
+	}
+	update, err = microsandbox.SetSnapshotGroupHead(ctx, baseName, artifact.ID())
+	if err != nil || update == nil || update.Head == nil || *update.Head != artifact.ID() || update.Changed {
+		t.Fatalf("SetSnapshotGroupHead on current head = %#v, err = %v", update, err)
+	}
+	t.Cleanup(func() { removeSnapshotBestEffort(snapshotDir) })
+
+	opened, err := microsandbox.OpenSnapshot(ctx, snapshotDir)
+	if err != nil {
+		t.Fatalf("Snapshot.Open: %v", err)
+	}
+	if opened.Digest() != artifact.Digest() {
+		t.Fatalf("Snapshot.Open digest = %q, want %q", opened.Digest(), artifact.Digest())
+	}
+
+	dirEntries, err := microsandbox.ListSnapshotsDir(ctx, filepath.Dir(snapshotDir))
+	if err != nil {
+		t.Fatalf("Snapshot.ListDir: %v", err)
+	}
+	found := false
+	for _, snap := range dirEntries {
+		if snap.Digest() == artifact.Digest() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("Snapshot.ListDir did not include digest %q", artifact.Digest())
+	}
+
+	indexed, err := microsandbox.ReindexSnapshots(ctx, filepath.Dir(snapshotDir))
+	if err != nil {
+		t.Fatalf("Snapshot.Reindex: %v", err)
+	}
+	if indexed == 0 {
+		t.Fatal("Snapshot.Reindex indexed zero artifacts")
+	}
+
+	archivePath := filepath.Join(t.TempDir(), "snapshot.tar")
+	phaseStart = time.Now()
+	if err := artifact.SaveTo(ctx, archivePath,
+		microsandbox.SnapshotSaveOptions{PlainTar: true}); err != nil {
+		t.Fatalf("Snapshot.SaveTo: %v", err)
+	}
+	logSnapshotPhase(t, "save snapshot archive", phaseStart)
+
+	copyCtx, cancelCopy := context.WithTimeout(context.Background(), integrationTestTimeout)
+	t.Cleanup(cancelCopy)
+	copiedArchivePath := filepath.Join(t.TempDir(), "copied.tar.zst")
+	phaseStart = time.Now()
+	if err := artifact.CopyTo(copiedArchivePath).
+		Labels(map[string]string{"environment": "test"}).
+		RecordIntegrity(true).
+		Save(copyCtx); err != nil {
+		t.Fatalf("Snapshot.CopyTo.Save: %v", err)
+	}
+	logSnapshotPhase(t, "copy snapshot archive", phaseStart)
+
+	provider, err := microsandbox.NewLocalContext(microsandbox.LocalOptions{})
+    if err != nil { t.Fatal(err) }
+    copiedResult, err := provider.Snapshots().Load(copyCtx, "copied", []string{copiedArchivePath}, microsandbox.SnapshotImportOptions{Dest: t.TempDir()})
+    if err != nil {
+		t.Fatalf("Snapshot.Load copied archive: %v", err)
+	}
+	if len(copiedResult.Checkpoints) != 1 || len(copiedResult.Added) != 1 || copiedResult.HeadUpdate == nil || copiedResult.HeadUpdate.Head == nil {
+		t.Fatalf("canonical import outcome: %+v", copiedResult)
+	}
+	copiedHandle := copiedResult.Checkpoints[0]
+	t.Cleanup(func() { _, _ = copiedResult.Snapshot.Remove(context.Background()) })
+	t.Cleanup(func() {
+		removeSnapshotBestEffort(copiedHandle.Reference())
+	})
+	copied := copiedHandle
+	_, err = copied.Manifest(copyCtx)
+	if err != nil {
+		t.Fatalf("Snapshot.Open copied archive: %v", err)
+	}
+	labels, err := copied.Labels(copyCtx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := labels["environment"]; got != "test" {
+		t.Fatalf("copied snapshot label = %q, want %q", got, "test")
+	}
+	if _, err := copied.Verify(copyCtx); err != nil {
+		t.Fatalf("Snapshot.Verify copied archive: %v", err)
+	}
+
+	// VM startup and snapshot export can consume most of the shared test context on busy
+	// self-hosted runners. Keep import independently bounded so it receives the same full
+	// operation budget instead of inheriting only the time left by the preceding phases.
+	loadCtx, cancelLoad := context.WithTimeout(context.Background(), integrationTestTimeout)
+	t.Cleanup(cancelLoad)
+	importDir := filepath.Join(t.TempDir(), "imported")
+	phaseStart = time.Now()
+	imported, err := microsandbox.LoadSnapshot(loadCtx, archivePath, importDir)
+	if err != nil {
+		t.Fatalf("Snapshot.Load: %v", err)
+	}
+	logSnapshotPhase(t, "load snapshot archive", phaseStart)
+	t.Cleanup(func() {
+		removeSnapshotBestEffort(imported.Reference())
+	})
+	if imported.Digest() != artifact.Digest() {
+		t.Fatalf("Snapshot.Load digest = %q, want %q", imported.Digest(), artifact.Digest())
+	}
+
+	// Independent imports share an identity and digest. Handle operations must stay
+	// bound to one installed copy instead of re-resolving an ambiguous digest.
+	duplicate, err := microsandbox.LoadSnapshot(loadCtx, archivePath, importDir)
+	if err != nil {
+		t.Fatalf("Snapshot.Load duplicate: %v", err)
+	}
+	t.Cleanup(func() { removeSnapshotBestEffort(localSnapshotPath(t, duplicate)) })
+	if localSnapshotPath(t, duplicate) == localSnapshotPath(t, imported) || duplicate.ID() != imported.ID() {
+		t.Fatalf("imports should be distinct copies of one snapshot: %q / %q", localSnapshotPath(t, imported), localSnapshotPath(t, duplicate))
+	}
+	if err := imported.Destroy(loadCtx, false); err != nil {
+		t.Fatalf("Snapshot.Remove with duplicate copies: %v", err)
+	}
+	if _, err := imported.Manifest(loadCtx); err == nil {
+		t.Fatal("removed handle unexpectedly reopened a different copy")
+	}
+	if _, err := duplicate.Manifest(loadCtx); err != nil {
+		t.Fatalf("removing first import affected second copy: %v", err)
+	}
+	if _, err := microsandbox.OpenSnapshot(loadCtx, snapshotDir); err != nil {
+		t.Fatalf("removing an import affected the original snapshot: %v", err)
+	}
+
+	// A repeated archive still yields one result per input, but one batch group
+	// installs the identical snapshot only once.
+	batch, err := microsandbox.LoadSnapshots(loadCtx,
+		[]string{archivePath, archivePath}, microsandbox.SnapshotLoadOptions{Dest: importDir})
+	if err != nil {
+		t.Fatalf("Snapshot.LoadMany: %v", err)
+	}
+	if len(batch) != 2 || batch[0].ID() != artifact.ID() || batch[1].ID() != artifact.ID() {
+		t.Fatalf("Snapshot.LoadMany returned unexpected handles: %#v", batch)
+	}
+	t.Cleanup(func() { removeSnapshotBestEffort(localSnapshotPath(t, batch[0])) })
+	if localSnapshotPath(t, batch[0]) != localSnapshotPath(t, batch[1]) || batch[0].Group() == nil {
+		t.Fatal("batch should reuse one installed copy in one generated group")
+	}
+}
+
+func logSnapshotPhase(t *testing.T, phase string, started time.Time) {
+	t.Helper()
+	t.Logf("snapshot phase %q completed in %s", phase, time.Since(started).Round(time.Millisecond))
+}
+
+func uniqueIntegrationName(t *testing.T, prefix string) string {
+	t.Helper()
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(t.Name()))
+	return fmt.Sprintf("%s-%08x-%d", prefix, h.Sum32(), time.Now().UnixNano()%1_000_000_000)
+}
+
+func removeSandboxBestEffort(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if h, err := microsandbox.GetSandbox(ctx, name); err == nil {
+		_ = h.Stop(ctx)
+	}
+	_ = microsandbox.RemoveSandbox(context.Background(), name)
+}
+
+func removeSnapshotBestEffort(pathOrName string) {
+	_ = microsandbox.RemoveSnapshot(context.Background(), pathOrName, true)
+}
+
+func removeGroupBestEffort(name string) {
+    provider, err := microsandbox.NewLocalContext(microsandbox.LocalOptions{})
+    if err != nil { return }
+    ctx := context.Background()
+    if history, err := provider.Snapshots().Get(ctx, name); err == nil { _, _ = history.Remove(ctx) }
+}

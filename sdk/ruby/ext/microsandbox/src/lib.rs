@@ -1,0 +1,2976 @@
+mod context;
+mod core_error;
+mod jobs;
+mod services;
+mod snapshot_group;
+mod snapshot_spawn;
+mod storage;
+
+use std::{
+    ffi::c_void,
+    future::Future,
+    mem::ManuallyDrop,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicPtr, AtomicU32, Ordering},
+    },
+    time::Duration,
+};
+
+use magnus::{
+    Error, ExceptionClass, RArray, RHash, RObject, RString, Ruby, Symbol, TryConvert, Value,
+    function, method, prelude::*, r_hash::ForEach, scan_args::scan_args, typed_data,
+};
+use microsandbox_core::{
+    AgentClientError, ChangeState, ContextKind, MicrosandboxError, MicrosandboxResult, Operation,
+    ServiceError, UnsupportedReason,
+    image::{Image, ImageHandle},
+    logs::{LogEntry, LogOptions, LogSource},
+    sandbox::{
+        DestroyOptions, ExecOptionsBuilder, ExecOutput, FsEntry, FsEntryKind, FsMetadata,
+        NetworkPolicy, PullPolicy, RestartOptions, RlimitResource, Sandbox as CoreSandbox,
+        SandboxBuilder, SandboxMetrics, SandboxPage, SandboxPingResult, SandboxStatus,
+        SandboxStopResult, SandboxTouchResult, SecretSource,
+    },
+    snapshot::{Checkpoint as Snapshot, SaveOpts},
+    volume::Volume,
+};
+
+use core_error::core_error;
+
+// -------------------------------------------------------------------------------------------------
+// GVL release — FFI
+// -------------------------------------------------------------------------------------------------
+
+unsafe extern "C" {
+    fn rb_thread_call_without_gvl(
+        func: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+        data: *mut c_void,
+        ubf: Option<unsafe extern "C" fn(*mut c_void) -> std::ffi::c_int>,
+        ubf_data: *mut c_void,
+    ) -> *mut c_void;
+}
+
+/// Per-call completion state created in the process that starts the operation.
+///
+/// Tokio's blocking oneshot receiver caches a thread parker. Reusing that
+/// inherited cache after `fork(2)` can dereference stale synchronization state,
+/// so the Ruby extension waits on a fresh condition variable instead.
+struct BlockingState<T> {
+    result: Mutex<Option<T>>,
+    ready: Condvar,
+}
+
+impl<T> BlockingState<T> {
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn complete(&self, value: T) {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *result = Some(value);
+        self.ready.notify_one();
+    }
+
+    fn wait(&self) -> T {
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(value) = result.take() {
+                return value;
+            }
+            result = self
+                .ready
+                .wait(result)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
+/// Carrier accessed from the C callback inside `rb_thread_call_without_gvl`.
+struct BlockingRecv<T> {
+    state: Arc<BlockingState<Result<T, tokio::task::JoinError>>>,
+    result: Option<std::thread::Result<Result<T, tokio::task::JoinError>>>,
+}
+
+fn catch_callback<F, T>(callback: F) -> std::thread::Result<T>
+where
+    F: FnOnce() -> T,
+{
+    catch_unwind(AssertUnwindSafe(callback))
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "unknown panic payload"
+    }
+}
+
+unsafe extern "C" fn do_blocking_recv<T>(data: *mut c_void) -> *mut c_void {
+    let carrier = unsafe { &mut *(data as *mut BlockingRecv<T>) };
+    carrier.result = Some(catch_callback(|| carrier.state.wait()));
+    std::ptr::null_mut()
+}
+
+// -------------------------------------------------------------------------------------------------
+// Runtime
+// -------------------------------------------------------------------------------------------------
+
+// A tokio runtime cannot survive fork(2): only the calling thread exists in
+// the child, while the inherited runtime points at worker and I/O threads that
+// disappeared. Tag each leaked runtime with the process that created it and
+// build a fresh one after fork. The stale parent runtime is intentionally
+// leaked; dropping it in the child can block forever joining vanished threads.
+static RUNTIME_PTR: AtomicPtr<tokio::runtime::Runtime> = AtomicPtr::new(std::ptr::null_mut());
+static RUNTIME_PID: AtomicU32 = AtomicU32::new(0);
+static RUNTIME_SLOT: Mutex<RuntimeSlot> = Mutex::new(RuntimeSlot { runtime: None });
+
+struct RuntimeSlot {
+    runtime: Option<ManuallyDrop<tokio::runtime::Runtime>>,
+}
+
+fn current_ruby() -> Ruby {
+    Ruby::get().expect("Ruby VM is not available")
+}
+
+fn runtime() -> Result<&'static tokio::runtime::Runtime, Error> {
+    let process_id = std::process::id();
+    let runtime_ptr = RUNTIME_PTR.load(Ordering::Acquire);
+    if !runtime_ptr.is_null() && RUNTIME_PID.load(Ordering::Acquire) == process_id {
+        return Ok(unsafe { &*runtime_ptr });
+    }
+
+    let mut slot = RUNTIME_SLOT.lock().map_err(|_| {
+        Error::new(
+            current_ruby().exception_runtime_error(),
+            "Tokio runtime lock is poisoned",
+        )
+    })?;
+    let runtime_ptr = RUNTIME_PTR.load(Ordering::Acquire);
+    if !runtime_ptr.is_null() && RUNTIME_PID.load(Ordering::Acquire) == process_id {
+        return Ok(unsafe { &*runtime_ptr });
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("microsandbox-ruby")
+        .build()
+        .map_err(|error| Error::new(current_ruby().exception_runtime_error(), error.to_string()))?;
+    // Assignment deliberately does not drop an inherited runtime. Its worker
+    // threads vanished at fork and Tokio may hang trying to join them.
+    slot.runtime = Some(ManuallyDrop::new(runtime));
+    let runtime_ptr = slot
+        .runtime
+        .as_ref()
+        .map(|runtime| &**runtime as *const _ as *mut _)
+        .expect("runtime slot was just initialized");
+    RUNTIME_PTR.store(runtime_ptr, Ordering::Release);
+    RUNTIME_PID.store(process_id, Ordering::Release);
+    Ok(unsafe { &*runtime_ptr })
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Core error mapping
+//--------------------------------------------------------------------------------------------------
+
+/// The `Microsandbox::*` exception class for a core error. `"Error"` is the
+/// natively defined base class; the subclasses live in
+/// `lib/microsandbox/errors.rb`. Class names mirror the Python SDK's bridge
+/// (`sdk/python/src/error.rs`), extended with the Go SDK's per-variant coverage
+/// for snapshots, exec spawn failures, and duplicate volumes. Every other
+/// variant falls back to the base class.
+fn core_error_class_name(error: &MicrosandboxError) -> &'static str {
+    match error {
+        MicrosandboxError::RuntimeNotInstalled(_) => "RuntimeNotInstalledError",
+        MicrosandboxError::RuntimeIncomplete(_) => "RuntimeIncompleteError",
+        MicrosandboxError::InvalidConfig(_)
+        | MicrosandboxError::InvalidWorkdir { .. }
+        | MicrosandboxError::MissingRestoreBindings { .. } => "InvalidConfigError",
+        MicrosandboxError::NoDefaultCommand => "NoDefaultCommandError",
+        MicrosandboxError::CloudHttp { .. } => "CloudHttpError",
+        MicrosandboxError::SandboxNotFound(_) => "SandboxNotFoundError",
+        MicrosandboxError::SandboxNotRunning(_) => "SandboxNotRunningError",
+        MicrosandboxError::SandboxAlreadyExists(_) => "SandboxAlreadyExistsError",
+        MicrosandboxError::SandboxReplaced { .. } => "SandboxReplacedError",
+        MicrosandboxError::SandboxStillRunning(_) => "SandboxStillRunningError",
+        MicrosandboxError::SandboxStopTimedOut { .. } => "SandboxStopTimedOutError",
+        MicrosandboxError::StopTimeout { .. } => "StopTimeoutError",
+        MicrosandboxError::ExecTimeout(_) => "ExecTimeoutError",
+        MicrosandboxError::ExecFailed(_) => "ExecFailedError",
+        MicrosandboxError::SandboxFsOps(_) => "FilesystemError",
+        MicrosandboxError::VolumeNotFound(_) => "VolumeNotFoundError",
+        MicrosandboxError::VolumeAlreadyExists(_) => "VolumeAlreadyExistsError",
+        MicrosandboxError::ServiceNotFound(_) => "ServiceNotFoundError",
+        MicrosandboxError::ServiceAlreadyExists(_) => "ServiceAlreadyExistsError",
+        MicrosandboxError::Service { .. } => "ServiceError",
+        MicrosandboxError::ImageNotFound(_) => "ImageNotFoundError",
+        MicrosandboxError::ImageInUse(_) => "ImageInUseError",
+        MicrosandboxError::SnapshotNotFound(_) => "SnapshotNotFoundError",
+        MicrosandboxError::SnapshotAlreadyExists(_) => "SnapshotAlreadyExistsError",
+        MicrosandboxError::SnapshotSandboxRunning(_) => "SnapshotSandboxRunningError",
+        MicrosandboxError::SnapshotImageMissing(_) => "SnapshotImageMissingError",
+        MicrosandboxError::SnapshotIntegrity(_) => "SnapshotIntegrityError",
+        MicrosandboxError::SnapshotSourceRecovery(_) => "SnapshotSourceRecoveryError",
+        MicrosandboxError::SnapshotImport(_) => "SnapshotImportError",
+        MicrosandboxError::SnapshotVerification(_) => "SnapshotVerificationError",
+        MicrosandboxError::SnapshotRemovalRecovery { .. } => "SnapshotRemovalRecoveryError",
+        MicrosandboxError::SnapshotGroupRemovalRecovery { .. } => {
+            "SnapshotGroupRemovalRecoveryError"
+        }
+        MicrosandboxError::SnapshotMigration { .. } => "SnapshotMigrationError",
+        // Always present: the extension enables the core's `net` feature.
+        MicrosandboxError::NetworkBuilder(_) => "NetworkPolicyError",
+        MicrosandboxError::Io(_) => "IoError",
+        MicrosandboxError::MetricsDisabled(_) => "MetricsDisabledError",
+        MicrosandboxError::MetricsUnavailable(_) => "MetricsUnavailableError",
+        MicrosandboxError::AgentClient(AgentClientError::UnsupportedOperation { .. }) => {
+            "UnsupportedOperationError"
+        }
+        MicrosandboxError::Unsupported { .. } => "UnsupportedError",
+        _ => "Error",
+    }
+}
+
+/// Look up `Microsandbox::<name>`, falling back to the base `Error`, then to
+/// `RuntimeError` if even that is missing.
+fn exception_class(ruby: &Ruby, name: &str) -> ExceptionClass {
+    ruby.define_module("Microsandbox")
+        .and_then(|module| {
+            module
+                .const_get::<_, ExceptionClass>(name)
+                .or_else(|_| module.const_get::<_, ExceptionClass>("Error"))
+        })
+        .unwrap_or_else(|_| ruby.exception_runtime_error())
+}
+
+/// Convert a core error from a Service change and attach whether that change may have been applied.
+fn service_change_error(ruby: &Ruby, error: MicrosandboxError) -> Error {
+    let changed = change_state_name(error.changed());
+    core_error::core_error_with_change(ruby, error, Some(changed))
+}
+
+fn structured_error(class: ExceptionClass, message: String, changed: Option<&str>) -> Error {
+    let exception = match class.new_instance((message.as_str(),)) {
+        Ok(exception) => exception,
+        Err(_) => return Error::new(class, message),
+    };
+    if let (Some(object), Some(changed)) = (RObject::from_value(exception.as_value()), changed) {
+        let _ = object.ivar_set("@changed", changed);
+    }
+    exception.into()
+}
+
+fn service_error(ruby: &Ruby, message: String, slug: &str, error: &ServiceError) -> Error {
+    let class = exception_class(ruby, "ServiceError");
+    let exception = match class.new_instance((message.as_str(),)) {
+        Ok(exception) => exception,
+        Err(_) => return Error::new(class, message),
+    };
+    let (reason, retry_after, raw_code, raw_status, raw_message) = service_error_details(error);
+    if let Some(object) = RObject::from_value(exception.as_value()) {
+        let _ = object.ivar_set("@slug", slug);
+        let _ = object.ivar_set("@reason", reason);
+        let _ = object.ivar_set("@retry_after", retry_after);
+        let _ = object.ivar_set("@changed", change_state_name(error.changed()));
+        let _ = object.ivar_set("@raw_code", raw_code);
+        let _ = object.ivar_set("@raw_status", raw_status);
+        let _ = object.ivar_set("@raw_message", raw_message);
+    }
+    exception.into()
+}
+
+fn service_error_details(
+    error: &ServiceError,
+) -> (
+    &'static str,
+    Option<f64>,
+    Option<&str>,
+    Option<u16>,
+    Option<&str>,
+) {
+    match error {
+        ServiceError::QuotaExceeded => ("service_quota_exceeded", None, None, None, None),
+        ServiceError::SandboxLimitExceeded => {
+            ("sandbox_service_limit_exceeded", None, None, None, None)
+        }
+        ServiceError::Conflict => ("service_conflict", None, None, None, None),
+        ServiceError::Detached => ("service_detached", None, None, None, None),
+        ServiceError::TargetUnreachable { retry_after } => (
+            "target_unreachable",
+            retry_after.map(|duration| duration.as_secs_f64()),
+            None,
+            None,
+            None,
+        ),
+        ServiceError::TargetNotRunning => ("sandbox_not_running", None, None, None, None),
+        ServiceError::ChangesPaused { retry_after } => (
+            "service_changes_paused",
+            retry_after.map(|duration| duration.as_secs_f64()),
+            None,
+            None,
+            None,
+        ),
+        ServiceError::OutcomeUnknown => ("outcome_unknown", None, None, None, None),
+        ServiceError::Other {
+            code,
+            status,
+            message,
+        } => (
+            "other",
+            None,
+            Some(code.as_str()),
+            Some(*status),
+            Some(message.as_str()),
+        ),
+        _ => ("other", None, None, None, None),
+    }
+}
+
+fn change_state_name(changed: ChangeState) -> &'static str {
+    match changed {
+        ChangeState::Unchanged => "unchanged",
+        ChangeState::Unknown => "unknown",
+    }
+}
+
+/// Build a `Microsandbox::UnsupportedError` carrying the rendered message plus
+/// the structured `@operation` / `@hint` attributes read by
+/// `UnsupportedError#operation` / `#hint`.
+fn unsupported_error(ruby: &Ruby, operation: &str, hint: &str, changed: Option<&str>) -> Error {
+    let message = format!("{operation} is not supported by this backend: {hint}");
+    let class = exception_class(ruby, "UnsupportedError");
+    match class.new_instance((message.as_str(),)) {
+        Ok(exception) => {
+            // Best-effort extras; the message already carries both.
+            if let Some(object) = RObject::from_value(exception.as_value()) {
+                let _ = object.ivar_set("@operation", operation);
+                let _ = object.ivar_set("@hint", hint);
+                if let Some(changed) = changed {
+                    let _ = object.ivar_set("@changed", changed);
+                }
+            }
+            exception.into()
+        }
+        Err(_) => Error::new(class, message),
+    }
+}
+
+/// Render an [`Operation`] as the Ruby API it corresponds to: `Sandbox::kill`
+/// becomes `sandbox.kill` and `Sandbox::log_stream(follow=false)` becomes
+/// `sandbox.log_stream(follow: false)`. Plain phrases without a `Type::method`
+/// shape (`config`, `snapshot operations`) pass through as-is.
+fn ruby_api_name(op: Operation) -> String {
+    let path = op.api_path();
+    let Some((ty, method)) = path.split_once("::") else {
+        return path.to_string();
+    };
+    format!("{}.{}", camel_to_snake(ty), method.replace('=', ": "))
+}
+
+/// Render an [`UnsupportedReason`] with `use instead` targets pointing at the
+/// Ruby API name rather than the Rust path.
+fn ruby_hint(reason: &UnsupportedReason) -> String {
+    match reason {
+        UnsupportedReason::UseInstead(op) => format!("use {}", ruby_api_name(*op)),
+        other => other.hint(),
+    }
+}
+
+/// Lower a `CamelCase` type name to `snake_case` (`SandboxFsOps` becomes
+/// `sandbox_fs_ops`).
+fn camel_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (i, ch) in name.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Spawn `future` on the tokio runtime and block the Ruby thread **without the
+/// GVL** until the result arrives. Other Ruby threads remain schedulable during
+/// sandbox operations.
+fn block_without_gvl<F, T>(ruby: &Ruby, future: F) -> Result<T, Error>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let runtime = runtime()?;
+    let state = Arc::new(BlockingState::new());
+    let task = runtime.spawn(future);
+    let completion = Arc::clone(&state);
+    runtime.spawn(async move {
+        completion.complete(task.await);
+    });
+    let mut carrier = BlockingRecv {
+        state,
+        result: None,
+    };
+    unsafe {
+        rb_thread_call_without_gvl(
+            do_blocking_recv::<T>,
+            &mut carrier as *mut _ as *mut c_void,
+            None,
+            std::ptr::null_mut(),
+        );
+    }
+    match carrier.result.take() {
+        Some(Ok(Ok(value))) => Ok(value),
+        Some(Ok(Err(error))) if error.is_cancelled() => Err(Error::new(
+            ruby.exception_runtime_error(),
+            "sandbox operation was canceled",
+        )),
+        Some(Ok(Err(error))) => {
+            let message = if error.is_panic() {
+                let panic = error.into_panic();
+                panic_message(panic.as_ref()).to_owned()
+            } else {
+                error.to_string()
+            };
+            Err(Error::new(
+                ruby.exception_runtime_error(),
+                format!("native operation panicked while the Ruby GVL was released: {message}"),
+            ))
+        }
+        Some(Err(panic)) => Err(Error::new(
+            ruby.exception_runtime_error(),
+            format!(
+                "native operation panicked while the Ruby GVL was released: {}",
+                panic_message(panic.as_ref())
+            ),
+        )),
+        None => unreachable!("GVL callback did not run"),
+    }
+}
+
+/// Run an SDK future to completion (GVL released) and convert errors.
+fn run<F, T>(ruby: &Ruby, future: F) -> Result<T, Error>
+where
+    F: Future<Output = MicrosandboxResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    block_without_gvl(ruby, future)?.map_err(|e| core_error(ruby, e))
+}
+
+/// A one-shot list can be the last owner of an empty local catalog. Wait for
+/// its SQLite workers to close before handing control back to Ruby: an
+/// immediate fork could otherwise inherit a mutex held by an exiting worker.
+fn run_catalog_list<F, T>(
+    ruby: &Ruby,
+    context: Arc<dyn microsandbox_core::Context>,
+    list: impl FnOnce(Arc<dyn microsandbox_core::Context>) -> F,
+) -> Result<T, Error>
+where
+    F: Future<Output = MicrosandboxResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let local = context.as_local().cloned();
+    let query = list(context);
+    run(ruby, async move {
+        let result = query.await;
+        if let Some(local) = local {
+            let cleanup = local.finish_unshared_catalog_query().await;
+            // Preserve a query failure if both the query and its cleanup failed.
+            if result.is_ok() {
+                cleanup?;
+            }
+        }
+        result
+    })
+}
+
+/// Run a Service change and attach the core's change classification to every mapped error.
+fn run_service_change<F, T>(ruby: &Ruby, future: F) -> Result<T, Error>
+where
+    F: Future<Output = MicrosandboxResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    block_without_gvl(ruby, future)?.map_err(|error| service_change_error(ruby, error))
+}
+
+// -------------------------------------------------------------------------------------------------
+// Argument helpers
+// -------------------------------------------------------------------------------------------------
+
+fn symbol(name: &str) -> Symbol {
+    current_ruby().to_symbol(name)
+}
+
+fn argument_error(ruby: &Ruby, message: impl Into<String>) -> Error {
+    Error::new(ruby.exception_arg_error(), message.into())
+}
+
+fn keyword_names(kwargs: RHash) -> Result<Vec<String>, Error> {
+    let mut names = Vec::with_capacity(kwargs.len());
+    kwargs.foreach(|key: Symbol, _value: Value| {
+        names.push(key.name()?.into_owned());
+        Ok(ForEach::Continue)
+    })?;
+    Ok(names)
+}
+
+fn reject_unknown_keywords(ruby: &Ruby, kwargs: RHash, allowed: &[&str]) -> Result<(), Error> {
+    for key in keyword_names(kwargs)? {
+        if !allowed.contains(&key.as_str()) {
+            return Err(argument_error(ruby, format!("unknown keyword: :{key}")));
+        }
+    }
+    Ok(())
+}
+
+fn keyword<T: TryConvert>(kwargs: RHash, name: &str) -> Result<Option<T>, Error> {
+    kwargs
+        .get(symbol(name))
+        .filter(|v| !v.is_nil())
+        .map(TryConvert::try_convert)
+        .transpose()
+}
+
+fn string_value(value: Value, name: &str) -> Result<String, Error> {
+    if let Some(sym) = Symbol::from_value(value) {
+        return Ok(sym.name()?.into_owned());
+    }
+    RString::try_convert(value)
+        .and_then(|s| s.to_string())
+        .map_err(|_| {
+            Error::new(
+                current_ruby().exception_type_error(),
+                format!("{name} must be a String or Symbol"),
+            )
+        })
+}
+
+fn string_map(value: Value, name: &str) -> Result<Vec<(String, String)>, Error> {
+    let hash = RHash::try_convert(value).map_err(|_| {
+        Error::new(
+            current_ruby().exception_type_error(),
+            format!("{name} must be a Hash"),
+        )
+    })?;
+    let mut out = Vec::with_capacity(hash.len());
+    hash.foreach(|k: Value, v: Value| {
+        let k = string_value(k, name)?;
+        let v = String::try_convert(v).map_err(|_| {
+            Error::new(
+                current_ruby().exception_type_error(),
+                format!("{name} values must be Strings"),
+            )
+        })?;
+        out.push((k, v));
+        Ok(ForEach::Continue)
+    })?;
+    Ok(out)
+}
+
+fn string_array(value: Value, name: &str) -> Result<Vec<String>, Error> {
+    let ary = RArray::try_convert(value).map_err(|_| {
+        Error::new(
+            current_ruby().exception_type_error(),
+            format!("{name} must be an Array"),
+        )
+    })?;
+    ary.to_vec::<String>().map_err(|_| {
+        Error::new(
+            current_ruby().exception_type_error(),
+            format!("{name} must contain only Strings"),
+        )
+    })
+}
+
+fn required_keyword<T: TryConvert>(hash: RHash, name: &str, ruby: &Ruby) -> Result<T, Error> {
+    keyword(hash, name)?.ok_or_else(|| argument_error(ruby, format!("missing keyword: :{name}")))
+}
+
+// -------------------------------------------------------------------------------------------------
+// Network / secrets
+// -------------------------------------------------------------------------------------------------
+
+fn restricted_network_policy(ruby: &Ruby, value: Value) -> Result<NetworkPolicy, Error> {
+    let hash = RHash::try_convert(value)
+        .map_err(|_| argument_error(ruby, "network must be :none or a Hash"))?;
+    reject_unknown_keywords(ruby, hash, &["allowed_hosts", "allowed_ports"])?;
+    let hosts: Vec<String> = required_keyword::<RArray>(hash, "allowed_hosts", ruby)?
+        .to_vec::<String>()
+        .map_err(|_| argument_error(ruby, "allowed_hosts must contain only Strings"))?;
+    let ports: Vec<u16> = required_keyword::<RArray>(hash, "allowed_ports", ruby)?
+        .to_vec::<u16>()
+        .map_err(|_| argument_error(ruby, "allowed_ports must contain integers"))?;
+    NetworkPolicy::builder()
+        .default_deny()
+        .egress(|eg| eg.tcp().ports(ports).allow_domains(hosts))
+        .build()
+        .map_err(|e| core_error(ruby, MicrosandboxError::from(e)))
+}
+
+fn apply_secret_options(
+    ruby: &Ruby,
+    mut builder: SandboxBuilder,
+    value: Value,
+) -> Result<SandboxBuilder, Error> {
+    let secrets = RArray::try_convert(value)
+        .map_err(|_| argument_error(ruby, "secrets must be an Array of Hashes"))?;
+    for i in 0..secrets.len() {
+        let spec: RHash = secrets.entry(i as isize)?;
+        reject_unknown_keywords(ruby, spec, &["env", "value", "allowed_host"])?;
+        let env = required_keyword::<String>(spec, "env", ruby)?;
+        let secret = required_keyword::<String>(spec, "value", ruby)?;
+        let host = required_keyword::<String>(spec, "allowed_host", ruby)?;
+        builder = builder.secret_env(env, secret, host);
+    }
+    Ok(builder)
+}
+
+#[derive(Clone)]
+enum RubyOutboundProxyConfig {
+    HttpConnect {
+        address: String,
+        credentials: Option<(String, SecretSource)>,
+    },
+    Socks4 {
+        address: String,
+        user_id: Option<String>,
+    },
+    Socks5 {
+        address: String,
+        credentials: Option<(String, SecretSource)>,
+    },
+}
+
+fn apply_outbound_proxy(builder: SandboxBuilder, proxy: &RubyOutboundProxy) -> SandboxBuilder {
+    match proxy.inner.borrow().clone() {
+        RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: Some((username, password)),
+        } => builder.proxy(|proxy| proxy.http_connect(address).credentials(username, password)),
+        RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: None,
+        } => builder.proxy(|proxy| proxy.http_connect(address)),
+        RubyOutboundProxyConfig::Socks4 {
+            address,
+            user_id: Some(user_id),
+        } => builder.proxy(|proxy| proxy.socks4(address).user_id(user_id)),
+        RubyOutboundProxyConfig::Socks4 {
+            address,
+            user_id: None,
+        } => builder.proxy(|proxy| proxy.socks4(address)),
+        RubyOutboundProxyConfig::Socks5 {
+            address,
+            credentials: Some((username, password)),
+        } => builder.proxy(|proxy| proxy.socks5(address).credentials(username, password)),
+        RubyOutboundProxyConfig::Socks5 {
+            address,
+            credentials: None,
+        } => builder.proxy(|proxy| proxy.socks5(address)),
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Duration / timeout
+// -------------------------------------------------------------------------------------------------
+
+fn duration(ruby: &Ruby, seconds: f64, name: &str) -> Result<Duration, Error> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(argument_error(
+            ruby,
+            format!("{name} must be a finite, non-negative number"),
+        ));
+    }
+    Duration::try_from_secs_f64(seconds)
+        .map_err(|_| argument_error(ruby, format!("{name} is too large")))
+}
+
+fn parse_timeout(
+    ruby: &Ruby,
+    positional: Option<f64>,
+    kwargs: RHash,
+    method: &str,
+) -> Result<Option<Duration>, Error> {
+    reject_unknown_keywords(ruby, kwargs, &["timeout"])?;
+    let kw = keyword::<f64>(kwargs, "timeout")?;
+    if positional.is_some() && kw.is_some() {
+        return Err(argument_error(
+            ruby,
+            format!("{method} accepts timeout once"),
+        ));
+    }
+    positional
+        .or(kw)
+        .map(|s| duration(ruby, s, "timeout"))
+        .transpose()
+}
+
+fn parse_status(ruby: &Ruby, status: &str) -> Result<SandboxStatus, Error> {
+    match status {
+        "created" => Ok(SandboxStatus::Created),
+        "starting" => Ok(SandboxStatus::Starting),
+        "running" => Ok(SandboxStatus::Running),
+        "draining" => Ok(SandboxStatus::Draining),
+        "paused" => Ok(SandboxStatus::Paused),
+        "stopped" => Ok(SandboxStatus::Stopped),
+        "crashed" => Ok(SandboxStatus::Crashed),
+        other => Err(argument_error(
+            ruby,
+            format!("invalid sandbox status {other:?}"),
+        )),
+    }
+}
+
+fn restart_options(ruby: &Ruby, args: &[Value]) -> Result<RestartOptions, Error> {
+    let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(ruby, parsed.keywords, &["force", "timeout", "detached"])?;
+    let mut options = RestartOptions {
+        force: keyword::<bool>(parsed.keywords, "force")?.unwrap_or(false),
+        detached: keyword::<bool>(parsed.keywords, "detached")?.unwrap_or(false),
+        ..Default::default()
+    };
+    if let Some(timeout) = keyword::<f64>(parsed.keywords, "timeout")? {
+        options.timeout = duration(ruby, timeout, "timeout")?;
+    }
+    Ok(options)
+}
+
+fn destroy_options(ruby: &Ruby, args: &[Value]) -> Result<DestroyOptions, Error> {
+    let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(ruby, parsed.keywords, &["force", "timeout"])?;
+    let mut options = DestroyOptions {
+        force: keyword::<bool>(parsed.keywords, "force")?.unwrap_or(false),
+        ..Default::default()
+    };
+    if let Some(timeout) = keyword::<f64>(parsed.keywords, "timeout")? {
+        options.timeout = duration(ruby, timeout, "timeout")?;
+    }
+    Ok(options)
+}
+
+// -------------------------------------------------------------------------------------------------
+// Rlimit parsing
+// -------------------------------------------------------------------------------------------------
+
+fn parse_resource(value: Value, ruby: &Ruby) -> Result<RlimitResource, Error> {
+    match string_value(value, "resource")?.as_str() {
+        "cpu" => Ok(RlimitResource::Cpu),
+        "fsize" => Ok(RlimitResource::Fsize),
+        "data" => Ok(RlimitResource::Data),
+        "stack" => Ok(RlimitResource::Stack),
+        "core" => Ok(RlimitResource::Core),
+        "rss" => Ok(RlimitResource::Rss),
+        "nproc" => Ok(RlimitResource::Nproc),
+        "nofile" => Ok(RlimitResource::Nofile),
+        "memlock" => Ok(RlimitResource::Memlock),
+        "as" => Ok(RlimitResource::As),
+        "locks" => Ok(RlimitResource::Locks),
+        "sigpending" => Ok(RlimitResource::Sigpending),
+        "msgqueue" => Ok(RlimitResource::Msgqueue),
+        "nice" => Ok(RlimitResource::Nice),
+        "rtprio" => Ok(RlimitResource::Rtprio),
+        "rttime" => Ok(RlimitResource::Rttime),
+        other => Err(argument_error(
+            ruby,
+            format!("unknown rlimit resource: {other}"),
+        )),
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Builder / exec option parsing
+// -------------------------------------------------------------------------------------------------
+
+fn apply_builder_options(
+    ruby: &Ruby,
+    mut builder: SandboxBuilder,
+    kwargs: RHash,
+) -> Result<SandboxBuilder, Error> {
+    const ALLOWED: &[&str] = &[
+        "image",
+        "cpus",
+        "max_cpus",
+        "memory",
+        "max_memory",
+        "nested_virt",
+        "detached",
+        "workdir",
+        "shell",
+        "hostname",
+        "user",
+        "env",
+        "labels",
+        "ephemeral",
+        "max_duration",
+        "idle_timeout",
+        "replace",
+        "replace_timeout",
+        "root_disk",
+        "disable_network",
+        "http",
+        "intercept_tls",
+        "network",
+        "proxy",
+        "secrets",
+        "quiet_logs",
+        "entrypoint",
+        "init",
+        "pull_policy",
+        "scripts",
+        "slug",
+    ];
+    reject_unknown_keywords(ruby, kwargs, ALLOWED)?;
+
+    if let Some(v) = keyword::<String>(kwargs, "image")? {
+        builder = builder.image(v);
+    }
+    if let Some(v) = keyword::<u8>(kwargs, "cpus")? {
+        builder = builder.cpus(v);
+    }
+    if let Some(v) = keyword::<u8>(kwargs, "max_cpus")? {
+        builder = builder.max_cpus(v);
+    }
+    if let Some(v) = keyword::<u32>(kwargs, "memory")? {
+        builder = builder.memory(v);
+    }
+    if let Some(enabled) = keyword::<bool>(kwargs, "nested_virt")? {
+        builder = builder.nested_virt(enabled);
+    }
+    if let Some(v) = keyword::<u32>(kwargs, "max_memory")? {
+        builder = builder.max_memory(v);
+    }
+    if let Some(v) = keyword::<bool>(kwargs, "detached")? {
+        builder = builder.detached(v);
+    }
+    if let Some(v) = keyword::<String>(kwargs, "workdir")? {
+        builder = builder.workdir(v);
+    }
+    if let Some(v) = keyword::<String>(kwargs, "shell")? {
+        builder = builder.shell(v);
+    }
+    if let Some(v) = keyword::<String>(kwargs, "hostname")? {
+        builder = builder.hostname(v);
+    }
+    if let Some(v) = keyword::<String>(kwargs, "user")? {
+        builder = builder.user(v);
+    }
+    if let Some(v) = kwargs.get(symbol("env")) {
+        builder = builder.envs(string_map(v, "env")?);
+    }
+    if let Some(v) = kwargs.get(symbol("labels")) {
+        builder = builder.labels(string_map(v, "labels")?);
+    }
+    if let Some(v) = keyword::<bool>(kwargs, "ephemeral")? {
+        builder = builder.ephemeral(v);
+    }
+    if let Some(v) = keyword::<u64>(kwargs, "max_duration")? {
+        builder = builder.max_duration(std::time::Duration::from_secs(v));
+    }
+    if let Some(v) = keyword::<u64>(kwargs, "idle_timeout")? {
+        builder = builder.idle_timeout(std::time::Duration::from_secs(v));
+    }
+    if keyword::<bool>(kwargs, "replace")?.unwrap_or(false) {
+        builder = builder.replace();
+    }
+    if let Some(v) = keyword::<f64>(kwargs, "replace_timeout")? {
+        builder = builder.replace_with_timeout(duration(ruby, v, "replace_timeout")?);
+    }
+    if let Some(v) = keyword::<u32>(kwargs, "root_disk")? {
+        builder = builder.root_disk(v);
+    }
+    if keyword::<bool>(kwargs, "disable_network")?.unwrap_or(false) {
+        builder = builder.disable_network();
+    }
+    if let Some(net) = kwargs.get(symbol("network")) {
+        if let Some(sym) = Symbol::from_value(net) {
+            if sym.name()?.as_ref() != "none" {
+                return Err(argument_error(ruby, "network must be :none or a Hash"));
+            }
+            builder = builder.disable_network();
+        } else {
+            let policy = restricted_network_policy(ruby, net)?;
+            builder = builder.network(|n| n.policy(policy));
+        }
+    }
+    if let Some(http) = keyword::<RHash>(kwargs, "http")? {
+        reject_unknown_keywords(
+            ruby,
+            http,
+            &[
+                "deny_response",
+                "deny_response_format",
+                "deny_message",
+                "network_deny_message",
+                "secret_deny_message",
+            ],
+        )?;
+        if let Some(enabled) = keyword::<bool>(http, "deny_response")? {
+            builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+        }
+        if let Some(format) = keyword::<Value>(http, "deny_response_format")?
+            .map(|value| string_value(value, "deny_response_format"))
+            .transpose()?
+        {
+            let format = match format.as_str() {
+                "text" => microsandbox_core::sandbox::HttpDenyResponseFormat::Text,
+                "json" => microsandbox_core::sandbox::HttpDenyResponseFormat::Json,
+                _ => {
+                    return Err(argument_error(
+                        ruby,
+                        "deny_response_format must be text or json",
+                    ));
+                }
+            };
+            builder = builder.network(|network| network.http(|h| h.deny_response_format(format)));
+        }
+        if let Some(message) = keyword::<String>(http, "deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.deny_message(message)));
+        }
+        if let Some(message) = keyword::<String>(http, "network_deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.network_deny_message(message)));
+        }
+        if let Some(message) = keyword::<String>(http, "secret_deny_message")? {
+            builder = builder.network(|network| network.http(|h| h.secret_deny_message(message)));
+        }
+    }
+    if keyword::<bool>(kwargs, "intercept_tls")?.unwrap_or(false) {
+        builder = builder.intercept_tls();
+    }
+    if let Some(proxy) = keyword::<typed_data::Obj<RubyOutboundProxy>>(kwargs, "proxy")? {
+        builder = apply_outbound_proxy(builder, &proxy);
+    }
+    if let Some(v) = kwargs.get(symbol("secrets")) {
+        builder = apply_secret_options(ruby, builder, v)?;
+    }
+    if keyword::<bool>(kwargs, "quiet_logs")?.unwrap_or(false) {
+        builder = builder.quiet_logs();
+    }
+    if let Some(v) = kwargs.get(symbol("entrypoint")) {
+        let parts = string_array(v, "entrypoint")?;
+        builder = builder.entrypoint(parts);
+    }
+    if let Some(v) = keyword::<String>(kwargs, "init")? {
+        builder = builder.init(v);
+    }
+    if let Some(v) = keyword::<Value>(kwargs, "pull_policy")?
+        .map(|value| string_value(value, "pull_policy"))
+        .transpose()?
+    {
+        let p = match v.to_ascii_lowercase().as_str() {
+            "if_missing" | "if-missing" => PullPolicy::IfMissing,
+            "always" => PullPolicy::Always,
+            "never" => PullPolicy::Never,
+            other => {
+                return Err(argument_error(
+                    ruby,
+                    format!("pull_policy must be if_missing, always, or never; got {other}"),
+                ));
+            }
+        };
+        builder = builder.pull_policy(p);
+    }
+    if let Some(v) = kwargs.get(symbol("scripts")) {
+        builder = builder.scripts(string_map(v, "scripts")?);
+    }
+    if let Some(v) = keyword::<String>(kwargs, "slug")? {
+        builder = builder.slug(v);
+    }
+    Ok(builder)
+}
+
+fn apply_exec_options(
+    ruby: &Ruby,
+    mut builder: ExecOptionsBuilder,
+    kwargs: RHash,
+) -> Result<ExecOptionsBuilder, Error> {
+    const ALLOWED: &[&str] = &["cwd", "user", "env", "timeout", "stdin", "tty", "rlimits"];
+    reject_unknown_keywords(ruby, kwargs, ALLOWED)?;
+
+    if let Some(v) = keyword::<String>(kwargs, "cwd")? {
+        builder = builder.cwd(v);
+    }
+    if let Some(v) = keyword::<String>(kwargs, "user")? {
+        builder = builder.user(v);
+    }
+    if let Some(v) = kwargs.get(symbol("env")) {
+        builder = builder.envs(string_map(v, "env")?);
+    }
+    if let Some(v) = keyword::<f64>(kwargs, "timeout")? {
+        builder = builder.timeout(duration(ruby, v, "timeout")?);
+    }
+    if let Some(v) = keyword::<bool>(kwargs, "tty")? {
+        builder = builder.tty(v);
+    }
+    if let Some(v) = kwargs.get(symbol("stdin")) {
+        if let Some(sym) = Symbol::from_value(v) {
+            match sym.name()?.as_ref() {
+                "null" => builder = builder.stdin_null(),
+                "pipe" => builder = builder.stdin_pipe(),
+                val => {
+                    return Err(argument_error(
+                        ruby,
+                        format!("stdin must be :null, :pipe, or a String; got :{val}"),
+                    ));
+                }
+            }
+        } else {
+            let s = RString::try_convert(v)?;
+            let data = unsafe { s.as_slice() }.to_vec();
+            builder = builder.stdin_bytes(data);
+        }
+    }
+    if let Some(v) = kwargs.get(symbol("rlimits")) {
+        let limits = RHash::try_convert(v).map_err(|_| {
+            argument_error(ruby, "rlimits must be a Hash of resource names to limits")
+        })?;
+        let mut parsed = Vec::with_capacity(limits.len());
+        limits.foreach(|res: Value, val: Value| {
+            let res = parse_resource(res, ruby)?;
+            let lim = u64::try_convert(val)
+                .map_err(|_| argument_error(ruby, "rlimit values must be non-negative integers"))?;
+            parsed.push((res, lim));
+            Ok(ForEach::Continue)
+        })?;
+        for (res, lim) in parsed {
+            builder = builder.rlimit(res, lim);
+        }
+    }
+    Ok(builder)
+}
+
+fn args_and_kwargs(args: &[Value]) -> Result<(String, RArray, RHash), Error> {
+    let parsed = scan_args::<(String,), (Option<RArray>,), (), (), RHash, ()>(args)?;
+    Ok((
+        parsed.required.0,
+        parsed
+            .optional
+            .0
+            .unwrap_or_else(|| current_ruby().ary_new()),
+        parsed.keywords,
+    ))
+}
+
+fn exec_args_and_kwargs(args: &[Value]) -> Result<(String, Vec<String>, RHash), Error> {
+    let (cmd, ary, kw) = args_and_kwargs(args)?;
+    Ok((cmd, ary.to_vec::<String>()?, kw))
+}
+
+// -------------------------------------------------------------------------------------------------
+// Wrapped types
+// -------------------------------------------------------------------------------------------------
+
+#[magnus::wrap(class = "Microsandbox::Sandbox", size)]
+struct RubySandbox {
+    inner: std::cell::RefCell<Option<CoreSandbox>>,
+}
+
+#[magnus::wrap(class = "Microsandbox::SandboxBuilder", free_immediately, size)]
+struct RubySandboxBuilder {
+    inner: std::cell::RefCell<Option<SandboxBuilder>>,
+}
+
+#[magnus::wrap(class = "Microsandbox::OutboundProxy", free_immediately, size)]
+struct RubyOutboundProxy {
+    inner: std::cell::RefCell<RubyOutboundProxyConfig>,
+}
+
+#[magnus::wrap(class = "Microsandbox::SecretSource", free_immediately, size)]
+struct RubySecretSource {
+    inner: SecretSource,
+}
+
+#[magnus::wrap(class = "Microsandbox::ExecOutput", free_immediately, size)]
+struct RubyExecOutput {
+    inner: ExecOutput,
+}
+
+#[magnus::wrap(class = "Microsandbox::SandboxMetrics", free_immediately, size)]
+struct RubySandboxMetrics {
+    inner: SandboxMetrics,
+}
+
+#[magnus::wrap(class = "Microsandbox::LogEntry", free_immediately, size)]
+struct RubyLogEntry {
+    inner: LogEntry,
+}
+
+#[magnus::wrap(class = "Microsandbox::ImageHandle", free_immediately, size)]
+struct RubyImageHandle {
+    inner: ImageHandle,
+}
+
+#[magnus::wrap(class = "Microsandbox::Volume", free_immediately, size)]
+struct RubyVolume {
+    inner: Volume,
+}
+
+#[magnus::wrap(class = "Microsandbox::Checkpoint", free_immediately, size)]
+struct RubySnapshot {
+    inner: Snapshot,
+}
+
+// -------------------------------------------------------------------------------------------------
+// Builder methods
+// -------------------------------------------------------------------------------------------------
+
+fn take_builder(this: &RubySandboxBuilder) -> Result<SandboxBuilder, Error> {
+    this.inner.borrow_mut().take().ok_or_else(|| {
+        Error::new(
+            current_ruby().exception_runtime_error(),
+            "builder has been consumed",
+        )
+    })
+}
+
+fn put_builder<F>(this: &RubySandboxBuilder, update: F) -> Result<(), Error>
+where
+    F: FnOnce(SandboxBuilder) -> SandboxBuilder,
+{
+    let b = take_builder(this)?;
+    *this.inner.borrow_mut() = Some(update(b));
+    Ok(())
+}
+
+impl RubySandboxBuilder {
+    fn image(this: typed_data::Obj<Self>, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.image(v))
+    }
+    fn cpus(this: typed_data::Obj<Self>, v: u8) -> Result<(), Error> {
+        put_builder(&this, |b| b.cpus(v))
+    }
+    fn max_cpus(this: typed_data::Obj<Self>, v: u8) -> Result<(), Error> {
+        put_builder(&this, |b| b.max_cpus(v))
+    }
+    fn memory(this: typed_data::Obj<Self>, v: u32) -> Result<(), Error> {
+        put_builder(&this, |b| b.memory(v))
+    }
+    fn nested_virt(this: typed_data::Obj<Self>, enabled: bool) -> Result<(), Error> {
+        put_builder(&this, |b| b.nested_virt(enabled))
+    }
+    fn max_memory(this: typed_data::Obj<Self>, v: u32) -> Result<(), Error> {
+        put_builder(&this, |b| b.max_memory(v))
+    }
+    fn env(this: typed_data::Obj<Self>, k: String, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.env(k, v))
+    }
+    fn label(this: typed_data::Obj<Self>, k: String, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.label(k, v))
+    }
+    fn workdir(this: typed_data::Obj<Self>, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.workdir(v))
+    }
+    fn shell(this: typed_data::Obj<Self>, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.shell(v))
+    }
+    fn hostname(this: typed_data::Obj<Self>, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.hostname(v))
+    }
+    fn user(this: typed_data::Obj<Self>, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.user(v))
+    }
+    fn detached(this: typed_data::Obj<Self>, v: bool) -> Result<(), Error> {
+        put_builder(&this, |b| b.detached(v))
+    }
+    fn ephemeral(this: typed_data::Obj<Self>, v: bool) -> Result<(), Error> {
+        put_builder(&this, |b| b.ephemeral(v))
+    }
+    fn max_duration(this: typed_data::Obj<Self>, v: u64) -> Result<(), Error> {
+        put_builder(&this, |b| b.max_duration(std::time::Duration::from_secs(v)))
+    }
+    fn idle_timeout(this: typed_data::Obj<Self>, v: u64) -> Result<(), Error> {
+        put_builder(&this, |b| b.idle_timeout(std::time::Duration::from_secs(v)))
+    }
+    fn replace(this: typed_data::Obj<Self>) -> Result<(), Error> {
+        put_builder(&this, SandboxBuilder::replace)
+    }
+    fn replace_with_timeout(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        secs: f64,
+    ) -> Result<(), Error> {
+        let d = duration(ruby, secs, "replace_timeout")?;
+        put_builder(&this, |b| b.replace_with_timeout(d))
+    }
+    fn root_disk(this: typed_data::Obj<Self>, v: u32) -> Result<(), Error> {
+        put_builder(&this, |b| b.root_disk(v))
+    }
+    fn intercept_tls(this: typed_data::Obj<Self>) -> Result<(), Error> {
+        put_builder(&this, SandboxBuilder::intercept_tls)
+    }
+
+    fn disable_network(this: typed_data::Obj<Self>) -> Result<(), Error> {
+        put_builder(&this, SandboxBuilder::disable_network)
+    }
+    fn http(
+        this: typed_data::Obj<Self>,
+        enabled: Option<bool>,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        Self::http_config(this, enabled, None, None, None, message)
+    }
+    fn http_config(
+        this: typed_data::Obj<Self>,
+        enabled: Option<bool>,
+        network_message: Option<String>,
+        secret_message: Option<String>,
+        format: Option<String>,
+        message: Option<String>,
+    ) -> Result<(), Error> {
+        let format = format
+            .map(|format| match format.as_str() {
+                "text" => Ok(microsandbox_core::sandbox::HttpDenyResponseFormat::Text),
+                "json" => Ok(microsandbox_core::sandbox::HttpDenyResponseFormat::Json),
+                _ => Err(argument_error(
+                    &current_ruby(),
+                    "deny_response_format must be text or json",
+                )),
+            })
+            .transpose()?;
+        put_builder(&this, |mut builder| {
+            if let Some(enabled) = enabled {
+                builder = builder.network(|network| network.http(|h| h.deny_response(enabled)));
+            }
+            if let Some(format) = format {
+                builder =
+                    builder.network(|network| network.http(|h| h.deny_response_format(format)));
+            }
+            if let Some(message) = message {
+                builder = builder.network(|network| network.http(|h| h.deny_message(message)));
+            }
+            if let Some(message) = network_message {
+                builder =
+                    builder.network(|network| network.http(|h| h.network_deny_message(message)));
+            }
+            if let Some(message) = secret_message {
+                builder =
+                    builder.network(|network| network.http(|h| h.secret_deny_message(message)));
+            }
+            builder
+        })
+    }
+    fn quiet_logs(this: typed_data::Obj<Self>) -> Result<(), Error> {
+        put_builder(&this, SandboxBuilder::quiet_logs)
+    }
+    fn entrypoint(this: typed_data::Obj<Self>, cmd: RArray) -> Result<(), Error> {
+        let parts = cmd.to_vec::<String>().map_err(|_| {
+            Error::new(
+                current_ruby().exception_type_error(),
+                "entrypoint must contain only Strings",
+            )
+        })?;
+        put_builder(&this, |b| b.entrypoint(parts))
+    }
+    fn init(this: typed_data::Obj<Self>, v: String) -> Result<(), Error> {
+        put_builder(&this, |b| b.init(v))
+    }
+    fn proxy(
+        this: typed_data::Obj<Self>,
+        proxy: typed_data::Obj<RubyOutboundProxy>,
+    ) -> Result<(), Error> {
+        put_builder(&this, |builder| apply_outbound_proxy(builder, &proxy))
+    }
+    fn vsock(this: typed_data::Obj<Self>, host_path: String, port: u32) -> Result<(), Error> {
+        put_builder(&this, |b| b.vsock(host_path, port))
+    }
+    fn vsock_dgram(this: typed_data::Obj<Self>, host_path: String, port: u32) -> Result<(), Error> {
+        put_builder(&this, |b| b.vsock_dgram(host_path, port))
+    }
+    fn create(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RubySandbox, Error> {
+        let b = take_builder(&this)?;
+        let sb = run(ruby, b.create())?;
+        Ok(RubySandbox {
+            inner: std::cell::RefCell::new(Some(sb)),
+        })
+    }
+
+    fn connect_or_create(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RubySandbox, Error> {
+        let builder = take_builder(&this)?;
+        let sandbox = run(ruby, builder.connect_or_create())?;
+        Ok(RubySandbox {
+            inner: std::cell::RefCell::new(Some(sandbox)),
+        })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Sandbox methods
+// -------------------------------------------------------------------------------------------------
+
+impl RubySandbox {
+    fn checkpoint(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        name: String,
+    ) -> Result<RubySnapshot, Error> {
+        let sandbox = this.inner_clone()?;
+        Ok(RubySnapshot {
+            inner: run(ruby, async move { sandbox.checkpoint(&name).await })?,
+        })
+    }
+
+    fn inner_clone(&self) -> Result<CoreSandbox, Error> {
+        self.inner.borrow().as_ref().cloned().ok_or_else(|| {
+            Error::new(
+                current_ruby().exception_runtime_error(),
+                "sandbox handle has been disposed",
+            )
+        })
+    }
+
+    fn name(&self) -> Result<String, Error> {
+        Ok(self.inner_clone()?.name().to_owned())
+    }
+    fn id(&self) -> Result<String, Error> {
+        Ok(self.inner_clone()?.id().to_string())
+    }
+    fn owns_lifecycle(&self) -> Result<bool, Error> {
+        Ok(self.inner_clone()?.owns_lifecycle())
+    }
+    fn backend(&self) -> Result<String, Error> {
+        Ok(match self.inner_clone()?.context_kind() {
+            ContextKind::Local => "local",
+            ContextKind::Remote => "cloud",
+        }
+        .to_owned())
+    }
+
+    /// Fresh persisted settings; inspection never implicitly starts the resource.
+    fn config(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<Value, Error> {
+        let sb = this.inner_clone()?;
+        let config = run(ruby, async move { sb.config().await })?;
+        let json = serde_json::to_string(&config)
+            .map_err(|error| Error::new(ruby.exception_runtime_error(), error.to_string()))?;
+        ruby.require("json")?;
+        ruby.class_object()
+            .const_get::<_, Value>("JSON")?
+            .funcall("parse", (json,))
+    }
+
+    /// One backend observation; returned hashes do not refresh themselves.
+    fn info(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RHash, Error> {
+        let sb = this.inner_clone()?;
+        let info = run(ruby, async move { sb.info().await })?;
+        let json = serde_json::to_string(&info)
+            .map_err(|error| Error::new(ruby.exception_runtime_error(), error.to_string()))?;
+        ruby.require("json")?;
+        let hash: RHash = ruby
+            .class_object()
+            .const_get::<_, Value>("JSON")?
+            .funcall("parse", (json,))?;
+        hash.aset("status", symbol(status_name(info.status)))?;
+        Ok(hash)
+    }
+
+    fn ensure_running(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.ensure_running().await })
+    }
+
+    fn status(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<Symbol, Error> {
+        let sb = this.inner_clone()?;
+        let status = run(ruby, async move { sb.status().await })?;
+        Ok(symbol(status_name(status)))
+    }
+
+    fn last_failure_message(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+    ) -> Result<Option<String>, Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.last_failure_message().await })
+    }
+
+    fn exec(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        args: &[Value],
+    ) -> Result<RubyExecOutput, Error> {
+        let (cmd, cmd_args, kw) = exec_args_and_kwargs(args)?;
+        let sb = this.inner_clone()?;
+        let opts = apply_exec_options(ruby, ExecOptionsBuilder::default(), kw)?;
+        let output = run(ruby, async move {
+            sb.exec_with(cmd, move |_| opts.args(cmd_args)).await
+        })?;
+        Ok(RubyExecOutput { inner: output })
+    }
+
+    /// Execute the persisted entrypoint and command from the retained runtime.
+    fn exec_default(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        args: &[Value],
+    ) -> Result<RubyExecOutput, Error> {
+        let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+        let opts = apply_exec_options(ruby, ExecOptionsBuilder::default(), parsed.keywords)?;
+        let sb = this.inner_clone()?;
+        let output = run(
+            ruby,
+            async move { sb.exec_default_with(move |_| opts).await },
+        )?;
+        Ok(RubyExecOutput { inner: output })
+    }
+
+    fn shell(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        args: &[Value],
+    ) -> Result<RubyExecOutput, Error> {
+        let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+        let script = parsed.required.0;
+        let sb = this.inner_clone()?;
+        let opts = apply_exec_options(ruby, ExecOptionsBuilder::default(), parsed.keywords)?;
+        let output = run(
+            ruby,
+            async move { sb.shell_with(script, move |_| opts).await },
+        )?;
+        Ok(RubyExecOutput { inner: output })
+    }
+
+    fn stop(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
+        let parsed = scan_args::<(), (Option<f64>,), (), (), RHash, ()>(args)?;
+        let timeout = parse_timeout(ruby, parsed.optional.0, parsed.keywords, "stop")?;
+        let sb = this.inner_clone()?;
+        run(ruby, async move {
+            match timeout {
+                Some(timeout) => sb.stop_with_timeout(timeout).await,
+                None => sb.stop().await,
+            }
+        })
+    }
+
+    fn stop_with_timeout(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        seconds: f64,
+    ) -> Result<(), Error> {
+        // A required scalar cannot turn an explicit bounded call into an unbounded stop.
+        let timeout = duration(ruby, seconds, "timeout")?;
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.stop_with_timeout(timeout).await })
+    }
+
+    fn kill(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
+        let parsed = scan_args::<(), (Option<f64>,), (), (), RHash, ()>(args)?;
+        let timeout = parse_timeout(ruby, parsed.optional.0, parsed.keywords, "kill")?;
+        let sb = this.inner_clone()?;
+        run(ruby, async move {
+            match timeout {
+                Some(timeout) => sb.kill_with_timeout(timeout).await,
+                None => sb.kill().await,
+            }
+        })
+    }
+
+    fn request_stop(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.request_stop().await })
+    }
+
+    fn request_kill(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.request_kill().await })
+    }
+
+    fn wait_until_stopped(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RHash, Error> {
+        let sb = this.inner_clone()?;
+        stop_result_hash(run(ruby, async move { sb.wait_until_stopped().await })?)
+    }
+
+    fn wait_for_status(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        status: Value,
+    ) -> Result<(), Error> {
+        let sandbox = this.inner_clone()?;
+        let status = parse_status(ruby, &string_value(status, "status")?)?;
+        run(ruby, async move { sandbox.wait_for_status(status).await })
+    }
+
+    fn restart(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        args: &[Value],
+    ) -> Result<RubySandbox, Error> {
+        let options = restart_options(ruby, args)?;
+        let sandbox = this.inner_clone()?;
+        let restarted = run(ruby, async move { sandbox.restart_with(options).await })?;
+        Ok(RubySandbox {
+            inner: std::cell::RefCell::new(Some(restarted)),
+        })
+    }
+
+    fn destroy(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
+        let options = destroy_options(ruby, args)?;
+        let sandbox = this.inner_clone()?;
+        run(ruby, async move { sandbox.destroy_with(options).await })
+    }
+
+    fn ping(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RHash, Error> {
+        let sb = this.inner_clone()?;
+        ping_result_hash(run(ruby, async move { sb.ping().await })?)
+    }
+
+    fn touch(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RHash, Error> {
+        let sb = this.inner_clone()?;
+        touch_result_hash(run(ruby, async move { sb.touch().await })?)
+    }
+
+    fn metrics(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RubySandboxMetrics, Error> {
+        let sb = this.inner_clone()?;
+        let inner = run(ruby, async move { sb.metrics().await })?;
+        Ok(RubySandboxMetrics { inner })
+    }
+
+    fn logs(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<RArray, Error> {
+        let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+        reject_unknown_keywords(ruby, parsed.keywords, &["tail", "sources"])?;
+        let mut opts = LogOptions::default();
+        if let Some(tail) = keyword::<usize>(parsed.keywords, "tail")? {
+            opts.tail = Some(tail);
+        }
+        if let Some(value) = parsed.keywords.get(symbol("sources")) {
+            let sources = RArray::try_convert(value).map_err(|_| {
+                argument_error(ruby, "sources must be an Array of symbols or strings")
+            })?;
+            for index in 0..sources.len() {
+                let value: Value = sources.entry(index as isize)?;
+                let name = string_value(value, "sources")?;
+                opts.sources.push(parse_log_source(ruby, &name)?);
+            }
+        }
+        let sb = this.inner_clone()?;
+        let entries = run(ruby, async move { sb.logs(&opts).await })?;
+        let array = current_ruby().ary_new();
+        for entry in entries {
+            array.push(RubyLogEntry { inner: entry })?;
+        }
+        Ok(array)
+    }
+    fn ssh_exec(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<RHash, Error> {
+        let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+        reject_unknown_keywords(ruby, parsed.keywords, &["inactivity_timeout"])?;
+        let inactivity_timeout = keyword::<f64>(parsed.keywords, "inactivity_timeout")?
+            .map(|seconds| duration(ruby, seconds, "inactivity_timeout"))
+            .transpose()?;
+        let command = parsed.required.0;
+        let sb = this.inner_clone()?;
+        let output = run(ruby, async move {
+            let client = sb
+                .ssh()
+                .connect_with(|builder| match inactivity_timeout {
+                    Some(timeout) => builder.inactivity_timeout(timeout),
+                    None => builder,
+                })
+                .await?;
+            client.exec(command).await
+        })?;
+        let hash = current_ruby().hash_new();
+        hash.aset("stdout", current_ruby().str_from_slice(&output.stdout))?;
+        hash.aset("stderr", current_ruby().str_from_slice(&output.stderr))?;
+        hash.aset("exit_code", output.status)?;
+        hash.aset("success", output.status == 0)?;
+        Ok(hash)
+    }
+
+    // -- filesystem ----------------------------------------------------------
+
+    fn fs_read(ruby: &Ruby, this: typed_data::Obj<Self>, path: String) -> Result<RString, Error> {
+        let sb = this.inner_clone()?;
+        let data = run(ruby, async move { sb.fs().read(&path).await })?;
+        Ok(current_ruby().str_from_slice(&data))
+    }
+
+    fn fs_write(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        path: String,
+        data: RString,
+    ) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        let bytes = unsafe { data.as_slice() }.to_vec();
+        run(ruby, async move { sb.fs().write(&path, bytes).await })
+    }
+
+    fn fs_mkdir(ruby: &Ruby, this: typed_data::Obj<Self>, path: String) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.fs().mkdir(&path).await })
+    }
+
+    fn fs_list(ruby: &Ruby, this: typed_data::Obj<Self>, path: String) -> Result<RArray, Error> {
+        let sb = this.inner_clone()?;
+        let entries = run(ruby, async move { sb.fs().list(&path).await })?;
+        let ary = current_ruby().ary_new();
+        for e in entries {
+            ary.push(fs_entry_hash(e)?)?;
+        }
+        Ok(ary)
+    }
+
+    fn fs_stat(ruby: &Ruby, this: typed_data::Obj<Self>, path: String) -> Result<RHash, Error> {
+        let sb = this.inner_clone()?;
+        let md = run(ruby, async move { sb.fs().stat(&path).await })?;
+        fs_metadata_hash(md)
+    }
+
+    fn fs_exists(ruby: &Ruby, this: typed_data::Obj<Self>, path: String) -> Result<bool, Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.fs().exists(&path).await })
+    }
+
+    fn fs_copy(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        from: String,
+        to: String,
+    ) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.fs().copy(&from, &to).await })
+    }
+
+    fn fs_rename(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        from: String,
+        to: String,
+    ) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.fs().rename(&from, &to).await })
+    }
+
+    fn fs_remove(ruby: &Ruby, this: typed_data::Obj<Self>, path: String) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.fs().remove(&path).await })
+    }
+
+    fn fs_remove_dir(ruby: &Ruby, this: typed_data::Obj<Self>, path: String) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.fs().remove_dir(&path).await })
+    }
+
+    fn fs_copy_from_host(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        host_path: String,
+        guest_path: String,
+    ) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move {
+            sb.fs().copy_from_host(&host_path, &guest_path).await
+        })
+    }
+
+    fn fs_copy_to_host(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        guest_path: String,
+        host_path: String,
+    ) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move {
+            sb.fs().copy_to_host(&guest_path, &host_path).await
+        })
+    }
+
+    // -- lifecycle -----------------------------------------------------------
+
+    fn detach(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.detach().await })
+    }
+
+    fn shutdown_owned(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<(), Error> {
+        let sb = this.inner_clone()?;
+        run(ruby, async move { sb.shutdown_owned().await })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Handle methods
+// -------------------------------------------------------------------------------------------------
+
+impl RubyExecOutput {
+    fn stdout(&self) -> RString {
+        current_ruby().str_from_slice(self.inner.stdout_bytes())
+    }
+    fn stderr(&self) -> RString {
+        current_ruby().str_from_slice(self.inner.stderr_bytes())
+    }
+    fn stdout_bytes(&self) -> RString {
+        current_ruby().str_from_slice(self.inner.stdout_bytes())
+    }
+    fn stderr_bytes(&self) -> RString {
+        current_ruby().str_from_slice(self.inner.stderr_bytes())
+    }
+    fn exit_code(&self) -> i32 {
+        self.inner.status().code
+    }
+    fn success(&self) -> bool {
+        self.inner.status().success
+    }
+    fn to_h(&self) -> Result<RHash, Error> {
+        let hash = current_ruby().hash_new();
+        hash.aset("stdout", self.stdout())?;
+        hash.aset("stderr", self.stderr())?;
+        hash.aset("exit_code", self.exit_code())?;
+        hash.aset("success", self.success())?;
+        Ok(hash)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Metrics methods
+// -------------------------------------------------------------------------------------------------
+
+impl RubySandboxMetrics {
+    fn to_h(&self) -> Result<RHash, Error> {
+        let metrics = &self.inner;
+        let hash = current_ruby().hash_new();
+        hash.aset("cpu_percent", metrics.cpu_percent as f64)?;
+        hash.aset("vcpu_time_ns", metrics.vcpu_time_ns)?;
+        hash.aset("memory_bytes", metrics.memory_bytes)?;
+        hash.aset("memory_limit_bytes", metrics.memory_limit_bytes)?;
+        hash.aset("disk_read_bytes", metrics.disk_read_bytes)?;
+        hash.aset("disk_write_bytes", metrics.disk_write_bytes)?;
+        hash.aset("net_rx_bytes", metrics.net_rx_bytes)?;
+        hash.aset("net_tx_bytes", metrics.net_tx_bytes)?;
+        hash.aset("uptime_ms", metrics.uptime.as_millis() as u64)?;
+        hash.aset("timestamp", metrics.timestamp.to_rfc3339())?;
+        Ok(hash)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// LogEntry methods
+// -------------------------------------------------------------------------------------------------
+
+impl RubyLogEntry {
+    fn timestamp(&self) -> String {
+        self.inner.timestamp.to_rfc3339()
+    }
+    fn source(&self) -> Symbol {
+        symbol(log_source_name(&self.inner.source))
+    }
+    fn data(&self) -> RString {
+        current_ruby().str_from_slice(&self.inner.data)
+    }
+    fn to_h(&self) -> Result<RHash, Error> {
+        let hash = current_ruby().hash_new();
+        hash.aset("timestamp", self.timestamp())?;
+        hash.aset("source", self.source())?;
+        hash.aset("data", self.data())?;
+        Ok(hash)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// ImageHandle methods
+// -------------------------------------------------------------------------------------------------
+
+impl RubyImageHandle {
+    fn reference(&self) -> String {
+        self.inner.reference().to_owned()
+    }
+    fn size_bytes(&self) -> Option<i64> {
+        self.inner.size_bytes()
+    }
+    fn manifest_digest(&self) -> Option<String> {
+        self.inner.manifest_digest().map(str::to_owned)
+    }
+    fn architecture(&self) -> Option<String> {
+        self.inner.architecture().map(str::to_owned)
+    }
+    fn os(&self) -> Option<String> {
+        self.inner.os().map(str::to_owned)
+    }
+    fn layer_count(&self) -> usize {
+        self.inner.layer_count()
+    }
+    fn created_at(&self) -> Option<String> {
+        self.inner.created_at().map(|dt| dt.to_rfc3339())
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Volume methods
+// -------------------------------------------------------------------------------------------------
+
+impl RubyVolume {
+    /// Identity is available without I/O and remains bound to the retained context.
+    fn id(&self) -> String {
+        self.inner.id().to_string()
+    }
+    fn path(&self) -> Result<String, Error> {
+        self.inner
+            .path()
+            .map(|path| path.display().to_string())
+            .map_err(|error| core_error(&current_ruby(), error))
+    }
+    fn name(&self) -> String {
+        self.inner.name().to_owned()
+    }
+    fn kind(&self) -> Symbol {
+        symbol(self.inner.kind().as_str())
+    }
+    fn info(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RHash, Error> {
+        let volume = this.inner.clone();
+        let info = run(ruby, async move { volume.info().await })?;
+        let mut value =
+            serde_json::to_value(&info).map_err(|error| argument_error(ruby, error.to_string()))?;
+        value["labels"] = serde_json::to_value(
+            info.labels
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .map_err(|error| argument_error(ruby, error.to_string()))?;
+        ruby.require("json")?;
+        let hash: RHash = ruby
+            .class_object()
+            .const_get::<_, Value>("JSON")?
+            .funcall("parse", (value.to_string(),))?;
+        hash.aset("kind", symbol(info.kind.as_str()))?;
+        Ok(hash)
+    }
+    fn created_at(&self) -> Option<String> {
+        self.inner.created_at().map(|dt| dt.to_rfc3339())
+    }
+    fn destroy(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<(), Error> {
+        let handle = this.inner.clone();
+        run(ruby, async move { handle.destroy().await })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Snapshot methods
+// -------------------------------------------------------------------------------------------------
+
+impl RubySnapshot {
+    fn remove(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        args: &[Value],
+    ) -> Result<snapshot_group::RubyCheckpointRemoveResult, Error> {
+        let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+        reject_unknown_keywords(ruby, parsed.keywords, &["force"])?;
+        let force = keyword::<bool>(parsed.keywords, "force")?.unwrap_or(false);
+        let checkpoint = this.inner.clone();
+        let inner = run(ruby, async move {
+            checkpoint
+                .remove_with(|options| if force { options.force() } else { options })
+                .await
+        })?;
+        Ok(snapshot_group::RubyCheckpointRemoveResult { inner })
+    }
+
+    fn id(&self) -> String {
+        self.inner.id().to_owned()
+    }
+
+    // Ruby methods keep their blocking style while the runtime performs a fresh lookup.
+    fn manifest(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<Value, Error> {
+        let snapshot = this.inner.clone();
+        let manifest = run(ruby, async move { snapshot.manifest().await })?;
+        let json = serde_json::to_string(&manifest)
+            .map_err(|error| argument_error(ruby, error.to_string()))?;
+        ruby.require("json")?;
+        ruby.class_object()
+            .const_get::<_, Value>("JSON")?
+            .funcall("parse", (json,))
+    }
+
+    fn state(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<Value, Error> {
+        let snapshot = this.inner.clone();
+        let state = run(ruby, async move { snapshot.state().await })?;
+        let json = serde_json::to_string(&state)
+            .map_err(|error| argument_error(ruby, error.to_string()))?;
+        ruby.require("json")?;
+        ruby.class_object()
+            .const_get::<_, Value>("JSON")?
+            .funcall("parse", (json,))
+    }
+
+    fn digest(&self) -> String {
+        self.inner.digest().to_owned()
+    }
+    fn name(&self) -> Option<String> {
+        self.inner.name().map(str::to_owned)
+    }
+    fn size_bytes(&self) -> Option<u64> {
+        self.inner.size_bytes()
+    }
+    fn image_ref(&self) -> String {
+        self.inner.image_ref().to_owned()
+    }
+    fn state_kind(&self) -> Symbol {
+        symbol(self.inner.state_kind().as_str())
+    }
+    fn reference(&self) -> String {
+        self.inner.reference().value().to_owned()
+    }
+    fn reference_kind(&self) -> Symbol {
+        symbol(self.inner.reference().kind())
+    }
+    fn destroy(ruby: &Ruby, this: typed_data::Obj<Self>, force: bool) -> Result<(), Error> {
+        let handle = this.inner.clone();
+        run(ruby, async move { handle.destroy(force).await })
+    }
+    fn save_to(ruby: &Ruby, this: typed_data::Obj<Self>, args: &[Value]) -> Result<(), Error> {
+        let (out, opts) = parse_snapshot_save_args(ruby, args)?;
+        let handle = this.inner.clone();
+        run(ruby, async move { handle.save_to(&out, opts).await })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Module functions
+// -------------------------------------------------------------------------------------------------
+
+fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn installed() -> bool {
+    microsandbox_core::setup::is_runtime_installed(
+        &microsandbox_core::config::GlobalConfig::default(),
+    )
+}
+
+fn install(ruby: &Ruby) -> Result<(), Error> {
+    run(ruby, async {
+        microsandbox_core::setup::install_runtime(
+            &microsandbox_core::config::GlobalConfig::default(),
+            Default::default(),
+        )
+        .await
+        .map(|_| ())
+    })
+}
+
+fn set_runtime_msb_path(path: String) {
+    microsandbox_core::config::set_sdk_msb_path(path);
+}
+
+fn set_runtime_libkrunfw_path(path: String) {
+    microsandbox_core::config::set_sdk_libkrunfw_path(path);
+}
+
+// -- Sandbox statics ---------------------------------------------------------
+
+fn sandbox_builder(name: String) -> RubySandboxBuilder {
+    RubySandboxBuilder {
+        inner: std::cell::RefCell::new(Some(SandboxBuilder::new(name))),
+    }
+}
+
+fn outbound_proxy_socks4(address: String) -> RubyOutboundProxy {
+    RubyOutboundProxy {
+        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::Socks4 {
+            address,
+            user_id: None,
+        }),
+    }
+}
+
+fn outbound_proxy_http_connect(address: String) -> RubyOutboundProxy {
+    RubyOutboundProxy {
+        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::HttpConnect {
+            address,
+            credentials: None,
+        }),
+    }
+}
+
+fn outbound_proxy_socks5(address: String) -> RubyOutboundProxy {
+    RubyOutboundProxy {
+        inner: std::cell::RefCell::new(RubyOutboundProxyConfig::Socks5 {
+            address,
+            credentials: None,
+        }),
+    }
+}
+
+fn secret_source_env(ruby: &Ruby, variable: String) -> Result<RubySecretSource, Error> {
+    if variable.is_empty() {
+        return Err(argument_error(
+            ruby,
+            "secret source environment variable must not be empty",
+        ));
+    }
+    Ok(RubySecretSource {
+        inner: SecretSource::env(variable),
+    })
+}
+
+impl RubyOutboundProxy {
+    fn user_id(ruby: &Ruby, this: typed_data::Obj<Self>, user_id: String) -> Result<(), Error> {
+        match &mut *this.inner.borrow_mut() {
+            RubyOutboundProxyConfig::Socks4 {
+                user_id: configured,
+                ..
+            } => {
+                *configured = Some(user_id);
+                Ok(())
+            }
+            RubyOutboundProxyConfig::Socks5 { .. } => Err(argument_error(
+                ruby,
+                "user_id is only supported for SOCKS4 proxies",
+            )),
+            RubyOutboundProxyConfig::HttpConnect { .. } => Err(argument_error(
+                ruby,
+                "user_id is only supported for SOCKS4 proxies",
+            )),
+        }
+    }
+
+    fn credentials(
+        ruby: &Ruby,
+        this: typed_data::Obj<Self>,
+        username: String,
+        password: typed_data::Obj<RubySecretSource>,
+    ) -> Result<(), Error> {
+        match &mut *this.inner.borrow_mut() {
+            RubyOutboundProxyConfig::Socks4 { .. } => Err(argument_error(
+                ruby,
+                "credentials are only supported for SOCKS5 and HTTP CONNECT proxies",
+            )),
+            RubyOutboundProxyConfig::HttpConnect { credentials, .. }
+            | RubyOutboundProxyConfig::Socks5 { credentials, .. } => {
+                *credentials = Some((username, password.inner.clone()));
+                Ok(())
+            }
+        }
+    }
+}
+
+fn sandbox_create(ruby: &Ruby, args: &[Value]) -> Result<RubySandbox, Error> {
+    sandbox_create_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn sandbox_create_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubySandbox, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    let builder = apply_builder_options(
+        ruby,
+        context.sandboxes().builder(parsed.required.0),
+        parsed.keywords,
+    )?;
+    let inner = run(ruby, builder.create())?;
+    Ok(RubySandbox {
+        inner: std::cell::RefCell::new(Some(inner)),
+    })
+}
+
+fn sandbox_connect_or_create(ruby: &Ruby, args: &[Value]) -> Result<RubySandbox, Error> {
+    sandbox_connect_or_create_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn sandbox_connect_or_create_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubySandbox, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    let builder = apply_builder_options(
+        ruby,
+        context.sandboxes().builder(parsed.required.0),
+        parsed.keywords,
+    )?;
+    let inner = run(ruby, builder.connect_or_create())?;
+    Ok(RubySandbox {
+        inner: std::cell::RefCell::new(Some(inner)),
+    })
+}
+
+fn sandbox_start(ruby: &Ruby, args: &[Value]) -> Result<RubySandbox, Error> {
+    sandbox_start_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn sandbox_start_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubySandbox, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(ruby, parsed.keywords, &["detached"])?;
+    let name = parsed.required.0;
+    let detached = keyword::<bool>(parsed.keywords, "detached")?.unwrap_or(false);
+    let inner = run(ruby, async move {
+        if detached {
+            context.sandboxes().start_detached(&name).await
+        } else {
+            context.sandboxes().start(&name).await
+        }
+    })?;
+    Ok(RubySandbox {
+        inner: std::cell::RefCell::new(Some(inner)),
+    })
+}
+
+fn sandbox_get(ruby: &Ruby, args: &[Value]) -> Result<RubySandbox, Error> {
+    sandbox_get_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn sandbox_get_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubySandbox, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "get does not accept keywords"));
+    }
+    let name = parsed.required.0;
+    let inner = run(ruby, async move { context.sandboxes().get(&name).await })?;
+    Ok(RubySandbox {
+        inner: std::cell::RefCell::new(Some(inner)),
+    })
+}
+
+fn sandbox_get_running(ruby: &Ruby, args: &[Value]) -> Result<RubySandbox, Error> {
+    sandbox_get_running_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn sandbox_get_running_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubySandbox, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(ruby, parsed.keywords, &[])?;
+    let name = parsed.required.0;
+    let sandboxes = CoreSandbox::ctx(context.as_ref());
+    let inner = run(ruby, async move { sandboxes.get_running(&name).await })?;
+    Ok(RubySandbox {
+        inner: std::cell::RefCell::new(Some(inner)),
+    })
+}
+
+fn sandbox_remove(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
+    sandbox_remove_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn sandbox_remove_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<(), Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "remove does not accept keywords"));
+    }
+    let name = parsed.required.0;
+    run(ruby, async move { context.sandboxes().remove(&name).await })
+}
+
+fn sandbox_list(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
+    sandbox_list_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn sandbox_list_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RHash, Error> {
+    let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(ruby, parsed.keywords, &["cursor", "limit", "labels"])?;
+    let cursor = keyword::<String>(parsed.keywords, "cursor")?;
+    let limit = keyword::<u32>(parsed.keywords, "limit")?;
+    let labels = parsed
+        .keywords
+        .get(symbol("labels"))
+        .map(|value| string_map(value, "labels"))
+        .transpose()?;
+    let page = run_catalog_list(ruby, context, |context| async move {
+        context
+            .sandboxes()
+            .list_with(move |mut builder| {
+                if let Some(limit) = limit {
+                    builder = builder.limit(limit);
+                }
+                if let Some(cursor) = cursor {
+                    builder = builder.cursor(cursor);
+                }
+                if let Some(labels) = labels {
+                    builder = builder.labels(labels);
+                }
+                builder
+            })
+            .await
+    })?;
+    page_hash(page)
+}
+
+// -- Volume statics ----------------------------------------------------------
+
+fn volume_get(ruby: &Ruby, args: &[Value]) -> Result<RubyVolume, Error> {
+    volume_get_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn volume_get_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubyVolume, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "get does not accept keywords"));
+    }
+    let name = parsed.required.0;
+    let inner = run(ruby, async move { context.volumes().get(&name).await })?;
+    Ok(RubyVolume { inner })
+}
+
+fn volume_list(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
+    volume_list_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn volume_list_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RArray, Error> {
+    let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "list does not accept keywords"));
+    }
+    let handles = run_catalog_list(ruby, context, |context| async move {
+        context.volumes().list().await
+    })?;
+    let array = current_ruby().ary_new();
+    for inner in handles {
+        array.push(RubyVolume { inner })?;
+    }
+    Ok(array)
+}
+
+fn volume_remove(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
+    volume_remove_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn volume_remove_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<(), Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "remove does not accept keywords"));
+    }
+    let name = parsed.required.0;
+    run(ruby, async move { context.volumes().remove(&name).await })
+}
+
+fn volume_builder(name: String) -> RubyVolumeBuilder {
+    RubyVolumeBuilder {
+        inner: std::cell::RefCell::new(Some(Volume::builder(name))),
+    }
+}
+
+// -- Snapshot statics --------------------------------------------------------
+
+fn snapshot_open(ruby: &Ruby, args: &[Value]) -> Result<RubySnapshot, Error> {
+    snapshot_open_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn snapshot_open_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubySnapshot, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "open does not accept keywords"));
+    }
+    let reference = parsed.required.0;
+    let inner = run(
+        ruby,
+        async move { context.checkpoints().open(&reference).await },
+    )?;
+    Ok(RubySnapshot { inner })
+}
+
+fn snapshot_get(ruby: &Ruby, args: &[Value]) -> Result<RubySnapshot, Error> {
+    snapshot_get_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn snapshot_get_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RubySnapshot, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "get does not accept keywords"));
+    }
+    let name = parsed.required.0;
+    let inner = run(ruby, async move { context.checkpoints().get(&name).await })?;
+    Ok(RubySnapshot { inner })
+}
+
+fn snapshot_list(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
+    snapshot_list_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn snapshot_list_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<RArray, Error> {
+    let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "list does not accept keywords"));
+    }
+    let handles = run_catalog_list(ruby, context, |context| async move {
+        context.checkpoints().list().await
+    })?;
+    let array = current_ruby().ary_new();
+    for inner in handles {
+        array.push(RubySnapshot { inner })?;
+    }
+    Ok(array)
+}
+
+fn snapshot_remove(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
+    snapshot_remove_in(microsandbox_core::context::configured_context(), ruby, args)
+}
+
+fn snapshot_remove_in(
+    context: Arc<dyn microsandbox_core::Context>,
+    ruby: &Ruby,
+    args: &[Value],
+) -> Result<(), Error> {
+    let parsed = scan_args::<(String,), (Option<bool>,), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "remove does not accept keywords"));
+    }
+    let name = parsed.required.0;
+    let force = parsed.optional.0.unwrap_or(false);
+    run(ruby, async move {
+        context.checkpoints().remove(&name, force).await
+    })
+}
+
+fn snapshot_save(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
+    let parsed = scan_args::<(String, String), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(
+        ruby,
+        parsed.keywords,
+        &[
+            "with_parents",
+            "with_image",
+            "plain_tar",
+            "since",
+            "last_layers",
+            "compatibility",
+        ],
+    )?;
+    let reference = parsed.required.0;
+    let out = PathBuf::from(parsed.required.1);
+    let opts = snapshot_save_opts(ruby, parsed.keywords)?;
+    run(ruby, async move {
+        Snapshot::save_by_reference(&reference, &out, opts).await
+    })
+}
+
+// -- Image statics -----------------------------------------------------------
+
+fn image_get(ruby: &Ruby, args: &[Value]) -> Result<RubyImageHandle, Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "get does not accept keywords"));
+    }
+    let reference = parsed.required.0;
+    let inner = run(ruby, async move { Image::get(&reference).await })?;
+    Ok(RubyImageHandle { inner })
+}
+
+fn image_list(ruby: &Ruby, args: &[Value]) -> Result<RArray, Error> {
+    let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "list does not accept keywords"));
+    }
+    let handles = run(ruby, Image::list())?;
+    let array = current_ruby().ary_new();
+    for inner in handles {
+        array.push(RubyImageHandle { inner })?;
+    }
+    Ok(array)
+}
+
+fn image_remove(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
+    let parsed = scan_args::<(String,), (Option<bool>,), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "remove does not accept keywords"));
+    }
+    let reference = parsed.required.0;
+    let force = parsed.optional.0.unwrap_or(false);
+    run(ruby, async move { Image::remove(&reference, force).await })
+}
+
+fn image_prune(ruby: &Ruby, args: &[Value]) -> Result<RHash, Error> {
+    let parsed = scan_args::<(), (), (), (), RHash, ()>(args)?;
+    if !parsed.keywords.is_empty() {
+        return Err(argument_error(ruby, "prune does not accept keywords"));
+    }
+    let report = run(ruby, Image::prune())?;
+    let hash = current_ruby().hash_new();
+    hash.aset("image_refs_removed", report.image_refs_removed)?;
+    hash.aset("manifests_removed", report.manifests_removed)?;
+    hash.aset("layers_removed", report.layers_removed)?;
+    hash.aset("bytes_reclaimed", report.bytes_reclaimed)?;
+    Ok(hash)
+}
+
+// -------------------------------------------------------------------------------------------------
+// VolumeBuilder (lightweight — not a typed_data object, just a Ruby wrapper)
+// -------------------------------------------------------------------------------------------------
+
+#[magnus::wrap(class = "Microsandbox::VolumeBuilder", size)]
+struct RubyVolumeBuilder {
+    inner: std::cell::RefCell<Option<microsandbox_core::volume::VolumeBuilder>>,
+}
+
+fn take_volume_builder(
+    this: &RubyVolumeBuilder,
+) -> Result<microsandbox_core::volume::VolumeBuilder, Error> {
+    this.inner.borrow_mut().take().ok_or_else(|| {
+        Error::new(
+            current_ruby().exception_runtime_error(),
+            "volume builder has been consumed",
+        )
+    })
+}
+
+fn put_volume_builder<F>(this: &RubyVolumeBuilder, update: F) -> Result<(), Error>
+where
+    F: FnOnce(microsandbox_core::volume::VolumeBuilder) -> microsandbox_core::volume::VolumeBuilder,
+{
+    let builder = take_volume_builder(this)?;
+    *this.inner.borrow_mut() = Some(update(builder));
+    Ok(())
+}
+
+impl RubyVolumeBuilder {
+    fn directory(this: typed_data::Obj<Self>) -> Result<typed_data::Obj<Self>, Error> {
+        put_volume_builder(&this, |builder| builder.directory())?;
+        Ok(this)
+    }
+
+    fn disk(this: typed_data::Obj<Self>) -> Result<typed_data::Obj<Self>, Error> {
+        put_volume_builder(&this, |builder| builder.disk())?;
+        Ok(this)
+    }
+
+    fn quota(this: typed_data::Obj<Self>, mib: u32) -> Result<typed_data::Obj<Self>, Error> {
+        put_volume_builder(&this, |builder| builder.quota(mib))?;
+        Ok(this)
+    }
+
+    fn size(this: typed_data::Obj<Self>, mib: u32) -> Result<typed_data::Obj<Self>, Error> {
+        put_volume_builder(&this, |builder| builder.size(mib))?;
+        Ok(this)
+    }
+
+    fn label(
+        this: typed_data::Obj<Self>,
+        key: String,
+        value: String,
+    ) -> Result<typed_data::Obj<Self>, Error> {
+        put_volume_builder(&this, |builder| builder.label(key, value))?;
+        Ok(this)
+    }
+
+    fn create(ruby: &Ruby, this: typed_data::Obj<Self>) -> Result<RubyVolume, Error> {
+        // Keep the builder's captured destination and the exact created identity.
+        let builder = take_volume_builder(&this)?;
+        let inner = run(ruby, async move { builder.create().await })?;
+        Ok(RubyVolume { inner })
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Conversion helpers
+// -------------------------------------------------------------------------------------------------
+
+fn status_name(status: SandboxStatus) -> &'static str {
+    match status {
+        SandboxStatus::Created => "created",
+        SandboxStatus::Starting => "starting",
+        SandboxStatus::Running => "running",
+        SandboxStatus::Draining => "draining",
+        SandboxStatus::Paused => "paused",
+        SandboxStatus::Stopped => "stopped",
+        SandboxStatus::Crashed => "crashed",
+    }
+}
+
+fn log_source_name(src: &LogSource) -> &'static str {
+    match src {
+        LogSource::Stdout => "stdout",
+        LogSource::Stderr => "stderr",
+        LogSource::Output => "output",
+        LogSource::System => "system",
+    }
+}
+
+fn parse_log_source(ruby: &Ruby, name: &str) -> Result<LogSource, Error> {
+    match name {
+        "stdout" => Ok(LogSource::Stdout),
+        "stderr" => Ok(LogSource::Stderr),
+        "output" => Ok(LogSource::Output),
+        "system" => Ok(LogSource::System),
+        other => Err(argument_error(ruby, format!("unknown log source: {other}"))),
+    }
+}
+
+fn stop_result_hash(r: SandboxStopResult) -> Result<RHash, Error> {
+    let h = current_ruby().hash_new();
+    h.aset("name", r.name)?;
+    h.aset("status", symbol(status_name(r.status)))?;
+    h.aset("exit_code", r.exit_code)?;
+    h.aset("signal", r.signal)?;
+    h.aset("observed_at", r.observed_at.to_rfc3339())?;
+    h.aset("source", r.source)?;
+    Ok(h)
+}
+
+fn ping_result_hash(r: SandboxPingResult) -> Result<RHash, Error> {
+    let h = current_ruby().hash_new();
+    h.aset("name", r.name)?;
+    h.aset("latency_ms", r.latency.as_millis() as u64)?;
+    Ok(h)
+}
+
+fn touch_result_hash(r: SandboxTouchResult) -> Result<RHash, Error> {
+    let h = current_ruby().hash_new();
+    h.aset("name", r.name)?;
+    h.aset("activity_seq", r.activity_seq)?;
+    Ok(h)
+}
+
+fn page_hash(page: SandboxPage) -> Result<RHash, Error> {
+    let array = current_ruby().ary_new();
+    for inner in page.sandboxes {
+        array.push(RubySandbox {
+            inner: std::cell::RefCell::new(Some(inner)),
+        })?;
+    }
+    let hash = current_ruby().hash_new();
+    hash.aset("sandboxes", array)?;
+    hash.aset("next_cursor", page.next_cursor)?;
+    Ok(hash)
+}
+
+fn fs_entry_kind_name(kind: FsEntryKind) -> &'static str {
+    match kind {
+        FsEntryKind::File => "file",
+        FsEntryKind::Directory => "directory",
+        FsEntryKind::Symlink => "symlink",
+        FsEntryKind::Other => "other",
+    }
+}
+
+fn fs_entry_hash(e: FsEntry) -> Result<RHash, Error> {
+    let h = current_ruby().hash_new();
+    h.aset("path", e.path)?;
+    h.aset("kind", fs_entry_kind_name(e.kind))?;
+    h.aset("size", e.size)?;
+    h.aset("mode", e.mode)?;
+    h.aset("uid", e.uid)?;
+    h.aset("gid", e.gid)?;
+    if let Some(m) = e.modified {
+        h.aset("modified", m.to_rfc3339())?;
+    }
+    if let Some(a) = e.accessed {
+        h.aset("accessed", a.to_rfc3339())?;
+    }
+    Ok(h)
+}
+
+fn fs_metadata_hash(md: FsMetadata) -> Result<RHash, Error> {
+    let h = current_ruby().hash_new();
+    h.aset("kind", fs_entry_kind_name(md.kind))?;
+    h.aset("size", md.size)?;
+    h.aset("mode", md.mode)?;
+    h.aset("uid", md.uid)?;
+    h.aset("gid", md.gid)?;
+    h.aset("readonly", md.readonly)?;
+    if let Some(m) = md.modified {
+        h.aset("modified", m.to_rfc3339())?;
+    }
+    if let Some(a) = md.accessed {
+        h.aset("accessed", a.to_rfc3339())?;
+    }
+    if let Some(c) = md.created {
+        h.aset("created", c.to_rfc3339())?;
+    }
+    Ok(h)
+}
+
+fn parse_snapshot_save_args(ruby: &Ruby, args: &[Value]) -> Result<(PathBuf, SaveOpts), Error> {
+    let parsed = scan_args::<(String,), (), (), (), RHash, ()>(args)?;
+    reject_unknown_keywords(
+        ruby,
+        parsed.keywords,
+        &[
+            "with_parents",
+            "with_image",
+            "plain_tar",
+            "since",
+            "last_layers",
+            "compatibility",
+        ],
+    )?;
+    Ok((
+        PathBuf::from(parsed.required.0),
+        snapshot_save_opts(ruby, parsed.keywords)?,
+    ))
+}
+
+fn snapshot_save_opts(ruby: &Ruby, keywords: RHash) -> Result<SaveOpts, Error> {
+    Ok(SaveOpts {
+        compatibility: keyword::<String>(keywords, "compatibility")?
+            .as_deref()
+            .unwrap_or("current")
+            .parse()
+            .map_err(|error: MicrosandboxError| argument_error(ruby, error.to_string()))?,
+        with_parents: keyword::<bool>(keywords, "with_parents")?.unwrap_or(false),
+        with_image: keyword::<bool>(keywords, "with_image")?.unwrap_or(false),
+        plain_tar: keyword::<bool>(keywords, "plain_tar")?.unwrap_or(false),
+        since: keyword::<String>(keywords, "since")?,
+        last_layers: keyword::<usize>(keywords, "last_layers")?,
+    })
+}
+
+// -------------------------------------------------------------------------------------------------
+// Ruby initialization
+// -------------------------------------------------------------------------------------------------
+
+#[magnus::init(name = "microsandbox")]
+fn init(ruby: &Ruby) -> Result<(), Error> {
+    let module = ruby.define_module("Microsandbox")?;
+    module.define_error("Error", ruby.exception_standard_error())?;
+    module.define_module_function("version", function!(version, 0))?;
+    storage::register(module)?;
+    module.define_module_function("installed?", function!(installed, 0))?;
+    module.define_module_function("install", function!(install, 0))?;
+    module.define_module_function("set_runtime_msb_path", function!(set_runtime_msb_path, 1))?;
+    module.define_module_function(
+        "set_runtime_libkrunfw_path",
+        function!(set_runtime_libkrunfw_path, 1),
+    )?;
+    // -- Proxy ---------------------------------------------------------------
+    let secret_source = module.define_class("SecretSource", ruby.class_object())?;
+    secret_source.define_singleton_method("env", function!(secret_source_env, 1))?;
+
+    let outbound_proxy = module.define_class("OutboundProxy", ruby.class_object())?;
+    outbound_proxy
+        .define_singleton_method("http_connect", function!(outbound_proxy_http_connect, 1))?;
+    outbound_proxy.define_singleton_method("socks4", function!(outbound_proxy_socks4, 1))?;
+    outbound_proxy.define_singleton_method("socks5", function!(outbound_proxy_socks5, 1))?;
+    outbound_proxy.define_method("user_id!", method!(RubyOutboundProxy::user_id, 1))?;
+    outbound_proxy.define_method("credentials!", method!(RubyOutboundProxy::credentials, 2))?;
+
+    // -- Sandbox -------------------------------------------------------------
+    let sandbox = module.define_class("Sandbox", ruby.class_object())?;
+    sandbox.define_singleton_method("builder", function!(sandbox_builder, 1))?;
+    sandbox.define_singleton_method("create", function!(sandbox_create, -1))?;
+    sandbox.define_singleton_method(
+        "connect_or_create",
+        function!(sandbox_connect_or_create, -1),
+    )?;
+    sandbox.define_singleton_method("start", function!(sandbox_start, -1))?;
+    sandbox.define_singleton_method("get", function!(sandbox_get, -1))?;
+    sandbox.define_singleton_method("get_running", function!(sandbox_get_running, -1))?;
+    sandbox.define_singleton_method("list", function!(sandbox_list, -1))?;
+    sandbox.define_singleton_method("remove", function!(sandbox_remove, -1))?;
+    sandbox.define_method("name", method!(RubySandbox::name, 0))?;
+    sandbox.define_method("id", method!(RubySandbox::id, 0))?;
+    sandbox.define_method("owns_lifecycle?", method!(RubySandbox::owns_lifecycle, 0))?;
+    sandbox.define_method("__shutdown_owned", method!(RubySandbox::shutdown_owned, 0))?;
+    sandbox.define_method("backend", method!(RubySandbox::backend, 0))?;
+    sandbox.define_method("status", method!(RubySandbox::status, 0))?;
+    sandbox.define_method("info", method!(RubySandbox::info, 0))?;
+    sandbox.define_method("config", method!(RubySandbox::config, 0))?;
+    sandbox.define_method(
+        "last_failure_message",
+        method!(RubySandbox::last_failure_message, 0),
+    )?;
+    sandbox.define_method("exec", method!(RubySandbox::exec, -1))?;
+    sandbox.define_method("exec_default", method!(RubySandbox::exec_default, -1))?;
+    sandbox.define_method("shell", method!(RubySandbox::shell, -1))?;
+    sandbox.define_method("stop", method!(RubySandbox::stop, -1))?;
+    sandbox.define_method(
+        "stop_with_timeout",
+        method!(RubySandbox::stop_with_timeout, 1),
+    )?;
+    sandbox.define_method("kill", method!(RubySandbox::kill, -1))?;
+    sandbox.define_method("request_stop", method!(RubySandbox::request_stop, 0))?;
+    sandbox.define_method("request_kill", method!(RubySandbox::request_kill, 0))?;
+    sandbox.define_method(
+        "wait_until_stopped",
+        method!(RubySandbox::wait_until_stopped, 0),
+    )?;
+    sandbox.define_method("ensure_running", method!(RubySandbox::ensure_running, 0))?;
+    sandbox.define_method("wait_for_status", method!(RubySandbox::wait_for_status, 1))?;
+    sandbox.define_method("restart", method!(RubySandbox::restart, -1))?;
+    sandbox.define_method("destroy", method!(RubySandbox::destroy, -1))?;
+    sandbox.define_method("detach", method!(RubySandbox::detach, 0))?;
+    sandbox.define_method("ping", method!(RubySandbox::ping, 0))?;
+    sandbox.define_method("touch", method!(RubySandbox::touch, 0))?;
+    sandbox.define_method("metrics", method!(RubySandbox::metrics, 0))?;
+    sandbox.define_method("checkpoint", method!(RubySandbox::checkpoint, 1))?;
+    sandbox.define_method("logs", method!(RubySandbox::logs, -1))?;
+    sandbox.define_method("ssh_exec", method!(RubySandbox::ssh_exec, -1))?;
+    // filesystem
+    sandbox.define_method("fs_read", method!(RubySandbox::fs_read, 1))?;
+    sandbox.define_method("fs_write", method!(RubySandbox::fs_write, 2))?;
+    sandbox.define_method("fs_mkdir", method!(RubySandbox::fs_mkdir, 1))?;
+    sandbox.define_method("fs_list", method!(RubySandbox::fs_list, 1))?;
+    sandbox.define_method("fs_stat", method!(RubySandbox::fs_stat, 1))?;
+    sandbox.define_method("fs_exists?", method!(RubySandbox::fs_exists, 1))?;
+    sandbox.define_method("fs_copy", method!(RubySandbox::fs_copy, 2))?;
+    sandbox.define_method("fs_rename", method!(RubySandbox::fs_rename, 2))?;
+    sandbox.define_method("fs_remove", method!(RubySandbox::fs_remove, 1))?;
+    sandbox.define_method("fs_remove_dir", method!(RubySandbox::fs_remove_dir, 1))?;
+    sandbox.define_method(
+        "fs_copy_from_host",
+        method!(RubySandbox::fs_copy_from_host, 2),
+    )?;
+    sandbox.define_method("fs_copy_to_host", method!(RubySandbox::fs_copy_to_host, 2))?;
+
+    sandbox.define_method("snapshot", method!(RubySandbox::snapshot, -1))?;
+
+    // -- SandboxBuilder ------------------------------------------------------
+    let builder = module.define_class("SandboxBuilder", ruby.class_object())?;
+    builder.define_method("image!", method!(RubySandboxBuilder::image, 1))?;
+    builder.define_method("cpus!", method!(RubySandboxBuilder::cpus, 1))?;
+    builder.define_method("max_cpus!", method!(RubySandboxBuilder::max_cpus, 1))?;
+    builder.define_method("memory!", method!(RubySandboxBuilder::memory, 1))?;
+    builder.define_method("nested_virt!", method!(RubySandboxBuilder::nested_virt, 1))?;
+    builder.define_method("max_memory!", method!(RubySandboxBuilder::max_memory, 1))?;
+    builder.define_method("env!", method!(RubySandboxBuilder::env, 2))?;
+    builder.define_method("label!", method!(RubySandboxBuilder::label, 2))?;
+    builder.define_method("workdir!", method!(RubySandboxBuilder::workdir, 1))?;
+    builder.define_method("shell!", method!(RubySandboxBuilder::shell, 1))?;
+    builder.define_method("hostname!", method!(RubySandboxBuilder::hostname, 1))?;
+    builder.define_method("user!", method!(RubySandboxBuilder::user, 1))?;
+    builder.define_method("detached!", method!(RubySandboxBuilder::detached, 1))?;
+    builder.define_method("ephemeral!", method!(RubySandboxBuilder::ephemeral, 1))?;
+    builder.define_method(
+        "max_duration!",
+        method!(RubySandboxBuilder::max_duration, 1),
+    )?;
+    builder.define_method(
+        "idle_timeout!",
+        method!(RubySandboxBuilder::idle_timeout, 1),
+    )?;
+    builder.define_method("replace!", method!(RubySandboxBuilder::replace, 0))?;
+    builder.define_method(
+        "replace_with_timeout!",
+        method!(RubySandboxBuilder::replace_with_timeout, 1),
+    )?;
+    builder.define_method("root_disk!", method!(RubySandboxBuilder::root_disk, 1))?;
+    builder.define_method(
+        "intercept_tls!",
+        method!(RubySandboxBuilder::intercept_tls, 0),
+    )?;
+    builder.define_method(
+        "disable_network!",
+        method!(RubySandboxBuilder::disable_network, 0),
+    )?;
+    builder.define_method("http!", method!(RubySandboxBuilder::http, 2))?;
+    builder.define_method("http_config!", method!(RubySandboxBuilder::http_config, 5))?;
+    builder.define_method("quiet_logs!", method!(RubySandboxBuilder::quiet_logs, 0))?;
+    builder.define_method("entrypoint!", method!(RubySandboxBuilder::entrypoint, 1))?;
+    builder.define_method("init!", method!(RubySandboxBuilder::init, 1))?;
+    builder.define_method("proxy!", method!(RubySandboxBuilder::proxy, 1))?;
+    builder.define_method("vsock!", method!(RubySandboxBuilder::vsock, 2))?;
+    builder.define_method("vsock_dgram!", method!(RubySandboxBuilder::vsock_dgram, 2))?;
+    builder.define_method("create", method!(RubySandboxBuilder::create, 0))?;
+    builder.define_method(
+        "connect_or_create",
+        method!(RubySandboxBuilder::connect_or_create, 0),
+    )?;
+
+    // -- ExecOutput ----------------------------------------------------------
+    let output = module.define_class("ExecOutput", ruby.class_object())?;
+    output.define_method("stdout", method!(RubyExecOutput::stdout, 0))?;
+    output.define_method("stderr", method!(RubyExecOutput::stderr, 0))?;
+    output.define_method("stdout_bytes", method!(RubyExecOutput::stdout_bytes, 0))?;
+    output.define_method("stderr_bytes", method!(RubyExecOutput::stderr_bytes, 0))?;
+    output.define_method("exit_code", method!(RubyExecOutput::exit_code, 0))?;
+    output.define_method("success?", method!(RubyExecOutput::success, 0))?;
+    output.define_method("to_h", method!(RubyExecOutput::to_h, 0))?;
+
+    // -- SandboxMetrics ------------------------------------------------------
+    let metrics = module.define_class("SandboxMetrics", ruby.class_object())?;
+    metrics.define_method("to_h", method!(RubySandboxMetrics::to_h, 0))?;
+
+    // -- LogEntry ------------------------------------------------------------
+    let log_entry = module.define_class("LogEntry", ruby.class_object())?;
+    log_entry.define_method("timestamp", method!(RubyLogEntry::timestamp, 0))?;
+    log_entry.define_method("source", method!(RubyLogEntry::source, 0))?;
+    log_entry.define_method("data", method!(RubyLogEntry::data, 0))?;
+    log_entry.define_method("to_h", method!(RubyLogEntry::to_h, 0))?;
+
+    // -- ImageHandle ---------------------------------------------------------
+    let image_handle = module.define_class("ImageHandle", ruby.class_object())?;
+    image_handle.define_method("reference", method!(RubyImageHandle::reference, 0))?;
+    image_handle.define_method("size_bytes", method!(RubyImageHandle::size_bytes, 0))?;
+    image_handle.define_method(
+        "manifest_digest",
+        method!(RubyImageHandle::manifest_digest, 0),
+    )?;
+    image_handle.define_method("architecture", method!(RubyImageHandle::architecture, 0))?;
+    image_handle.define_method("os", method!(RubyImageHandle::os, 0))?;
+    image_handle.define_method("layer_count", method!(RubyImageHandle::layer_count, 0))?;
+    image_handle.define_method("created_at", method!(RubyImageHandle::created_at, 0))?;
+
+    let image = module.define_class("Image", ruby.class_object())?;
+    image.define_singleton_method("get", function!(image_get, -1))?;
+    image.define_singleton_method("list", function!(image_list, -1))?;
+    image.define_singleton_method("remove", function!(image_remove, -1))?;
+    image.define_singleton_method("prune", function!(image_prune, -1))?;
+
+    // -- Volume --------------------------------------------------------------
+    let volume = module.define_class("Volume", ruby.class_object())?;
+    volume.define_singleton_method("builder", function!(volume_builder, 1))?;
+    volume.define_singleton_method("get", function!(volume_get, -1))?;
+    volume.define_singleton_method("list", function!(volume_list, -1))?;
+    volume.define_singleton_method("remove", function!(volume_remove, -1))?;
+
+    let vol_builder = module.define_class("VolumeBuilder", ruby.class_object())?;
+    vol_builder.define_method("directory", method!(RubyVolumeBuilder::directory, 0))?;
+    vol_builder.define_method("disk", method!(RubyVolumeBuilder::disk, 0))?;
+    vol_builder.define_method("quota", method!(RubyVolumeBuilder::quota, 1))?;
+    vol_builder.define_method("size", method!(RubyVolumeBuilder::size, 1))?;
+    vol_builder.define_method("label", method!(RubyVolumeBuilder::label, 2))?;
+    vol_builder.define_method("create", method!(RubyVolumeBuilder::create, 0))?;
+
+    volume.define_method("info", method!(RubyVolume::info, 0))?;
+    volume.define_method("id", method!(RubyVolume::id, 0))?;
+    volume.define_method("path", method!(RubyVolume::path, 0))?;
+    volume.define_method("name", method!(RubyVolume::name, 0))?;
+    volume.define_method("kind", method!(RubyVolume::kind, 0))?;
+    volume.define_method("created_at", method!(RubyVolume::created_at, 0))?;
+    volume.define_method("destroy", method!(RubyVolume::destroy, 0))?;
+
+    // -- Snapshot ------------------------------------------------------------
+    let snapshot = module.define_class("Checkpoint", ruby.class_object())?;
+    snapshot_group::register(ruby, module)?;
+    snapshot_spawn::register(ruby, module)?;
+    snapshot.define_singleton_method("open", function!(snapshot_open, -1))?;
+    snapshot.define_singleton_method("get", function!(snapshot_get, -1))?;
+    snapshot.define_singleton_method("list", function!(snapshot_list, -1))?;
+    snapshot.define_singleton_method("remove", function!(snapshot_remove, -1))?;
+    snapshot.define_singleton_method("save", function!(snapshot_save, -1))?;
+    snapshot.define_method("id", method!(RubySnapshot::id, 0))?;
+    snapshot.define_method("remove", method!(RubySnapshot::remove, -1))?;
+    snapshot.define_method("digest", method!(RubySnapshot::digest, 0))?;
+    snapshot.define_method("name", method!(RubySnapshot::name, 0))?;
+    snapshot.define_method("size_bytes", method!(RubySnapshot::size_bytes, 0))?;
+    snapshot.define_method("image_ref", method!(RubySnapshot::image_ref, 0))?;
+    snapshot.define_method("state_kind", method!(RubySnapshot::state_kind, 0))?;
+    snapshot.define_method("reference", method!(RubySnapshot::reference, 0))?;
+    snapshot.define_method("reference_kind", method!(RubySnapshot::reference_kind, 0))?;
+    snapshot.define_method("manifest", method!(RubySnapshot::manifest, 0))?;
+    snapshot.define_method("state", method!(RubySnapshot::state, 0))?;
+    snapshot.define_method("destroy", method!(RubySnapshot::destroy, 1))?;
+    snapshot.define_method("save_to", method!(RubySnapshot::save_to, -1))?;
+    snapshot.define_method("save", method!(RubySnapshot::save_to, -1))?;
+    snapshot.define_method("verify", method!(RubySnapshot::verify, 0))?;
+
+    context::register(ruby, module)?;
+    services::init(ruby, module)?;
+    jobs::init(ruby, module)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use std::time::Duration;
+    use std::{sync::Arc, thread};
+
+    use microsandbox_core::{ChangeState, MicrosandboxError, ServiceError};
+
+    use super::{
+        BlockingState, catch_callback, change_state_name, panic_message, service_error_details,
+    };
+
+    #[test]
+    fn blocking_state_waits_for_completion() {
+        let state = Arc::new(BlockingState::new());
+        let completion = Arc::clone(&state);
+        let worker = thread::spawn(move || completion.complete(42));
+
+        assert_eq!(state.wait(), 42);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn no_gvl_callback_panics_are_captured() {
+        let result = catch_callback(|| panic!("callback panic"));
+        let panic = result.expect_err("callback panic should be captured");
+        assert_eq!(panic_message(panic.as_ref()), "callback panic");
+    }
+
+    #[test]
+    fn other_service_error_keeps_raw_details() {
+        let error = ServiceError::Other {
+            code: "new_service_reason".to_owned(),
+            status: 409,
+            message: "new refusal".to_owned(),
+        };
+
+        assert_eq!(
+            service_error_details(&error),
+            (
+                "other",
+                None,
+                Some("new_service_reason"),
+                Some(409),
+                Some("new refusal")
+            )
+        );
+    }
+
+    #[test]
+    fn service_change_state_is_available_for_non_service_errors() {
+        let unchanged = MicrosandboxError::InvalidConfig("bad target".to_owned());
+        let unknown = MicrosandboxError::Custom("transport ended".to_owned());
+
+        assert_eq!(change_state_name(unchanged.changed()), "unchanged");
+        assert_eq!(change_state_name(unknown.changed()), "unknown");
+        assert_eq!(change_state_name(ChangeState::Unknown), "unknown");
+        assert_eq!(
+            service_error_details(&ServiceError::TargetUnreachable {
+                retry_after: Some(Duration::from_millis(1250)),
+            }),
+            ("target_unreachable", Some(1.25), None, None, None)
+        );
+        assert_eq!(
+            service_error_details(&ServiceError::ChangesPaused {
+                retry_after: Some(Duration::from_secs(5)),
+            }),
+            ("service_changes_paused", Some(5.0), None, None, None)
+        );
+    }
+}

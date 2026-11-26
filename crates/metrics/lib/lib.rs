@@ -1,0 +1,31 @@
+//! Shared-memory live metrics registry for microsandbox.
+//!
+//! Replaces continuous `sandbox_metric` inserts into the catalog SQLite
+//! database with a single POSIX shared-memory region. Every running sandbox
+//! owns one fixed slot; readers scan the region to produce typed metrics
+//! responses without per-sandbox RPC or per-sample writes.
+
+#![warn(missing_docs)]
+
+mod compatibility;
+mod error;
+mod guest_memory;
+mod layout;
+mod registry;
+mod snapshot;
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use compatibility::MetricsRegistryReader;
+pub use error::{MetricsError, MetricsResult};
+pub use guest_memory::{GuestMemoryObservation, guest_memory_clock};
+/// Maximum bytes reserved for a sandbox name inside a fixed metrics slot.
+pub use layout::NAME_BYTES as SLOT_NAME_BYTES;
+pub use layout::{READABLE_REGISTRY_ABI_VERSIONS, REGISTRY_ABI_VERSION, registry_size};
+pub use registry::{
+    ActivateSlot, GuestMemoryValidity, IdentifiedMetric, MetricsRegistry, MetricsSlotWriter,
+    ReleaseMode, ReserveSlot, SampleWrite, SlotReservation, default_capacity,
+};
+pub use snapshot::{LiveMetric, LiveMetricState, SandboxMetricSnapshot, SandboxMetrics};

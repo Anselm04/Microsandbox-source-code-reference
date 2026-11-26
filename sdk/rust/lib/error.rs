@@ -1,0 +1,1252 @@
+//! Error types for microsandbox.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::Serialize;
+
+mod resize;
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Cloud error code for Service changes paused before any change was made.
+pub(crate) const SERVICE_CHANGES_PAUSED_CODE: &str = "service_changes_paused";
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// The result type for microsandbox operations.
+pub type MicrosandboxResult<T> = Result<T, MicrosandboxError>;
+
+/// Representation of a successfully published snapshot artifact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotArtifactKind {
+    /// An installed snapshot directory.
+    Installed,
+    /// A portable snapshot archive.
+    Archive,
+}
+
+/// A completed artifact retained even though the source failed to recover after capture.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PublishedSnapshotArtifact {
+    /// Whether `path` names an installed directory or archive.
+    pub kind: SnapshotArtifactKind,
+    /// Final published path, never an operation's staging directory.
+    pub path: PathBuf,
+    /// Identity stored in the snapshot descriptor.
+    pub snapshot_id: String,
+    /// Digest of the canonical snapshot descriptor.
+    pub digest: String,
+    /// Head outcome recorded by this publication, never a later read of the mutable group head.
+    /// Absent for archive-only capture or producers that did not report an outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_update: Option<crate::snapshot::HeadUpdate>,
+}
+
+/// Capture completed, but restoring the source's prior execution state failed.
+///
+/// The runtime checkpoint remains available at its runtime-local locator. `artifact` is present
+/// only after the requested installed snapshot or archive was also published successfully. Do not
+/// infer that the source is running, safely paused, or eligible for ordinary resume from this
+/// error: a thaw acknowledgement or fail-closed re-pause may itself have failed.
+#[derive(Clone, Debug, Serialize)]
+pub struct SnapshotSourceRecoveryError {
+    /// Sandbox whose post-capture recovery failed.
+    pub source_sandbox: String,
+    /// Verified runtime checkpoint identity.
+    pub checkpoint_id: String,
+    /// Content-addressed root of the verified runtime checkpoint.
+    pub checkpoint_root: String,
+    /// Runtime-local checkpoint path; removing the source may remove this recovery locator.
+    pub checkpoint_path: PathBuf,
+    /// Requested artifact, when its publication completed.
+    pub artifact: Option<PublishedSnapshotArtifact>,
+    /// Original runtime recovery diagnostic, including uncertainty about thaw or re-pause.
+    pub detail: String,
+    /// Additional failure while materializing or publishing the requested artifact.
+    pub publication_error: Option<String>,
+}
+
+/// Why the guest rejected a configured working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WorkdirProblem {
+    /// The path exists but is not a directory.
+    NotADirectory,
+    /// The guest could not stat the path, for example because it does not exist.
+    StatFailed {
+        /// Error message returned by the guest.
+        message: String,
+    },
+}
+
+/// What is known about an archive batch when its import call fails.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotImportOutcome {
+    /// This operation did not publish group members or change the head.
+    NotCommitted,
+    /// The entire batch committed; a later indexing, cleanup or result step failed.
+    Committed,
+    /// Publication may have committed; recovery must establish the durable outcome.
+    Unknown,
+}
+
+/// An import failure with its publication outcome and original cause retained.
+#[derive(Debug, Serialize)]
+pub struct SnapshotImportError {
+    /// Identity of this attempt, also recorded in its local publication journal.
+    pub operation_id: String,
+    /// Requested archive paths, resolved at the local backend boundary.
+    pub archives: Vec<PathBuf>,
+    /// Destination group directory, when namespace preparation completed.
+    pub group_path: Option<PathBuf>,
+    /// Whether this operation published its batch.
+    pub outcome: SnapshotImportOutcome,
+    /// Original diagnostic, also available through the Rust error source chain.
+    pub detail: String,
+    /// Original typed cause; language bindings preserve the serialized context above.
+    #[serde(skip)]
+    pub source: Box<MicrosandboxError>,
+}
+
+/// Errors that can occur in microsandbox operations.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum MicrosandboxError {
+    /// An I/O error occurred.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// An HTTP request error occurred.
+    #[cfg(any(feature = "cloud", feature = "local"))]
+    #[error("http error: {0}")]
+    Http(#[from] reqwest::Error),
+
+    /// A cloud control-plane request failed with an HTTP status.
+    #[error("cloud HTTP {status}: {message}")]
+    CloudHttp {
+        /// HTTP status code returned by the cloud API.
+        status: u16,
+        /// Machine-readable cloud API error code, when present.
+        code: Option<String>,
+        /// Human-readable cloud API error message.
+        message: String,
+    },
+
+    /// The libkrunfw library was not found at the expected location.
+    #[error("libkrunfw not found: {0}")]
+    LibkrunfwNotFound(String),
+
+    /// Neither member of the host runtime pair is installed.
+    #[error("microsandbox runtime is not installed: {0}")]
+    RuntimeNotInstalled(String),
+
+    /// Only one member of the host runtime pair is available.
+    #[error("microsandbox runtime installation is incomplete: {0}")]
+    RuntimeIncomplete(String),
+
+    /// A database error occurred.
+    #[cfg(feature = "local")]
+    #[error("database error: {0}")]
+    Database(#[from] sea_orm::DbErr),
+
+    /// Invalid configuration.
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
+
+    /// The guest rejected the configured working directory.
+    #[error("invalid config: {}", .problem.message(.path))]
+    InvalidWorkdir {
+        /// Configured guest path.
+        path: String,
+        /// Why the guest rejected the path.
+        problem: WorkdirProblem,
+    },
+
+    /// A restore was refused because guest paths lack destination bindings.
+    ///
+    /// Callers can branch on `restore` to offer interface-specific remedies, such as selecting a
+    /// captured disk, which only a full restore accepts.
+    #[error(
+        "invalid config: restore requires destination bindings for: {}; {}",
+        .missing.join(", "),
+        .restore.missing_bindings_remedy()
+    )]
+    MissingRestoreBindings {
+        /// Sorted resources without a destination, each a kind and guest path such as
+        /// `mount /data`, `disk /data`, or `filesystem /work`.
+        missing: Vec<String>,
+        /// Which restore refused, which decides how the missing resources can be supplied.
+        restore: RestoreKind,
+    },
+
+    /// The sandbox's effective entrypoint and CMD do not provide an executable default command.
+    #[error(
+        "sandbox has no default command; configure an entrypoint or cmd, or execute a literal command"
+    )]
+    NoDefaultCommand,
+
+    /// The requested sandbox was not found.
+    #[error("sandbox not found: {0}")]
+    SandboxNotFound(String),
+
+    /// A sandbox with the given name already exists. Returned by
+    /// `Sandbox::create` when the name is taken and `replace_existing`
+    /// was not set, and by `Sandbox::create` with `replace_existing`
+    /// when an in-process `Sandbox` handle for that name is still
+    /// alive (the caller must drop or stop the existing handle first).
+    #[error("sandbox already exists: {0}")]
+    SandboxAlreadyExists(String),
+
+    /// A receiver was bound to an older sandbox that has since been replaced
+    /// by another sandbox using the same name.
+    #[error(
+        "sandbox {name:?} was replaced (expected identity {expected}, found {actual}); refusing stale lifecycle operation"
+    )]
+    SandboxReplaced {
+        /// Reused sandbox name.
+        name: String,
+        /// Identity captured by the receiver.
+        expected: String,
+        /// Identity currently associated with the name.
+        actual: String,
+    },
+
+    /// The sandbox is still running and cannot be removed.
+    #[error("sandbox still running: {0}")]
+    SandboxStillRunning(String),
+
+    /// The sandbox exists but is not running.
+    #[error("sandbox {0}")]
+    SandboxNotRunning(String),
+
+    /// Graceful sandbox shutdown did not converge before the requested deadline.
+    #[error(
+        "timed out after {timeout:?} waiting for sandbox {name:?} to stop; the accepted stop may still complete"
+    )]
+    SandboxStopTimedOut {
+        /// Sandbox whose shutdown is still in progress.
+        name: String,
+        /// Time spent waiting for stopped-state observation.
+        timeout: std::time::Duration,
+    },
+
+    /// A runtime error occurred.
+    #[error("runtime error: {0}")]
+    Runtime(String),
+
+    /// The attempted replacement failed and recovery retained the original sandbox.
+    #[error(
+        "{source}. Original sandbox {name:?} (ID {original_id}) is stopped and can be started explicitly"
+    )]
+    ReplacementStopped {
+        /// Public name restored to the original sandbox.
+        name: String,
+        /// Catalog identity of the retained sandbox.
+        original_id: i32,
+        /// Failure that prevented the new launch.
+        source: Box<MicrosandboxError>,
+    },
+
+    /// The attempted replacement failed and recovery still needs attention.
+    #[error(
+        "{source}. Recovery for sandbox {name:?} (ID {original_id}) is pending: {recovery}. Resolve the recovery error before starting the sandbox"
+    )]
+    ReplacementRecoveryPending {
+        /// Public name reserved by the recovery transaction.
+        name: String,
+        /// Catalog identity retained by the recovery transaction.
+        original_id: i32,
+        /// Failure that prevented the new launch.
+        source: Box<MicrosandboxError>,
+        /// Failure while recovering the original sandbox.
+        recovery: Box<MicrosandboxError>,
+    },
+
+    /// Graceful shutdown did not establish completion within the caller's budget.
+    #[error(
+        "graceful stop of sandbox {name:?} ({identity}) timed out after {timeout:?} waiting for shutdown completion and runtime release; the shutdown request may still complete; no kill was requested"
+    )]
+    StopTimeout {
+        /// Sandbox name.
+        name: String,
+        /// Persisted identity targeted by this stop operation.
+        identity: String,
+        /// Total budget including dispatch and ownership observation.
+        timeout: std::time::Duration,
+    },
+
+    /// A live resize did not converge before the caller's deadline.
+    #[error(
+        "timed out after {timeout:?} waiting for sandbox {name:?} live resize to converge; completion is unconfirmed and the resize has not been undone"
+    )]
+    ResizeTimeout {
+        /// Sandbox name.
+        name: String,
+        /// Wait budget.
+        timeout: std::time::Duration,
+        /// Last observed resize status; empty when no read completed before the deadline.
+        status: Vec<microsandbox_types::modify::ResourceResizeStatus>,
+    },
+
+    /// An accepted resize could not be confirmed, with a structured reason and original cause.
+    #[error(transparent)]
+    ResizeWait(Box<ResizeWaitError>),
+
+    /// The sandbox process exited before the agent relay became
+    /// available. Carries the sandbox name and the structured
+    /// `boot-error.json` record so the CLI can render a useful inline
+    /// error with hints.
+    #[cfg(feature = "local")]
+    #[error("failed to start {name:?}: {}", .err.message)]
+    BootStart {
+        /// The name of the sandbox that failed to start.
+        name: String,
+        /// Structured failure record loaded from `boot-error.json`.
+        err: microsandbox_runtime::boot_error::BootError,
+    },
+
+    /// A JSON serialization/deserialization error occurred.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// A protocol error occurred.
+    #[error("protocol error: {0}")]
+    Protocol(#[from] microsandbox_protocol::ProtocolError),
+
+    /// An agent client error occurred.
+    #[error("agent client error: {0}")]
+    AgentClient(#[from] crate::agent::AgentClientError),
+
+    /// A runtime control operation failed; the source retains delivery certainty
+    /// and the original peer response. Shared setup failures use one owned source.
+    #[error("control client error: {0}")]
+    ControlClient(#[source] std::sync::Arc<microsandbox_control_client::ControlClientError>),
+
+    /// The run or active configuration changed while saving a modification.
+    /// Earlier live operations may have applied; callers must inspect fresh
+    /// state before deciding whether to retry.
+    #[error(
+        "sandbox state changed while saving a modification; inspect its current state before retrying because earlier live changes may have applied"
+    )]
+    ControlStateChanged,
+
+    /// The runtime applied an ordered prefix of a secret batch before failure.
+    #[error(
+        "secret update stopped after {applied_count} applied entries; failed index {failed_index}"
+    )]
+    ControlSecretBatch {
+        /// Number of successfully completed entries, including no-ops.
+        applied_count: u32,
+        /// First failed entry; subsequent entries were not applied.
+        failed_index: u32,
+        /// Structured peer failure; earlier entries remain applied.
+        error: microsandbox_protocol::control::ControlError,
+    },
+
+    /// A nix/errno error occurred.
+    #[cfg(all(feature = "local", unix))]
+    #[error("nix error: {0}")]
+    Nix(#[from] nix::errno::Errno),
+
+    /// A Windows host prerequisite is missing for local sandbox execution.
+    #[cfg(all(feature = "local", windows))]
+    #[error("{0}")]
+    WindowsHostSetup(#[from] crate::setup::WindowsHostSetupError),
+
+    /// Command execution timed out.
+    #[error("exec timed out after {0:?}")]
+    ExecTimeout(std::time::Duration),
+
+    /// A command failed to spawn (binary not found, permission
+    /// denied, etc.). Distinct from a non-zero exit status: the
+    /// user code never ran. The CLI renders this as a styled
+    /// error block with hints; SDK consumers can branch on
+    /// [`microsandbox_protocol::exec::ExecFailureKind`].
+    #[error("exec failed: {}", .0.message)]
+    ExecFailed(microsandbox_protocol::exec::ExecFailed),
+
+    /// A terminal operation failed.
+    #[error("terminal error: {0}")]
+    Terminal(String),
+
+    /// A filesystem operation failed inside the sandbox.
+    #[error("sandbox fs error: {0}")]
+    SandboxFsOps(String),
+
+    /// The requested image was not found.
+    #[error("image not found: {0}")]
+    ImageNotFound(String),
+
+    /// The image is in use by one or more sandboxes.
+    #[error("image in use by sandbox(es): {0}")]
+    ImageInUse(String),
+
+    /// The requested volume was not found.
+    #[error("volume not found: {0}")]
+    VolumeNotFound(String),
+
+    /// The volume already exists.
+    #[error("volume already exists: {0}")]
+    VolumeAlreadyExists(String),
+
+    /// No visible Service has this slug.
+    #[error("service not found: {0}")]
+    ServiceNotFound(String),
+
+    /// The slug is unavailable.
+    #[error("service slug unavailable: {0}; choose another slug")]
+    ServiceAlreadyExists(String),
+
+    /// A Service change was refused, or its outcome is unknown.
+    ///
+    /// Use [`MicrosandboxError::changed`] to learn whether the change may have been applied.
+    #[error("service {slug}: {error}")]
+    Service {
+        /// Slug of the Service the change addressed.
+        slug: String,
+        /// Why the change did not complete.
+        error: ServiceError,
+    },
+
+    /// An OCI image operation failed.
+    #[cfg(feature = "local")]
+    #[error("image error: {0}")]
+    Image(#[from] microsandbox_image::ImageError),
+
+    /// A network builder accumulated a parse / validation error.
+    /// Surfaces from `NetworkBuilder::build()` (and its nested
+    /// `DnsBuilder::build()`) when chained inside
+    /// `SandboxBuilder::network(|n| ...)`.
+    #[cfg(feature = "net")]
+    #[error("network builder: {0}")]
+    NetworkBuilder(#[from] microsandbox_network::policy::BuildError),
+
+    /// A rootfs patch operation failed.
+    #[error("patch failed: {0}")]
+    PatchFailed(String),
+
+    /// A snapshot artifact was not found.
+    #[error("snapshot not found: {0}")]
+    SnapshotNotFound(String),
+
+    /// A snapshot artifact already exists at the given path.
+    #[error("snapshot already exists: {0}")]
+    SnapshotAlreadyExists(String),
+
+    /// Snapshotting requires the source sandbox to be stopped.
+    #[error("snapshot source sandbox '{0}' is not stopped")]
+    SnapshotSandboxRunning(String),
+
+    /// The image referenced by a snapshot is not in the local cache.
+    #[error("snapshot image missing from cache: {0}")]
+    SnapshotImageMissing(String),
+
+    /// The snapshot artifact failed integrity verification.
+    #[error("snapshot integrity check failed: {0}")]
+    SnapshotIntegrity(String),
+
+    /// A checkpoint was captured, but restoring the source's execution state failed.
+    #[error("{0}")]
+    SnapshotSourceRecovery(Box<SnapshotSourceRecoveryError>),
+
+    /// An archive import failed without discarding its publication outcome.
+    #[error("{0}")]
+    SnapshotImport(#[source] Box<SnapshotImportError>),
+
+    /// Filesystem removal committed, but subsequent catalog or recovery work failed.
+    #[error("checkpoint removal committed for {}; recovery remains: {source}", .result.id)]
+    SnapshotRemovalRecovery {
+        /// The exact removal and head outcome, even though cleanup did not finish.
+        result: Box<crate::snapshot::CheckpointRemoveResult>,
+        /// Original cleanup/catalog failure.
+        #[source]
+        source: Box<MicrosandboxError>,
+    },
+
+    /// Whole-group publication committed, but catalog or payload cleanup needs recovery.
+    #[error("snapshot group removal committed for {group}: {source}", group = .result.group)]
+    SnapshotGroupRemovalRecovery {
+        /// Confirmed publication outcome, retained even though cleanup failed.
+        result: Box<crate::snapshot::SnapshotRemoveResult>,
+        /// Catalog or cleanup failure after whole-group retirement.
+        #[source]
+        source: Box<MicrosandboxError>,
+    },
+
+    /// Group verification failed. The report retains every member outcome, including partial evidence.
+    #[error("snapshot group verification failed for '{}'", .0.group)]
+    SnapshotVerification(Box<crate::snapshot::SnapshotGroupVerifyReport>),
+
+    /// An adjacent-release snapshot artifact migration is blocked.
+    #[error("snapshot artifact migration failed for {artifact} during {phase}: {code}: {detail}")]
+    SnapshotMigration {
+        /// Stable machine-readable failure code.
+        code: String,
+        /// Last safe durable phase.
+        phase: String,
+        /// Artifact name or explicitly supplied path.
+        artifact: String,
+        /// Bounded repair-oriented detail.
+        detail: String,
+    },
+
+    /// Metrics sampling is disabled for this sandbox.
+    #[error("metrics disabled for sandbox: {0}")]
+    MetricsDisabled(String),
+
+    /// Live metrics are enabled but no valid guest sample is available yet.
+    #[error("metrics unavailable for sandbox: {0}")]
+    MetricsUnavailable(String),
+
+    /// A log stream fell behind enough that the file it was reading
+    /// rotated out of the on-disk retention window. The stream
+    /// yields this error and ends; restart from
+    /// `LogStreamStart::Beginning`, `LogStreamStart::Since(now)`,
+    /// or `LogStreamStart::From(c)` with the cursor of the last
+    /// entry that was successfully consumed.
+    #[error("log stream missed rotation (dropped from offset {dropped_from_offset})")]
+    MissedRotation {
+        /// Byte offset within the lost file at which streamed
+        /// entries stop. Useful for diagnostics.
+        dropped_from_offset: u64,
+    },
+
+    /// An opaque cursor passed to an SDK operation could not be decoded or no longer identifies a
+    /// valid position. For log streams, this is yielded once at stream start before the stream ends.
+    #[error("invalid cursor: {0}")]
+    InvalidCursor(String),
+
+    /// A backend does not support a requested SDK operation.
+    #[error("{} is not supported by this backend: {}", .op.api_path(), .reason.hint())]
+    Unsupported {
+        /// Operation requested by the caller.
+        op: Operation,
+        /// Why the operation is unavailable, and what to do instead.
+        reason: UnsupportedReason,
+    },
+
+    /// A modification did not complete as asked: it may be saved without being in effect on the
+    /// running sandbox, or its result is unknown. Only Cloud returns it; `cause` never holds a
+    /// secret value.
+    #[error("the change did not complete as asked: {cause}")]
+    ModificationNotConfirmed {
+        /// What is known about the change: what failed, whether it was saved, and whether
+        /// sending the same change again retries it.
+        cause: String,
+    },
+
+    /// A custom error message.
+    #[error("{0}")]
+    Custom(String),
+}
+
+/// Why a Service change did not complete.
+///
+/// Every reason except [`OutcomeUnknown`](Self::OutcomeUnknown) means nothing changed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ServiceError {
+    /// The organization Service limit was reached.
+    #[error("organization service limit reached; remove a service or request a higher limit")]
+    QuotaExceeded,
+    /// The target sandbox Service limit was reached.
+    #[error("sandbox service limit reached; remove or move a service, or request a higher limit")]
+    SandboxLimitExceeded,
+    /// The Service changed; get it before retrying.
+    #[error("changed by another request; get it before retrying")]
+    Conflict,
+    /// The Service has no target; set a target.
+    #[error("detached; set a target")]
+    Detached,
+    /// The target cannot be reached; retry later.
+    #[error("target cannot be reached right now; retry later")]
+    TargetUnreachable {
+        /// Retry delay returned with the refusal, when available.
+        retry_after: Option<Duration>,
+    },
+    /// Service changes are paused; retry later.
+    #[error("service changes are paused; retry later")]
+    ChangesPaused {
+        /// Retry delay returned with the refusal, when available.
+        retry_after: Option<Duration>,
+    },
+    /// The target sandbox is not running; start it, then retry.
+    #[error("target sandbox is not running; start it, then retry")]
+    TargetNotRunning,
+    /// The change may have been applied; get and check the Service before retrying.
+    #[error("change may have been applied; get and check the service before retrying")]
+    OutcomeUnknown,
+    /// The server refused the change with an error code this SDK does not recognize.
+    #[error("HTTP {status} ({code}): {message}")]
+    Other {
+        /// Raw error code returned with the refusal.
+        code: String,
+        /// HTTP status returned with the refusal.
+        status: u16,
+        /// Human-readable message returned with the refusal.
+        message: String,
+    },
+}
+
+/// Whether a failed Service change may have been applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeState {
+    /// Nothing changed.
+    Unchanged,
+    /// The change may have been applied; get and check the Service before retrying.
+    Unknown,
+}
+
+/// Which restore operation reported missing destination bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreKind {
+    /// A disk restore; only destination mounts can satisfy its recorded guest paths.
+    Disk,
+    /// A full restore; destination mounts or its captured disks can satisfy missing resources.
+    Full,
+}
+
+/// An SDK operation that a backend may decline to perform.
+///
+/// Carried by [`MicrosandboxError::Unsupported`] so callers can branch on
+/// exactly which API was rejected instead of parsing a message string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Operation {
+    /// Host runtime discovery, installation, and setup.
+    RuntimeSetup,
+    /// `Sandbox::create`.
+    SandboxCreate,
+    /// `Sandbox::start`.
+    SandboxStart,
+    /// `Sandbox::stop`.
+    SandboxStop,
+    /// `Sandbox::restart`.
+    SandboxRestart,
+    /// `Sandbox::pause`.
+    SandboxPause,
+    /// `Sandbox::resume`.
+    SandboxResume,
+    /// `Sandbox::remove`.
+    SandboxRemove,
+    /// `Sandbox::remove_persisted`.
+    SandboxRemovePersisted,
+    /// `Sandbox::kill`.
+    SandboxKill,
+    /// `Sandbox::drain`.
+    SandboxDrain,
+    /// `Sandbox::ping`.
+    SandboxPing,
+    /// Low-level access to the prepared local agent connection.
+    SandboxClient,
+    /// `Sandbox::touch`.
+    SandboxTouch,
+    /// `Sandbox::stop_and_wait`.
+    SandboxStopAndWait,
+    /// `Sandbox::wait`.
+    SandboxWait,
+    /// `Sandbox::logs`.
+    SandboxLogs,
+    /// `Sandbox::log_stream`.
+    SandboxLogStream,
+    /// `Sandbox::log_stream` with `follow: false`.
+    SandboxLogStreamNoFollow,
+    /// `Sandbox::log_stream` with `follow: true`.
+    SandboxLogStreamFollow,
+    /// `Sandbox::follow_logs`.
+    SandboxFollowLogs,
+    /// `Sandbox::logger`.
+    SandboxLogger,
+    /// `Sandbox::metrics`.
+    SandboxMetrics,
+    /// `Sandbox::metrics_stream`.
+    SandboxMetricsStream,
+    /// `Sandbox::modify`.
+    SandboxModify,
+    /// `Sandbox::fs`.
+    SandboxFs,
+    /// The free function `all_sandbox_metrics`.
+    AllSandboxMetrics,
+    /// Dialing a sandbox's agent (exec, attach, and guest-fs transport).
+    AgentConnect,
+    /// `Sandbox::config`.
+    SandboxConfig,
+    /// `Sandbox::ensure_running`.
+    SandboxEnsureRunning,
+    /// Read the retained local runtime exit.
+    SandboxTerminalExit,
+    /// `Sandbox::destroy`.
+    SandboxDestroy,
+    /// `Sandbox::snapshot`.
+    SandboxSnapshot,
+    /// `Sandbox::snapshot_to`.
+    SandboxSnapshotTo,
+    /// `SandboxFsOps::open_file`.
+    SandboxFsOpenFile,
+    /// `SandboxFsOps::open_dir`.
+    SandboxFsOpenDir,
+    /// `SandboxFsOps::close_handle`.
+    SandboxFsCloseHandle,
+    /// `SandboxFsOps::read_handle`.
+    SandboxFsReadHandle,
+    /// `SandboxFsOps::read_handle_stream`.
+    SandboxFsReadHandleStream,
+    /// `SandboxFsOps::write_handle`.
+    SandboxFsWriteHandle,
+    /// `SandboxFsOps::write_handle_stream`.
+    SandboxFsWriteHandleStream,
+    /// `SandboxFsOps::read_dir_handle`.
+    SandboxFsReadDirHandle,
+    /// `SandboxFsOps::stat_handle`.
+    SandboxFsStatHandle,
+    /// `SandboxFsOps::set_stat_handle`.
+    SandboxFsSetStatHandle,
+    /// `SandboxSshOps::server`.
+    SandboxSshServer,
+    /// `SshServer::serve`.
+    SshServerServe,
+    /// `Volume::create`.
+    VolumeCreate,
+    /// `Volume::get`.
+    VolumeGet,
+    /// `Volume::get_default`.
+    VolumeGetDefault,
+    /// `Volume::list`.
+    VolumeList,
+    /// `Volume::remove`.
+    VolumeRemove,
+    /// `Volume::path`.
+    VolumePath,
+    /// `VolumeFs::read`.
+    VolumeFsRead,
+    /// `VolumeFs::read_to_string`.
+    VolumeFsReadToString,
+    /// `VolumeFs::write`.
+    VolumeFsWrite,
+    /// `VolumeFs::list`.
+    VolumeFsList,
+    /// `VolumeFs::stat`.
+    VolumeFsStat,
+    /// `VolumeFs::mkdir`.
+    VolumeFsMkdir,
+    /// `VolumeFs::remove`.
+    VolumeFsRemove,
+    /// `VolumeFs::copy`.
+    VolumeFsCopy,
+    /// `VolumeFs::rename`.
+    VolumeFsRename,
+    /// `VolumeFs::exists`.
+    VolumeFsExists,
+    /// `VolumeFs::read_stream`.
+    VolumeFsReadStream,
+    /// `VolumeFs::write_stream`.
+    VolumeFsWriteStream,
+    /// `Service::create`.
+    ServiceCreate,
+    /// `Service::get`.
+    ServiceGet,
+    /// `Service::list`.
+    ServiceList,
+    /// `Service::update`.
+    ServiceUpdate,
+    /// `Service::enable`.
+    ServiceEnable,
+    /// `Service::disable`.
+    ServiceDisable,
+    /// `Service::remove`.
+    ServiceRemove,
+    /// `Image::get`.
+    ImageGet,
+    /// `Storage::usage` and per-object storage observations.
+    StorageUsage,
+    /// `Storage::prune`.
+    StoragePrune,
+    /// `Image::list`.
+    ImageList,
+    /// `Image::inspect`.
+    ImageInspect,
+    /// `Image::remove`.
+    ImageRemove,
+    /// `Image::prune`.
+    ImagePrune,
+    /// `Image::load`.
+    ImageLoad,
+    /// `Image::save`.
+    ImageSave,
+    /// Snapshot operations (`Snapshot::*`).
+    SnapshotOps,
+    /// The free function `config` (ambient local-config accessor).
+    Config,
+}
+
+/// Why a backend declined an [`Operation`].
+///
+/// Carried by [`MicrosandboxError::Unsupported`]; [`hint`](Self::hint)
+/// renders it as a brief remedy for error messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsupportedReason {
+    /// Only local backends perform this operation.
+    LocalOnly,
+    /// Only cloud backends perform this operation.
+    CloudOnly,
+    /// Another operation covers this on the active backend.
+    UseInstead(Operation),
+    /// The operation needs a unix host.
+    RequiresUnixHost,
+    /// The operation needs a crate feature that is not enabled.
+    RequiresCrateFeature(&'static str),
+    /// The named configuration option is not accepted by this backend.
+    ConfigField(&'static str),
+    /// Volume contents are reached by mounting the volume into a sandbox.
+    MountIntoSandbox,
+    /// The operation is unavailable for the supplied state or format.
+    NotAvailable(String),
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl WorkdirProblem {
+    fn message(&self, path: &str) -> String {
+        match self {
+            Self::NotADirectory => {
+                format!("workdir is not a directory in guest: {path}")
+            }
+            Self::StatFailed { message } => {
+                format!("could not validate workdir in guest {path:?}: sandbox fs error: {message}")
+            }
+        }
+    }
+}
+
+impl Operation {
+    /// The user-facing API path for this operation, e.g. `"Sandbox::kill"`.
+    pub fn api_path(&self) -> &'static str {
+        match self {
+            Operation::RuntimeSetup => "runtime setup",
+            Operation::SandboxCreate => "Sandbox::create",
+            Operation::SandboxStart => "Sandbox::start",
+            Operation::SandboxStop => "Sandbox::stop",
+            Operation::SandboxRestart => "Sandbox::restart",
+            Operation::SandboxPause => "Sandbox::pause",
+            Operation::SandboxResume => "Sandbox::resume",
+            Operation::SandboxRemove => "Sandbox::remove",
+            Operation::SandboxRemovePersisted => "Sandbox::remove_persisted",
+            Operation::SandboxKill => "Sandbox::kill",
+            Operation::SandboxDrain => "Sandbox::drain",
+            Operation::SandboxPing => "Sandbox::ping",
+            Operation::SandboxClient => "Sandbox::client",
+            Operation::SandboxTouch => "Sandbox::touch",
+            Operation::SandboxStopAndWait => "Sandbox::stop_and_wait",
+            Operation::SandboxWait => "Sandbox::wait",
+            Operation::SandboxLogs => "Sandbox::logs",
+            Operation::SandboxLogStream => "Sandbox::log_stream",
+            Operation::SandboxLogStreamNoFollow => "Sandbox::log_stream(follow=false)",
+            Operation::SandboxLogStreamFollow => "Sandbox::log_stream(follow=true)",
+            Operation::SandboxFollowLogs => "Sandbox::follow_logs",
+            Operation::SandboxLogger => "Sandbox::logger",
+            Operation::SandboxMetrics => "Sandbox::metrics",
+            Operation::SandboxMetricsStream => "Sandbox::metrics_stream",
+            Operation::SandboxModify => "Sandbox::modify",
+            Operation::SandboxFs => "Sandbox::fs",
+            Operation::AllSandboxMetrics => "all_sandbox_metrics",
+            Operation::AgentConnect => "agent connections",
+            Operation::SandboxConfig => "Sandbox::config",
+            Operation::SandboxEnsureRunning => "Sandbox::ensure_running",
+            Operation::SandboxTerminalExit => "Sandbox::terminal_exit",
+            Operation::SandboxDestroy => "Sandbox::destroy",
+            Operation::SandboxSnapshot => "Sandbox::snapshot",
+            Operation::SandboxSnapshotTo => "Sandbox::snapshot_to",
+            Operation::SandboxFsOpenFile => "SandboxFsOps::open_file",
+            Operation::SandboxFsOpenDir => "SandboxFsOps::open_dir",
+            Operation::SandboxFsCloseHandle => "SandboxFsOps::close_handle",
+            Operation::SandboxFsReadHandle => "SandboxFsOps::read_handle",
+            Operation::SandboxFsReadHandleStream => "SandboxFsOps::read_handle_stream",
+            Operation::SandboxFsWriteHandle => "SandboxFsOps::write_handle",
+            Operation::SandboxFsWriteHandleStream => "SandboxFsOps::write_handle_stream",
+            Operation::SandboxFsReadDirHandle => "SandboxFsOps::read_dir_handle",
+            Operation::SandboxFsStatHandle => "SandboxFsOps::stat_handle",
+            Operation::SandboxFsSetStatHandle => "SandboxFsOps::set_stat_handle",
+            Operation::SandboxSshServer => "SandboxSshOps::server",
+            Operation::SshServerServe => "SshServer::serve",
+            Operation::VolumeCreate => "Volume::create",
+            Operation::VolumeGet => "Volume::get",
+            Operation::VolumeGetDefault => "Volume::get_default",
+            Operation::VolumeList => "Volume::list",
+            Operation::VolumeRemove => "Volume::remove",
+            Operation::VolumePath => "Volume::path",
+            Operation::VolumeFsRead => "VolumeFs::read",
+            Operation::VolumeFsReadToString => "VolumeFs::read_to_string",
+            Operation::VolumeFsWrite => "VolumeFs::write",
+            Operation::VolumeFsList => "VolumeFs::list",
+            Operation::VolumeFsStat => "VolumeFs::stat",
+            Operation::VolumeFsMkdir => "VolumeFs::mkdir",
+            Operation::VolumeFsRemove => "VolumeFs::remove",
+            Operation::VolumeFsCopy => "VolumeFs::copy",
+            Operation::VolumeFsRename => "VolumeFs::rename",
+            Operation::VolumeFsExists => "VolumeFs::exists",
+            Operation::VolumeFsReadStream => "VolumeFs::read_stream",
+            Operation::VolumeFsWriteStream => "VolumeFs::write_stream",
+            Operation::ServiceCreate => "Service::create",
+            Operation::ServiceGet => "Service::get",
+            Operation::ServiceList => "Service::list",
+            Operation::ServiceUpdate => "Service::update",
+            Operation::ServiceEnable => "Service::enable",
+            Operation::ServiceDisable => "Service::disable",
+            Operation::ServiceRemove => "Service::remove",
+            Operation::ImageGet => "Image::get",
+            Operation::StorageUsage => "Storage::usage",
+            Operation::StoragePrune => "Storage::prune",
+            Operation::ImageList => "Image::list",
+            Operation::ImageInspect => "Image::inspect",
+            Operation::ImageRemove => "Image::remove",
+            Operation::ImagePrune => "Image::prune",
+            Operation::ImageLoad => "Image::load",
+            Operation::ImageSave => "Image::save",
+            Operation::SnapshotOps => "snapshot operations",
+            Operation::Config => "config",
+        }
+    }
+}
+
+impl UnsupportedReason {
+    /// Render this reason as a brief remedy hint for error messages.
+    pub fn hint(&self) -> String {
+        match self {
+            UnsupportedReason::LocalOnly => "use a local backend".to_string(),
+            UnsupportedReason::CloudOnly => "use a cloud backend".to_string(),
+            UnsupportedReason::UseInstead(op) => format!("use {}", op.api_path()),
+            UnsupportedReason::RequiresUnixHost => "unix hosts only".to_string(),
+            UnsupportedReason::RequiresCrateFeature(feature) => {
+                format!("enable the {feature} feature")
+            }
+            UnsupportedReason::ConfigField(field) => {
+                format!("the {field} option is not accepted here")
+            }
+            UnsupportedReason::MountIntoSandbox => "mount the volume into a sandbox".to_string(),
+            UnsupportedReason::NotAvailable(reason) => reason.clone(),
+        }
+    }
+}
+
+impl MicrosandboxError {
+    /// Build an [`Unsupported`](Self::Unsupported) error for an operation the
+    /// active backend cannot honor.
+    pub fn unsupported(op: Operation, reason: UnsupportedReason) -> MicrosandboxError {
+        MicrosandboxError::Unsupported { op, reason }
+    }
+
+    /// [`Unsupported`](Self::Unsupported) for operations only a local backend honors.
+    pub fn local_only(op: Operation) -> MicrosandboxError {
+        Self::unsupported(op, UnsupportedReason::LocalOnly)
+    }
+
+    /// [`Unsupported`](Self::Unsupported) for operations only a cloud backend honors.
+    pub fn cloud_only(op: Operation) -> MicrosandboxError {
+        Self::unsupported(op, UnsupportedReason::CloudOnly)
+    }
+
+    /// Whether the Service change that returned this error may have been applied.
+    ///
+    /// Call this on every [`MicrosandboxError`] returned by Service create, update, enable,
+    /// disable, or remove, including errors outside [`MicrosandboxError::Service`]. Bindings can
+    /// project the result onto their base error type so callers do not need to identify a specific
+    /// error variant first.
+    ///
+    /// Errors that are returned before a change can commit report [`ChangeState::Unchanged`]:
+    /// invalid arguments, refused requests, missing Services or sandboxes, unavailable slugs,
+    /// unsupported backends, and connections that failed before the request was sent. Every other
+    /// error reports [`ChangeState::Unknown`].
+    pub fn changed(&self) -> ChangeState {
+        match self {
+            MicrosandboxError::Service { error, .. } => error.changed(),
+            MicrosandboxError::InvalidConfig(_)
+            | MicrosandboxError::ServiceNotFound(_)
+            | MicrosandboxError::ServiceAlreadyExists(_)
+            | MicrosandboxError::SandboxNotFound(_)
+            | MicrosandboxError::Unsupported { .. } => ChangeState::Unchanged,
+            #[cfg(any(feature = "cloud", feature = "local"))]
+            MicrosandboxError::Http(error) if error.is_connect() => ChangeState::Unchanged,
+            MicrosandboxError::CloudHttp { status, code, .. } => {
+                if (400..500).contains(status)
+                    || code.as_deref() == Some(SERVICE_CHANGES_PAUSED_CODE)
+                {
+                    ChangeState::Unchanged
+                } else {
+                    ChangeState::Unknown
+                }
+            }
+            // The wildcard fails closed, so a new variant reports Unknown.
+            _ => ChangeState::Unknown,
+        }
+    }
+}
+
+impl ServiceError {
+    /// Whether the change that failed with this reason may have been applied.
+    pub fn changed(&self) -> ChangeState {
+        match self {
+            ServiceError::QuotaExceeded
+            | ServiceError::SandboxLimitExceeded
+            | ServiceError::Conflict
+            | ServiceError::Detached
+            | ServiceError::TargetUnreachable { .. }
+            | ServiceError::ChangesPaused { .. }
+            | ServiceError::TargetNotRunning
+            | ServiceError::Other { .. } => ChangeState::Unchanged,
+            ServiceError::OutcomeUnknown => ChangeState::Unknown,
+        }
+    }
+}
+
+impl RestoreKind {
+    /// Interface-neutral remedy for resources this restore is missing.
+    fn missing_bindings_remedy(self) -> &'static str {
+        match self {
+            RestoreKind::Disk => {
+                "provide a destination mount for each path or explicitly allow missing resources"
+            }
+            RestoreKind::Full => {
+                "provide a destination mount or select a \
+                 captured disk for each path, or explicitly allow missing resources"
+            }
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl std::fmt::Display for SnapshotImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "snapshot import {}", self.operation_id)?;
+        if let Some(group) = &self.group_path {
+            write!(f, " into {}", group.display())?;
+        }
+        match self.outcome {
+            SnapshotImportOutcome::NotCommitted => write!(
+                f,
+                " failed; this batch published no changes: {}",
+                self.detail
+            ),
+            SnapshotImportOutcome::Committed => write!(
+                f,
+                " committed, but a later step failed: {}; inspect the destination before retrying",
+                self.detail
+            ),
+            SnapshotImportOutcome::Unknown => write!(
+                f,
+                " has an unknown publication outcome: {}; recover the destination before retrying",
+                self.detail
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotImportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+impl std::fmt::Display for SnapshotSourceRecoveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(artifact) = &self.artifact {
+            write!(
+                f,
+                "snapshot {} saved at {}; ",
+                artifact.snapshot_id,
+                artifact.path.display()
+            )?;
+        } else {
+            write!(
+                f,
+                "checkpoint {} retained at {}; requested snapshot publication is unconfirmed; ",
+                self.checkpoint_id,
+                self.checkpoint_path.display()
+            )?;
+        }
+        write!(
+            f,
+            "source sandbox {:?} requires recovery: {}",
+            self.source_sandbox, self.detail
+        )?;
+        if let Some(error) = &self.publication_error {
+            write!(f, "; snapshot publication failed: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<microsandbox_types::TypesError> for MicrosandboxError {
+    fn from(value: microsandbox_types::TypesError) -> Self {
+        match value {
+            microsandbox_types::TypesError::InvalidConfig(message) => Self::InvalidConfig(message),
+        }
+    }
+}
+
+impl From<microsandbox_types::CommandResolutionError> for MicrosandboxError {
+    fn from(value: microsandbox_types::CommandResolutionError) -> Self {
+        match value {
+            microsandbox_types::CommandResolutionError::NoDefaultCommand => Self::NoDefaultCommand,
+            error => Self::InvalidConfig(error.to_string()),
+        }
+    }
+}
+
+impl From<microsandbox_types::SnapshotManifestError> for MicrosandboxError {
+    fn from(value: microsandbox_types::SnapshotManifestError) -> Self {
+        Self::SnapshotIntegrity(value.to_string())
+    }
+}
+
+#[cfg(feature = "local")]
+impl microsandbox_db::retry::IsSqliteBusy for MicrosandboxError {
+    fn is_sqlite_busy(&self) -> bool {
+        matches!(self, MicrosandboxError::Database(db_err) if microsandbox_db::retry::is_sqlite_busy(db_err))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use resize::{ResizeWaitError, ResizeWaitFailure};
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_restore_bindings_name_each_restore_remedy() {
+        let disk = MicrosandboxError::MissingRestoreBindings {
+            missing: vec!["mount /data".into(), "mount /logs".into()],
+            restore: RestoreKind::Disk,
+        };
+        let full = MicrosandboxError::MissingRestoreBindings {
+            missing: vec!["disk /data".into(), "filesystem /work".into()],
+            restore: RestoreKind::Full,
+        };
+
+        assert_eq!(
+            disk.to_string(),
+            "invalid config: restore requires destination bindings for: mount /data, \
+             mount /logs; provide a destination mount for each path or explicitly allow \
+             missing resources"
+        );
+        assert_eq!(
+            full.to_string(),
+            "invalid config: restore requires destination bindings for: disk /data, \
+             filesystem /work; provide a destination mount or select a captured disk for \
+             each path, or explicitly allow missing resources"
+        );
+    }
+
+    #[test]
+    fn snapshot_source_recovery_details_keep_artifact_and_diagnostics_structured() {
+        let mut details = SnapshotSourceRecoveryError {
+            source_sandbox: "box".into(),
+            checkpoint_id: "checkpoint_test".into(),
+            checkpoint_root: "sha256:checkpoint".into(),
+            checkpoint_path: "/runtime/checkpoint_test".into(),
+            artifact: Some(PublishedSnapshotArtifact {
+                kind: SnapshotArtifactKind::Archive,
+                path: "/snapshots/saved.tar".into(),
+                snapshot_id: "snap_test".into(),
+                digest: "sha256:descriptor".into(),
+                head_update: None,
+            }),
+            detail: "thaw timed out; re-pause failed".into(),
+            publication_error: None,
+        };
+        let json = serde_json::to_value(&details).unwrap();
+        assert_eq!(json["artifact"]["kind"], "archive");
+        assert_eq!(json["artifact"]["path"], "/snapshots/saved.tar");
+        assert_eq!(json["detail"], details.detail);
+        assert!(json["publication_error"].is_null());
+        assert!(
+            details
+                .to_string()
+                .contains("saved at /snapshots/saved.tar")
+        );
+
+        details.artifact = None;
+        details.publication_error = Some("destination fsync failed".into());
+        let json = serde_json::to_value(&details).unwrap();
+        assert!(json["artifact"].is_null());
+        let rendered = MicrosandboxError::SnapshotSourceRecovery(Box::new(details)).to_string();
+        assert!(rendered.contains("publication is unconfirmed"));
+        assert!(rendered.contains("thaw timed out; re-pause failed"));
+        assert!(rendered.contains("destination fsync failed"));
+    }
+
+    #[test]
+    fn unsupported_renders_operation_and_reason() {
+        let err = MicrosandboxError::unsupported(
+            Operation::SandboxKill,
+            UnsupportedReason::UseInstead(Operation::SandboxStop),
+        );
+        assert_eq!(
+            err.to_string(),
+            "Sandbox::kill is not supported by this backend: use Sandbox::stop"
+        );
+
+        let err = MicrosandboxError::local_only(Operation::ImagePrune);
+        assert_eq!(
+            err.to_string(),
+            "Image::prune is not supported by this backend: use a local backend"
+        );
+
+        let err = MicrosandboxError::unsupported(
+            Operation::SandboxCreate,
+            UnsupportedReason::ConfigField("ca_certs"),
+        );
+        assert_eq!(
+            err.to_string(),
+            "Sandbox::create is not supported by this backend: the ca_certs option is not accepted here"
+        );
+    }
+
+    #[test]
+    fn sandbox_stop_timeout_explains_that_shutdown_continues() {
+        let error = MicrosandboxError::SandboxStopTimedOut {
+            name: "cloud-sandbox".into(),
+            timeout: std::time::Duration::from_secs(360),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "timed out after 360s waiting for sandbox \"cloud-sandbox\" to stop; the accepted stop may still complete"
+        );
+    }
+
+    #[test]
+    fn modification_not_confirmed_shows_the_cause_as_given() {
+        let error = MicrosandboxError::ModificationNotConfirmed {
+            cause: "the change was saved, but the running sandbox does not hold the secret; it \
+                    applies at the next start"
+                .into(),
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "the change did not complete as asked: the change was saved, but the running sandbox \
+             does not hold the secret; it applies at the next start"
+        );
+    }
+}

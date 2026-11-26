@@ -1,0 +1,307 @@
+---
+title: Overview
+"og:title": Microsandbox SDKs for TypeScript, Rust, Python, Go, and Ruby
+description: Install a microsandbox SDK, create your first microVM sandbox, and find API references for TypeScript, Rust, Python, Go, and Ruby.
+keywords: ["microsandbox SDK", "Python SDK", "TypeScript SDK", "Rust SDK", "Go SDK"]
+icon: "play"
+---
+
+Run microsandbox from your application. Locally, each sandbox runs as a child VM process; there is no daemon to install.
+
+The SDK uses your configured backend and defaults to local. Set `MSB_BACKEND=remote` and supply your API key to run the same code on [our managed cloud](/cloud/overview). Existing sandboxes keep their original destination. See [remote connections](/cloud/connect).
+
+## Installation
+
+<CodeGroup>
+```bash TypeScript
+npm install microsandbox
+```
+
+```bash Rust
+cargo add microsandbox
+```
+
+```bash Python
+pip install microsandbox
+```
+
+```bash Go
+go get github.com/superradcompany/microsandbox/sdk/go
+```
+
+```bash Ruby
+gem install microsandbox
+```
+</CodeGroup>
+
+<Note>
+Local sandboxes need a runtime. See [runtime setup](/sdk/setup) for installation and packaging details. Remote connections need only an API key.
+</Note>
+
+## Small example
+
+Create a sandbox from a container image, run a command, print the output, and remove it.
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+const sb = await Sandbox.builder("hello")
+    .image("python")
+    .create();
+
+try {
+    const output = await sb.exec("python", ["-c", "print('Hello, World!')"]);
+    console.log("Output:", output.stdout());
+} finally {
+    await sb.destroy();
+}
+```
+
+```rust Rust
+use std::error::Error;
+
+use microsandbox::Sandbox;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let sb = Sandbox::builder("hello")
+        .image("python")
+        .create()
+        .await?;
+
+    let output = sb.exec("python", ["-c", "print('Hello, World!')"]).await?;
+    println!("{}", output.stdout()?);
+
+    sb.destroy().await?;
+    Ok(())
+}
+```
+
+```python Python
+import asyncio
+from microsandbox import Sandbox
+
+async def main():
+    sb = await Sandbox.create("hello", image="python")
+    try:
+        output = await sb.exec("python", ["-c", "print('Hello, World!')"])
+        print(output.stdout_text)
+    finally:
+        await sb.destroy()
+
+asyncio.run(main())
+```
+
+```go Go
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+
+    m "github.com/superradcompany/microsandbox/sdk/go"
+)
+
+func main() {
+    if err := run(); err != nil {
+        log.Fatal(err)
+    }
+}
+
+func run() error {
+    ctx := context.Background()
+
+    if _, err := m.EnsureRuntime(ctx, m.RuntimeConfig{}, m.InstallOptions{}); err != nil {
+        return err
+    }
+
+    sb, err := m.CreateSandbox(ctx, "hello", m.WithImage("python"))
+    if err != nil {
+        return err
+    }
+    defer func() {
+        _ = sb.Destroy(context.Background())
+        _ = sb.Close()
+    }()
+
+    out, err := sb.Exec(ctx, "python", []string{"-c", "print('Hello, World!')"})
+    if err != nil {
+        return err
+    }
+    fmt.Println("Output:", out.Stdout())
+    return nil
+}
+```
+
+```ruby Ruby
+require "microsandbox"
+
+Microsandbox.install unless Microsandbox.installed?
+
+Microsandbox::Sandbox.with("hello", image: "python") do |sandbox|
+  output = sandbox.exec("python", ["-c", "print('Hello, World!')"])
+  puts "Output: #{output.stdout}"
+end
+Microsandbox::Sandbox.remove("hello")
+```
+
+</CodeGroup>
+
+## Connect remotely
+
+Set `MSB_API_KEY`, then use a `RemoteContext`. These examples inspect an existing sandbox named `worker`.
+
+<CodeGroup>
+```typescript TypeScript
+import { RemoteContext } from "microsandbox";
+
+const remote = RemoteContext.fromEnv();
+const sb = await remote.sandboxes.get("worker");
+console.log(await sb.status());
+```
+
+```rust Rust
+use microsandbox::{Context, RemoteContext};
+
+let remote = RemoteContext::from_env()?;
+let sb = remote.sandboxes().get("worker").await?;
+println!("{:?}", sb.status().await?);
+```
+
+```python Python
+from microsandbox import RemoteContext
+
+remote = RemoteContext.from_env()
+sb = await remote.sandboxes.get("worker")
+print(await sb.status())
+```
+
+```go Go
+remote, err := m.RemoteContextFromEnv()
+if err != nil {
+    return err
+}
+sb, err := remote.Sandboxes().Get(ctx, "worker")
+if err != nil {
+    return err
+}
+defer sb.Close()
+
+status, err := sb.Status(ctx)
+if err != nil {
+    return err
+}
+fmt.Println(status)
+```
+
+```ruby Ruby
+require "microsandbox"
+
+remote = Microsandbox::RemoteContext.from_env
+sb = remote.sandboxes.get("worker")
+puts sb.status
+```
+</CodeGroup>
+
+<Tip>
+Use `MSB_BACKEND` or an active profile to [switch between local and cloud](/cloud/connect#choose-at-startup) across SDKs and the CLI.
+</Tip>
+
+## Capture the configured destination
+
+Resolve configuration once when an application needs to inspect its destination before creating a sandbox, or keep using that destination after `msb context use` changes the saved selection. Resolution uses the same precedence as ordinary SDK calls and returns configuration errors immediately. It does not create a sandbox, open its catalog, or contact the remote API.
+
+<CodeGroup>
+```typescript TypeScript
+import { configuredContext } from "microsandbox";
+
+const destination = configuredContext();
+console.log(destination.info); // kind, source, profile, apiUrl
+const sandboxes = destination.sandboxes;
+```
+
+```rust Rust
+let destination = microsandbox::resolve_context()?;
+println!("{:?}", destination.info()?);
+let sandboxes = destination.sandboxes();
+```
+
+```python Python
+from microsandbox import configured_context
+
+destination = configured_context()
+print(destination.info)  # kind, source, profile, api_url
+sandboxes = destination.sandboxes
+```
+
+```go Go
+import msb "github.com/superradcompany/microsandbox/sdk/go"
+
+destination, err := msb.ConfiguredContext()
+if err != nil {
+    return err
+}
+info, err := destination.Info()
+if err != nil {
+    return err
+}
+fmt.Println(info.Kind, info.Source, info.Profile, info.APIURL)
+sandboxes := destination.Sandboxes()
+```
+
+```ruby Ruby
+require "microsandbox"
+
+destination = Microsandbox.configured_context
+puts destination.info.inspect
+sandboxes = destination.sandboxes
+```
+</CodeGroup>
+
+Use these collections for subsequent operations. They retain the destination's endpoint and authentication even if profiles or environment variables change. Resolving again captures the new configuration; ordinary package-level calls keep their existing selection behavior.
+
+Metadata contains no API key. `kind` is `local` or `remote` (`:local` or `:remote` in Ruby). `source` identifies the selector: `managed`, `MSB_BACKEND`, `MSB_PROFILE`, `active_profile`, or `default`. Explicit constructors can report `programmatic` or `profile`. Rust callers matching `ContextSelectionSource` exhaustively must handle the new `Managed` variant. Profile names and API URLs are absent when not applicable (empty strings in Go). Custom HTTP requests still need their own authentication; this API does not expose credentials or provide an authenticated HTTP client. Go reports an unsupported-operation error from `Info()` when an older native library cannot return retained metadata.
+
+## Select a smaller distribution
+
+<Note>
+Smaller packages are unreleased and are not included in v0.7.15.
+</Note>
+
+TypeScript and Python offer separate local and remote packages:
+
+<CodeGroup>
+```bash TypeScript
+npm install @microsandbox/local
+# Or, for remote connections:
+npm install @microsandbox/remote
+```
+
+```bash Python
+pip install microsandbox-local
+# Or, for remote connections:
+pip install microsandbox-remote
+```
+</CodeGroup>
+
+Change the package you import; the same sandbox methods still work.
+
+See [distribution choices](/migrations/v0.8#sdk-distribution-migration) for imports, native-library setup, and options for every SDK.
+
+<Note>
+Smaller local packages need a [separately installed runtime](/sdk/setup#bring-your-own-runtime). Remote packages need no local runtime.
+</Note>
+
+## Reference
+
+Choose the SDK for your language:
+
+- [TypeScript SDK](/sdk/typescript/sandbox)
+- [Rust SDK](/sdk/rust/sandbox)
+- [Python SDK](/sdk/python/sandbox)
+- [Go SDK](/sdk/go/sandbox)
+- [Ruby SDK](/sdk/ruby/sandbox)
+
+For low-level protocol integrations, see the Agent Client references for [TypeScript](/sdk/typescript/agent-client), [Rust](/sdk/rust/agent-client), [Python](/sdk/python/agent-client), and [Go](/sdk/go/agent-client). See also [error handling](/sdk/errors).

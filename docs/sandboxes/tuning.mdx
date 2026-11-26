@@ -1,0 +1,565 @@
+---
+title: Live Modify
+description: Resize a running sandbox and update its configuration without replacing it
+icon: "pen-to-square"
+---
+
+<Tooltip tip="On our managed cloud, modify changes secrets only: a value, allowed hosts and removal can apply live; other secret changes need the next-start policy."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Use `modify` to resize a local sandbox, update its metadata, rotate secrets, or change defaults for future commands. On our managed cloud, `modify` changes secrets only; recreate the sandbox for other configuration changes.
+
+<span id="what-can-modify-change" />
+
+Live modification is available through TypeScript, Rust, Python, Go, and the CLI. Ruby does not expose a modification API; set its supported options when creating a sandbox.
+
+## Supported changes
+
+When a change takes effect depends on the setting:
+
+| Change | When it takes effect | Notes |
+| --- | --- | --- |
+| CPU and memory | Live, within the boot-time `max_*` ceilings | The VM and workload keep running |
+| Labels | Live | Host-side metadata; guest processes do not change |
+| Existing secret material or removal | Live | Adding a secret or changing its placeholder needs a restart |
+| Environment and workdir | Future execs | Processes that are already running keep their current values |
+| `max_cpus` and `max_memory` | Restart or next start | These ceilings are fixed when the VM boots |
+| Root disk size | Live, restart or next start | Managed and flat ext4 roots grow only; tmpfs changes on boot |
+| Published TCP/UDP ports | Restart or next start | Add, update, or explicitly remove individual host endpoints |
+| Named volumes, mount tmpfs, and user disk images | Outside `modify` | Capacity is managed where the storage is defined |
+
+The default policy applies only changes that can complete without restarting. If a patch contains one restart-required change, microsandbox rejects the whole patch and the old configuration stays intact.
+
+On our managed cloud, `modify` changes secrets only. A secret's value, allowed hosts, and removal can apply live; any other secret change applies at the next start, so use the next-start policy, then stop and start the sandbox. The restart policy cannot apply those changes on cloud. On a running sandbox, a live change reads `live` or fails with a [not-confirmed error](/sdk/errors#modification-not-confirmed); it reads `next start` only when the sandbox is stopped or the next-start policy is used.
+
+<span id="modify-a-running-sandbox" />
+
+## Apply changes
+
+This patch doubles the running sandbox's CPU and memory and updates a label in the same operation:
+
+<CodeGroup>
+```bash CLI
+msb modify worker --cpus 4 --memory 2G --label tier=web
+```
+
+```typescript TypeScript
+const plan = await sandbox.modify({
+  cpus: 4,
+  memory: 2048,
+  labels: { tier: "web" },
+});
+```
+
+```rust Rust
+let plan = sb.modify()
+    .cpus(4)
+    .memory(2048)
+    .label("tier", "web")
+    .apply()
+    .await?;
+```
+
+```python Python
+plan = await sb.modify(
+    cpus=4,
+    memory=2048,
+    labels={"tier": "web"},
+)
+```
+
+```go Go
+plan, err := sb.Modify(ctx, m.ModifyOptions{
+    CPUs:      4,
+    MemoryMiB: 2048,
+    Labels:    map[string]string{"tier": "web"},
+})
+```
+</CodeGroup>
+
+The result is a modification plan showing what changed and whether each change was applied. CPU and memory can take a moment to converge inside the guest. The new host limits and label take effect immediately, and the workload continues running.
+
+<span id="reserve-resize-headroom" />
+
+## Set resize limits
+
+Live growth needs capacity reserved when the VM boots. Set `max_cpus` and `max_memory` above the starting allocation when you create a sandbox that may need to scale:
+
+<CodeGroup>
+```typescript TypeScript
+await using sandbox = await Sandbox.builder("worker")
+  .image("python")
+  .cpus(2)
+  .memory(1024)
+  .maxCpus(8)
+  .maxMemory(4096)
+  .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .cpus(2)
+    .memory(1024)
+    .max_cpus(8)
+    .max_memory(4096)
+    .create()
+    .await?;
+```
+
+```python Python
+sb = await Sandbox.create(
+    "worker",
+    image="python",
+    cpus=2,
+    memory=1024,
+    max_cpus=8,
+    max_memory=4096,
+)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("python"),
+    m.WithCPUs(2),
+    m.WithMemory(1024),
+    m.WithMaxCPUs(8),
+    m.WithMaxMemory(4096),
+)
+```
+
+```ruby Ruby
+sb = Microsandbox::Sandbox.create(
+  "worker",
+  image: "python",
+  cpus: 2,
+  memory: 1024,
+  max_cpus: 8,
+  max_memory: 4096
+)
+```
+
+```bash CLI
+msb create python --name worker \
+  --cpus 2 --memory 1G \
+  --max-cpus 8 --max-memory 4G
+```
+</CodeGroup>
+
+The sandbox starts with two vCPUs and 1 GiB of memory, but it can grow live to eight vCPUs and 4 GiB. The ceilings default to the starting size, so omitting them leaves no live growth headroom.
+
+Reserving headroom is cheap: spare vCPUs stay parked, and microsandbox backs spare memory only when the guest uses it. You can lower CPU or memory live without pre-planning, then grow back up to the booted ceiling later.
+
+<span id="preview-before-applying" />
+
+## Preview changes
+
+Use a dry run when a patch mixes settings or you are unsure whether a restart is needed:
+
+<CodeGroup>
+```bash CLI
+msb modify worker --max-memory 16G --dry-run
+```
+
+```typescript TypeScript
+const plan = await sandbox.modify({
+  maxMemory: 16_384,
+  dryRun: true,
+});
+```
+
+```rust Rust
+let plan = sb.modify()
+    .max_memory(16_384)
+    .dry_run()
+    .await?;
+```
+
+```python Python
+plan = await sb.modify(max_memory=16_384, dry_run=True)
+```
+
+```go Go
+plan, err := sb.Modify(ctx, m.ModifyOptions{
+    MaxMemoryMiB: 16_384,
+    DryRun:        true,
+})
+```
+</CodeGroup>
+
+The planner classifies every requested field before it changes anything:
+
+| Disposition | Meaning |
+| --- | --- |
+| `live` | Applies without restarting the VM |
+| `next start` | Is saved and applies the next time the sandbox starts |
+| `requires restart` | Cannot affect the running VM under the default policy |
+| `unsupported` | Is invalid for this sandbox or backing type |
+
+<span id="live-paths-in-detail" />
+
+## Update settings
+
+<span id="cpu-and-memory" />
+
+### Resize CPU and memory
+
+<Frame>
+  <img src="/images/live-modify.svg" alt="A terminal changes CPU, memory, and a label while the sandbox remains running" />
+</Frame>
+
+Raise or lower CPU and memory while the workload runs:
+
+<CodeGroup>
+```bash CLI
+msb modify worker --cpus 4 --memory 2G
+```
+
+```typescript TypeScript
+const plan = await sandbox.modify({ cpus: 4, memory: 2048 });
+```
+
+```rust Rust
+let plan = sb.modify()
+    .cpus(4)
+    .memory(2048)
+    .apply()
+    .await?;
+```
+
+```python Python
+plan = await sb.modify(cpus=4, memory=2048)
+```
+
+```go Go
+plan, err := sb.Modify(ctx, m.ModifyOptions{
+    CPUs:      4,
+    MemoryMiB: 2048,
+})
+```
+</CodeGroup>
+
+Use [`msb ps`](/cli/sandbox-commands#msb-status) to inspect allocation and [`msb metrics`](/cli/sandbox-commands#msb-metrics) to check usage before resizing. A successful modification returns `accepted` for each resized resource: the runtime accepted its target, but guest completion has not been confirmed. `plan.applied` describes applying the modification request; it does not establish usable guest capacity. Do not infer completion from equal reported quantities or from current memory exceeding a shrink target.
+
+<span id="labels" />
+
+### Update labels
+
+Labels are host-side metadata, so adding, changing, or removing one on a running sandbox is applied live by default:
+
+<CodeGroup>
+```bash CLI
+msb modify worker --label tier=web --label-rm stale
+```
+
+```typescript TypeScript
+const plan = await sandbox.modify({
+  labels: { tier: "web" },
+  labelsRemove: ["stale"],
+});
+```
+
+```rust Rust
+let plan = sb.modify()
+    .label("tier", "web")
+    .remove_label("stale")
+    .apply()
+    .await?;
+```
+
+```python Python
+plan = await sb.modify(
+    labels={"tier": "web"},
+    labels_rm=["stale"],
+)
+```
+
+```go Go
+plan, err := sb.Modify(ctx, m.ModifyOptions{
+    Labels:       map[string]string{"tier": "web"},
+    LabelsRemove: []string{"stale"},
+})
+```
+</CodeGroup>
+
+Running guest processes do not change. Lists and label filters show the new labels immediately, and [`msb-metrics`](/observability/msb-metrics) tags usage with them from its next collection. With the `next_start` policy the labels are saved, but metrics and branches keep the old labels until the sandbox starts again.
+
+<Note>Sandboxes started by v0.6.3 or earlier can't apply label changes live; use `--restart` or `--next-start`.</Note>
+
+See [Labels](/sandboxes/labels) for naming and cardinality guidance.
+
+<span id="environment-and-workdir" />
+
+### Set command defaults
+
+Environment and workdir updates require no restart, but they affect only commands started after the patch:
+
+<CodeGroup>
+```bash CLI
+msb modify worker --env MODE=prod --workdir /app
+msb exec worker -- printenv MODE
+```
+
+```typescript TypeScript
+await sandbox.modify({
+  env: { MODE: "prod" },
+  workdir: "/app",
+});
+
+const output = await sandbox.exec("printenv", ["MODE"]);
+```
+
+```rust Rust
+sb.modify()
+    .env("MODE", "prod")
+    .workdir("/app")
+    .apply()
+    .await?;
+
+let output = sb.exec("printenv", ["MODE"]).await?;
+```
+
+```python Python
+await sb.modify(env={"MODE": "prod"}, workdir="/app")
+output = await sb.exec("printenv", ["MODE"])
+```
+
+```go Go
+_, err := sb.Modify(ctx, m.ModifyOptions{
+    Env:     map[string]string{"MODE": "prod"},
+    Workdir: "/app",
+})
+out, err := sb.Exec(ctx, "printenv", []string{"MODE"})
+```
+</CodeGroup>
+
+Processes that were already running keep their original environment and working directory.
+
+<span id="secrets" />
+
+### Rotate secrets
+
+Rotating the value of an existing secret is live because substitution happens at the host network boundary. Guest code keeps using the same placeholder while microsandbox begins injecting the new value:
+
+<CodeGroup>
+```bash CLI
+msb modify worker --secret GITHUB_TOKEN@api.github.com
+```
+
+```typescript TypeScript
+const plan = await sandbox.modify({
+  secrets: {
+    GITHUB_TOKEN: {
+      env: "GITHUB_TOKEN",
+      allowedHosts: ["api.github.com"],
+    },
+  },
+});
+```
+
+```rust Rust
+use microsandbox::sandbox::SecretSource;
+
+let plan = sb.modify()
+    .secret(|secret| secret
+        .env("GITHUB_TOKEN")
+        .source(SecretSource::Env { var: "GITHUB_TOKEN".into() })
+        .allow("api.github.com"))
+    .remove_secret("OLD_TOKEN")
+    .apply()
+    .await?;
+```
+
+```python Python
+plan = await sb.modify(
+    secrets={
+        "GITHUB_TOKEN": {
+            "env": "GITHUB_TOKEN",
+            "allowed_hosts": ["api.github.com"],
+        },
+    },
+)
+```
+
+```go Go
+plan, err := sb.Modify(ctx, m.ModifyOptions{
+    Secrets: map[string]m.SecretModifySpec{
+        "GITHUB_TOKEN": {
+            Env:          "GITHUB_TOKEN",
+            AllowedHosts: []string{"api.github.com"},
+        },
+    },
+})
+```
+</CodeGroup>
+
+Adding a new secret or changing its guest-visible placeholder requires a restart because existing processes cannot receive a new placeholder. If the new secret requires TLS identity while interception is off, the plan on a local sandbox also enables `tls`, which needs the same restart or next start. Existing secrets configured with `require_tls_identity(false)` continue to rotate live over plain HTTP without enabling interception. Removing a secret does not require recreating the sandbox, and on a local sandbox, removing every TLS-dependent secret leaves interception on. See [Secrets](/sandboxes/secrets) for sources, host allow lists, and storage behavior.
+
+<span id="root-disk-growth" />
+
+### Grow the root disk
+
+Grow an owned managed or flat ext4 root without restarting, including roots backed by checkpoint layers:
+
+<CodeGroup>
+```bash CLI
+msb modify worker --root-disk 8G
+```
+
+```typescript TypeScript
+await sandbox.modify({ rootDiskSize: 8192 });
+```
+
+```rust Rust
+sb.modify().root_disk_size(8192).apply().await?;
+```
+
+```python Python
+await sb.modify(root_disk_size=8192)
+```
+
+```go Go
+_, err := sb.Modify(ctx, m.ModifyOptions{RootDiskSizeMiB: 8192})
+```
+</CodeGroup>
+
+Microsandbox briefly pauses the VM to extend its writable disk, resumes it, then asks ext4 to make the space usable. Existing snapshots and sealed backing layers stay unchanged. A stopped sandbox grows before the new size is persisted.
+
+Growth is explicit and grow-only. The ext4 image must have enough reserved metadata headroom; older runtimes and filesystems without online-resize support return an error instead of silently restarting. User-supplied disks and cloud sandboxes remain unsupported. Use `--next-start` to defer growth or `--restart` to use stopped growth.
+
+If the disk grows but guest filesystem expansion fails, the error reports incomplete growth. Retry the same target, or stop and restart to finish recovery. Microsandbox never truncates the disk to roll back; snapshots and compaction stay blocked until recovery completes.
+
+<span id="changes-that-need-a-boot-boundary" />
+
+## Restart required
+
+These changes take effect after a restart:
+
+| Change | Apply now | Defer safely |
+| --- | --- | --- |
+| Raise `max_cpus` or `max_memory` | `--restart` | `--next-start` |
+| Resize a tmpfs root disk | On restart | `--next-start` |
+| Add a new secret or change its placeholder | `--restart` | `--next-start` |
+
+<CodeGroup>
+```bash CLI
+msb modify worker --max-memory 16G --next-start
+msb modify worker --root-disk 8G --restart
+```
+
+```typescript TypeScript
+await sandbox.modify({
+  maxMemory: 16_384,
+  policy: "next_start",
+});
+
+await sandbox.modify({
+  rootDiskSize: 8192,
+  policy: "restart",
+});
+```
+
+```rust Rust
+sb.modify()
+    .max_memory(16_384)
+    .next_start()
+    .apply()
+    .await?;
+
+sb.modify()
+    .root_disk_size(8192)
+    .restart()
+    .apply()
+    .await?;
+```
+
+```python Python
+from microsandbox import ModificationPolicy
+
+await sb.modify(
+    max_memory=16_384,
+    policy=ModificationPolicy.NEXT_START,
+)
+
+await sb.modify(
+    root_disk_size=8192,
+    policy=ModificationPolicy.RESTART,
+)
+```
+
+```go Go
+_, err := sb.Modify(ctx, m.ModifyOptions{
+    MaxMemoryMiB: 16_384,
+    Policy:       m.ModificationPolicyNextStart,
+})
+
+_, err = sb.Modify(ctx, m.ModifyOptions{
+    RootDiskSizeMiB: 8192,
+    Policy:          m.ModificationPolicyRestart,
+})
+```
+</CodeGroup>
+
+`--next-start` saves the desired configuration without touching the running VM. `--restart` stops and starts the sandbox only when the patch needs it. The default policy does neither and rejects restart-required changes.
+
+Root disk resizing remains conservative: managed and flat OCI disks grow only, tmpfs can grow or shrink at the next boot, and user-supplied disk images are never resized by microsandbox. Named volume and mount capacity is managed where that storage is defined. See [Volumes](/sandboxes/volumes) and [Images](/images/overview) for the storage model.
+
+## Change published ports
+
+Add or update one mapping without repeating the others. A mapping is identified by its
+host address, host port, and protocol. The default is loopback (`127.0.0.1`) and TCP.
+Removal is explicit; an empty list leaves existing mappings unchanged.
+
+<CodeGroup>
+
+```typescript TypeScript
+await sandbox.modify({
+  ports: [{ hostPort: 8080, guestPort: 3000 }],
+  policy: "next_start",
+});
+await sandbox.modify({ portsRemove: [{ hostPort: 8080 }], policy: "restart" });
+```
+
+```rust Rust
+use microsandbox::sandbox::{PortProtocol, PublishedPortKey};
+
+sb.modify().port(8080, 3000).next_start().apply().await?;
+sb.modify().remove_port(PublishedPortKey {
+    host_bind: "127.0.0.1".into(),
+    host_port: 8080,
+    protocol: PortProtocol::Tcp,
+}).restart().apply().await?;
+```
+
+```python Python
+from microsandbox import ModificationPolicy, PortEndpoint
+
+await sb.modify(ports={8080: 3000}, policy=ModificationPolicy.NEXT_START)
+await sb.modify(ports_rm=[PortEndpoint(8080)], policy=ModificationPolicy.RESTART)
+```
+
+```go Go
+_, err := sb.Modify(ctx, m.ModifyOptions{
+    Ports: []m.PortBinding{{HostPort: 8080, GuestPort: 3000}},
+    Policy: m.ModificationPolicyNextStart,
+})
+_, err = sb.Modify(ctx, m.ModifyOptions{
+    PortsRemove: []m.PortEndpoint{{HostPort: 8080}},
+    Policy: m.ModificationPolicyRestart,
+})
+```
+```bash CLI
+msb modify worker -p 8080:3000 --next-start
+msb modify worker --port-rm 8080 --restart
+# Explicit address and UDP:
+msb modify worker -p 127.0.0.1:5353:53/udp --next-start
+msb modify worker --port-rm 127.0.0.1:5353/udp --next-start
+```
+</CodeGroup>
+
+For running sandboxes, use `--next-start` to defer changes or `--restart` to apply them immediately. Restart preserves disk contents but interrupts processes and connections. Stopped sandboxes save changes for their next start. Use `--dry-run` to preview changes.
+
+Known port conflicts are rejected before changes are applied, but ports aren't reserved: binding can still fail at startup and will be logged. Port modification is supported only for local sandboxes.
+
+## Reference
+
+For every CLI flag and result state, see [`msb modify`](/cli/sandbox-commands#msb-modify). The SDK sandbox references expose the same planner and policies for [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), and [Go](/sdk/go/sandbox).

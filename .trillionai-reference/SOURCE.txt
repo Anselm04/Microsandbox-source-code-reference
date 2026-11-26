@@ -1,0 +1,5 @@
+Upstream: https://github.com/superradcompany/microsandbox
+Revision: 1102191f53385012da0d35995915df5306e85588
+Source snapshot; upstream automation, unsupported entries, and restricted enterprise code where applicable excluded. Original licences retained. Commercial reuse requires licence audit.
+Copied files: 2525
+Excluded files: 28

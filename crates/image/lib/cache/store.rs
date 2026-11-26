@@ -1,0 +1,1617 @@
+//! Global on-disk image and layer cache.
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use oci_client::Reference;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as Sha2Digest, Sha256};
+
+use super::lock::CacheLockGuard;
+use crate::storage_lease::StorageLease;
+use crate::{
+    config::ImageConfig,
+    digest::Digest,
+    erofs::ErofsReader,
+    error::{ImageError, ImageResult},
+    progress::{PullProgress, PullProgressSender},
+};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Subdirectory for per-layer EROFS images (keyed by diff_id).
+const LAYERS_DIR: &str = "layers";
+
+/// Subdirectory for fsmeta EROFS images (keyed by manifest digest).
+const FSMETA_DIR: &str = "fsmeta";
+
+/// Subdirectory for VMDK descriptors (keyed by manifest digest).
+const VMDK_DIR: &str = "vmdk";
+
+/// Root directory for reusable flat ext4 artifacts.
+const FLAT_DIR: &str = "flat";
+const FLAT_REFS_DIR: &str = "refs";
+const FLAT_BLOBS_DIR: &str = "blobs";
+const FLAT_LOCKS_DIR: &str = "locks";
+
+/// Subdirectory for cached manifest + config metadata.
+const MANIFESTS_DIR: &str = "manifests";
+
+/// Subdirectory for transient staging (downloads, work dirs).
+const TMP_DIR: &str = "tmp";
+
+/// EROFS images are emitted in 4 KiB filesystem blocks.
+const EROFS_ALIGNMENT_BYTES: u64 = 4096;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Whether descriptor generation replaces an existing cached file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VmdkWriteMode {
+    /// Repair paths even when a descriptor already exists.
+    ReplaceExisting,
+    /// Recheck under the lock and preserve an existing descriptor.
+    KeepExisting,
+}
+
+/// On-disk global cache for OCI layers and EROFS images.
+///
+/// Layout:
+/// ```text
+/// ~/.microsandbox/cache/manifests/<sha256-of-ref>.json       # manifest + config metadata
+/// ~/.microsandbox/cache/tmp/<blob>.part                      # partial downloads
+/// ~/.microsandbox/cache/tmp/<blob>.download.lock             # download flock files
+/// ~/.microsandbox/cache/tmp/<blob>.work/                     # materialization work dirs
+/// ~/.microsandbox/cache/layers/<diff_id_safe>.erofs          # per-layer EROFS
+/// ~/.microsandbox/cache/layers/<diff_id_safe>.erofs.lock     # materialization flock
+/// ~/.microsandbox/cache/fsmeta/<manifest_safe>.erofs         # fsmeta EROFS (fsmerge metadata)
+/// ~/.microsandbox/cache/fsmeta/<manifest_safe>.erofs.lock    # materialization flock
+/// ~/.microsandbox/cache/vmdk/<manifest_safe>.vmdk            # VMDK descriptor
+/// ```
+#[derive(Clone)]
+pub struct GlobalCache {
+    /// An explicitly scoped operation retains all admitted entries through catalog publication.
+    pub(super) operation: Option<Arc<Mutex<BTreeMap<PathBuf, StorageLease>>>>,
+
+    /// Root of the layer EROFS cache (`~/.microsandbox/cache/layers/`).
+    layers_dir: PathBuf,
+
+    /// Root of the fsmeta EROFS cache (`~/.microsandbox/cache/fsmeta/`).
+    fsmeta_dir: PathBuf,
+
+    /// Root of the VMDK descriptor cache (`~/.microsandbox/cache/vmdk/`).
+    vmdk_dir: PathBuf,
+
+    /// Manifest-keyed references to immutable flat artifacts.
+    flat_refs_dir: PathBuf,
+
+    /// Content-addressed immutable raw ext4 artifacts.
+    flat_blobs_dir: PathBuf,
+
+    /// Per-derivation materialization locks.
+    flat_locks_dir: PathBuf,
+
+    /// Root of the manifest metadata cache (`~/.microsandbox/cache/manifests/`).
+    manifests_dir: PathBuf,
+
+    /// Root of the transient staging area (`~/.microsandbox/cache/tmp/`).
+    tmp_dir: PathBuf,
+}
+
+/// Authentication provenance recorded when an OCI cache entry was populated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheAuthProvenance {
+    /// Entry predates provenance tracking or came from an archive import that
+    /// does not establish anonymous upstream registry access.
+    #[default]
+    Unknown,
+    /// Entry was fetched from the upstream registry without credentials.
+    Anonymous,
+    /// Entry was fetched from the upstream registry using non-anonymous credentials.
+    Authenticated,
+    /// Entry was explicitly imported from a local image archive (`msb image load`).
+    LocalArchive,
+}
+
+/// Cached metadata for a pulled image reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedImageMetadata {
+    /// Content-addressable digest of the resolved manifest.
+    pub manifest_digest: String,
+    /// Content-addressable digest of the config blob.
+    pub config_digest: String,
+    /// Raw resolved image manifest JSON.
+    pub raw_manifest_json: String,
+    /// Raw image config JSON.
+    pub raw_config_json: String,
+    /// Parsed OCI image configuration.
+    pub config: ImageConfig,
+    /// Layer metadata in bottom-to-top order.
+    pub layers: Vec<CachedLayerMetadata>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct CachedImageEntry {
+    #[serde(flatten)]
+    pub(crate) metadata: CachedImageMetadata,
+    #[serde(default, skip_serializing_if = "CacheAuthProvenance::is_unknown")]
+    pub(crate) pull_auth: CacheAuthProvenance,
+}
+
+/// A validated archive metadata publication with the reference gate held.
+pub struct ImageMetadataInstall {
+    cache: GlobalCache,
+    path: PathBuf,
+    new_bytes: Option<Vec<u8>>,
+    _leases: Vec<StorageLease>,
+    _gate: StorageLease,
+}
+
+/// Cached metadata for a single layer descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedLayerMetadata {
+    /// Compressed layer digest from the manifest (blob digest).
+    pub digest: String,
+    /// OCI media type of the layer blob.
+    pub media_type: Option<String>,
+    /// Compressed blob size in bytes.
+    pub size_bytes: Option<u64>,
+    /// Uncompressed diff ID from the image config.
+    pub diff_id: String,
+}
+
+/// Manifest-keyed reference to one validated immutable flat rootfs artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlatRootfsRef {
+    /// Reference schema version.
+    pub schema: u32,
+    /// Resolved OCI manifest digest used as the requested input.
+    pub manifest_digest: String,
+    /// Complete derivation digest including platform and materializer profile.
+    pub derivation_digest: String,
+    /// SHA-256 digest of the validated raw ext4 bytes.
+    pub artifact_digest: String,
+    /// Pure-Rust materializer ABI.
+    pub materializer_abi: u32,
+    /// Deterministic ext4 UUID as lowercase hexadecimal.
+    pub uuid: String,
+    /// Logical sparse image size.
+    pub virtual_size_bytes: u64,
+    /// Unique inode count in the materialized rootfs.
+    pub inode_count: u64,
+    /// Unique regular-file content bytes.
+    pub content_bytes: u64,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl ImageMetadataInstall {
+    /// Publish after all backing artifacts have been installed.
+    pub async fn commit(self) -> ImageResult<()> {
+        tokio::task::spawn_blocking(move || {
+            let installation = self;
+            if let Some(bytes) = &installation.new_bytes {
+                installation
+                    .cache
+                    .install_image_metadata_file(&installation.path, bytes)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+}
+
+impl CacheAuthProvenance {
+    /// Whether provenance is unknown (omitted on disk for backward compatibility).
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    /// Whether an unauthenticated cache lookup may serve this entry directly.
+    pub const fn allows_unauthenticated_cache_hit(self) -> bool {
+        matches!(self, Self::Anonymous | Self::LocalArchive)
+    }
+}
+
+impl GlobalCache {
+    /// Create a new GlobalCache using the provided cache directory.
+    ///
+    /// Creates all subdirectories if they don't exist.
+    pub fn new(cache_dir: &Path) -> ImageResult<Self> {
+        let layers_dir = cache_dir.join(LAYERS_DIR);
+        let fsmeta_dir = cache_dir.join(FSMETA_DIR);
+        let vmdk_dir = cache_dir.join(VMDK_DIR);
+        let flat_dir = cache_dir.join(FLAT_DIR);
+        let flat_refs_dir = flat_dir.join(FLAT_REFS_DIR);
+        let flat_blobs_dir = flat_dir.join(FLAT_BLOBS_DIR);
+        let flat_locks_dir = flat_dir.join(FLAT_LOCKS_DIR);
+        let manifests_dir = cache_dir.join(MANIFESTS_DIR);
+        let tmp_dir = cache_dir.join(TMP_DIR);
+
+        for dir in [
+            &layers_dir,
+            &fsmeta_dir,
+            &vmdk_dir,
+            &flat_refs_dir,
+            &flat_blobs_dir,
+            &flat_locks_dir,
+            &manifests_dir,
+            &tmp_dir,
+        ] {
+            std::fs::create_dir_all(dir).map_err(|e| ImageError::Cache {
+                path: dir.clone(),
+                source: e,
+            })?;
+        }
+
+        Ok(Self {
+            operation: None,
+            layers_dir,
+            fsmeta_dir,
+            vmdk_dir,
+            flat_refs_dir,
+            flat_blobs_dir,
+            flat_locks_dir,
+            manifests_dir,
+            tmp_dir,
+        })
+    }
+
+    /// Create a new GlobalCache using async filesystem operations.
+    pub async fn new_async(cache_dir: &Path) -> ImageResult<Self> {
+        let layers_dir = cache_dir.join(LAYERS_DIR);
+        let fsmeta_dir = cache_dir.join(FSMETA_DIR);
+        let vmdk_dir = cache_dir.join(VMDK_DIR);
+        let flat_dir = cache_dir.join(FLAT_DIR);
+        let flat_refs_dir = flat_dir.join(FLAT_REFS_DIR);
+        let flat_blobs_dir = flat_dir.join(FLAT_BLOBS_DIR);
+        let flat_locks_dir = flat_dir.join(FLAT_LOCKS_DIR);
+        let manifests_dir = cache_dir.join(MANIFESTS_DIR);
+        let tmp_dir = cache_dir.join(TMP_DIR);
+
+        for dir in [
+            &layers_dir,
+            &fsmeta_dir,
+            &vmdk_dir,
+            &flat_refs_dir,
+            &flat_blobs_dir,
+            &flat_locks_dir,
+            &manifests_dir,
+            &tmp_dir,
+        ] {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| ImageError::Cache {
+                    path: dir.clone(),
+                    source: e,
+                })?;
+        }
+
+        Ok(Self {
+            operation: None,
+            layers_dir,
+            fsmeta_dir,
+            vmdk_dir,
+            flat_refs_dir,
+            flat_blobs_dir,
+            flat_locks_dir,
+            manifests_dir,
+            tmp_dir,
+        })
+    }
+
+    // ── Layer EROFS paths (keyed by diff_id) ─────────────────────────
+
+    /// Root layer EROFS cache directory.
+    pub fn layers_dir(&self) -> &Path {
+        &self.layers_dir
+    }
+
+    /// Path to the per-layer EROFS image for a given diff_id.
+    pub fn layer_erofs_path(&self, diff_id: &Digest) -> PathBuf {
+        self.layers_dir
+            .join(format!("{}.erofs", diff_id.to_path_safe()))
+    }
+
+    /// Path to the materialization lock for a layer EROFS image.
+    pub fn layer_erofs_lock_path(&self, diff_id: &Digest) -> PathBuf {
+        self.layers_dir
+            .join(format!("{}.erofs.lock", diff_id.to_path_safe()))
+    }
+
+    /// Check if a layer EROFS image exists.
+    pub fn is_layer_materialized(&self, diff_id: &Digest) -> bool {
+        is_valid_erofs_artifact(&self.layer_erofs_path(diff_id))
+    }
+
+    /// Check if all given layer diff_ids have materialized EROFS images.
+    pub fn all_layers_materialized(&self, diff_ids: &[Digest]) -> bool {
+        diff_ids.iter().all(|d| self.is_layer_materialized(d))
+    }
+
+    // ── fsmeta EROFS paths (keyed by manifest digest) ─────────────────
+
+    /// Root fsmeta EROFS cache directory.
+    pub fn fsmeta_dir(&self) -> &Path {
+        &self.fsmeta_dir
+    }
+
+    /// Path to the fsmeta EROFS image for a given manifest digest.
+    pub fn fsmeta_erofs_path(&self, manifest_digest: &Digest) -> PathBuf {
+        self.fsmeta_dir
+            .join(format!("{}.erofs", manifest_digest.to_path_safe()))
+    }
+
+    /// Path to the materialization lock for a fsmeta EROFS image.
+    pub fn fsmeta_erofs_lock_path(&self, manifest_digest: &Digest) -> PathBuf {
+        self.fsmeta_dir
+            .join(format!("{}.erofs.lock", manifest_digest.to_path_safe()))
+    }
+
+    /// Check if a fsmeta EROFS image exists.
+    pub fn is_fsmeta_materialized(&self, manifest_digest: &Digest) -> bool {
+        is_valid_erofs_artifact(&self.fsmeta_erofs_path(manifest_digest))
+    }
+
+    // ── VMDK descriptor paths (keyed by manifest digest) ────────────
+
+    /// Root VMDK cache directory.
+    pub fn vmdk_dir(&self) -> &Path {
+        &self.vmdk_dir
+    }
+
+    /// Path to the VMDK descriptor for a given manifest digest.
+    pub fn vmdk_path(&self, manifest_digest: &Digest) -> PathBuf {
+        self.vmdk_dir
+            .join(format!("{}.vmdk", manifest_digest.to_path_safe()))
+    }
+
+    /// Legacy VMDK lock path, retained for source compatibility.
+    ///
+    /// Current writers use [`Self::fsmeta_erofs_lock_path`] to serialize descriptors
+    /// with fsmeta materialization. This path does not coordinate those writers.
+    pub fn vmdk_lock_path(&self, manifest_digest: &Digest) -> PathBuf {
+        self.vmdk_dir
+            .join(format!("{}.vmdk.lock", manifest_digest.to_path_safe()))
+    }
+
+    /// Check if a VMDK descriptor exists for a given manifest digest.
+    pub fn is_vmdk_materialized(&self, manifest_digest: &Digest) -> bool {
+        self.vmdk_path(manifest_digest).exists()
+    }
+    /// Verify a pinned descriptor and all its referenced EROFS extents.
+    pub fn is_vmdk_complete(&self, manifest_digest: &Digest) -> bool {
+        let fsmeta = self.fsmeta_erofs_path(manifest_digest);
+        let Ok(fsmeta) = fsmeta.canonicalize() else {
+            return false;
+        };
+        let Ok(layers_dir) = self.layers_dir.canonicalize() else {
+            return false;
+        };
+        let Ok(descriptor) = std::fs::File::open(self.vmdk_path(manifest_digest)) else {
+            return false;
+        };
+        let mut text = String::new();
+        // Cache descriptors contain only extent and geometry lines.
+        const MAX_DESCRIPTOR_BYTES: usize = 16 * 1024 * 1024;
+        if descriptor
+            .take(MAX_DESCRIPTOR_BYTES as u64 + 1)
+            .read_to_string(&mut text)
+            .is_err()
+            || text.len() > MAX_DESCRIPTOR_BYTES
+        {
+            return false;
+        }
+        let mut extents = Vec::new();
+        for line in text.lines().filter(|line| line.starts_with("RW ")) {
+            let Some((_, extent)) = line.split_once(" FLAT \"") else {
+                return false;
+            };
+            let Some((path, offset)) = extent.rsplit_once("\" ") else {
+                return false;
+            };
+            if offset == "0" {
+                let path = Path::new(path);
+                let expected = if extents.is_empty() {
+                    path == fsmeta
+                } else {
+                    path.parent() == Some(layers_dir.as_path())
+                        && path.extension().is_some_and(|ext| ext == "erofs")
+                };
+                if !expected || !is_valid_erofs_artifact(path) {
+                    return false;
+                }
+                extents.push(path);
+            }
+        }
+        if extents.is_empty() {
+            return false;
+        }
+        let mut expected = Vec::new();
+        crate::stitch::vmdk::format_vmdk_descriptor(&mut expected, &extents).is_ok()
+            && text.as_bytes() == expected
+    }
+
+    /// Check the pinned descriptor against the ordered layer IDs in admitted metadata.
+    pub fn is_vmdk_complete_for_layers(
+        &self,
+        manifest_digest: &Digest,
+        diff_ids: &[Digest],
+    ) -> bool {
+        if !self.is_fsmeta_materialized(manifest_digest) || !self.all_layers_materialized(diff_ids)
+        {
+            return false;
+        }
+        let mut paths = vec![self.fsmeta_erofs_path(manifest_digest)];
+        paths.extend(diff_ids.iter().map(|id| self.layer_erofs_path(id)));
+        let extents = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        if crate::stitch::vmdk::format_vmdk_descriptor(&mut expected, &extents).is_err() {
+            return false;
+        }
+        let Ok(file) = std::fs::File::open(self.vmdk_path(manifest_digest)) else {
+            return false;
+        };
+        let mut actual = Vec::with_capacity(expected.len());
+        file.take(expected.len() as u64 + 1)
+            .read_to_end(&mut actual)
+            .is_ok()
+            && actual == expected
+    }
+
+    /// Rewrite the VMDK descriptor for a manifest digest so its extents are
+    /// this cache's fsmeta and layer EROFS files.
+    ///
+    /// Descriptors reference extents by absolute path, so one copied from
+    /// another cache must be regenerated rather than reused.
+    ///
+    /// This blocking variant is retained for external callers. Async callers should use
+    /// [`Self::rewrite_vmdk_async`] to avoid blocking on the materialization lock.
+    pub fn rewrite_vmdk(
+        &self,
+        manifest_digest: &Digest,
+        layer_diff_ids: &[Digest],
+    ) -> ImageResult<()> {
+        self.write_vmdk(
+            manifest_digest,
+            layer_diff_ids,
+            VmdkWriteMode::ReplaceExisting,
+            None,
+        )
+    }
+
+    /// Rewrite a VMDK descriptor without blocking an async worker on its materialization lock.
+    pub async fn rewrite_vmdk_async(
+        &self,
+        manifest_digest: &Digest,
+        layer_diff_ids: &[Digest],
+    ) -> ImageResult<()> {
+        self.write_vmdk_async(
+            manifest_digest,
+            layer_diff_ids,
+            VmdkWriteMode::ReplaceExisting,
+            None,
+        )
+        .await
+    }
+
+    /// Install a descriptor only if missing, preserving any existing file.
+    pub async fn install_vmdk_if_missing_async(
+        &self,
+        manifest_digest: &Digest,
+        layer_diff_ids: &[Digest],
+    ) -> ImageResult<()> {
+        self.write_vmdk_async(
+            manifest_digest,
+            layer_diff_ids,
+            VmdkWriteMode::KeepExisting,
+            None,
+        )
+        .await
+    }
+
+    /// Write a descriptor after asynchronously acquiring its materialization lock.
+    pub(crate) async fn write_vmdk_async(
+        &self,
+        manifest_digest: &Digest,
+        layer_diff_ids: &[Digest],
+        mode: VmdkWriteMode,
+        progress: Option<PullProgressSender>,
+    ) -> ImageResult<()> {
+        let cache = self.clone();
+        let manifest_digest = manifest_digest.clone();
+        let layer_diff_ids = layer_diff_ids.to_vec();
+        let materializer_guard =
+            CacheLockGuard::acquire_async(&self.fsmeta_erofs_lock_path(&manifest_digest)).await?;
+
+        tokio::task::spawn_blocking(move || {
+            let _materializer_guard = materializer_guard;
+            cache.write_vmdk_locked(&manifest_digest, &layer_diff_ids, mode, progress.as_ref())
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Write a descriptor under the image materialization lock.
+    pub(crate) fn write_vmdk(
+        &self,
+        manifest_digest: &Digest,
+        layer_diff_ids: &[Digest],
+        mode: VmdkWriteMode,
+        progress: Option<&PullProgressSender>,
+    ) -> ImageResult<()> {
+        // Serialize with image materialization, which writes the VMDK under this lock.
+        let _materializer_guard =
+            CacheLockGuard::acquire(&self.fsmeta_erofs_lock_path(manifest_digest))?;
+
+        self.write_vmdk_locked(manifest_digest, layer_diff_ids, mode, progress)
+    }
+
+    /// Write a descriptor while the caller holds the image materialization lock.
+    pub(crate) fn write_vmdk_locked(
+        &self,
+        manifest_digest: &Digest,
+        layer_diff_ids: &[Digest],
+        mode: VmdkWriteMode,
+        progress: Option<&PullProgressSender>,
+    ) -> ImageResult<()> {
+        let fsmeta = self.fsmeta_erofs_path(manifest_digest);
+        let layers: Vec<PathBuf> = layer_diff_ids
+            .iter()
+            .map(|diff_id| self.layer_erofs_path(diff_id))
+            .collect();
+        let mut extents: Vec<&Path> = vec![&fsmeta];
+        extents.extend(layers.iter().map(PathBuf::as_path));
+
+        let vmdk = self.vmdk_path(manifest_digest);
+        if mode == VmdkWriteMode::KeepExisting {
+            // A concurrent pull may have regenerated the descriptor while we waited.
+            if vmdk.exists() {
+                return Ok(());
+            }
+            if !is_valid_erofs_artifact(&fsmeta) {
+                return Err(ImageError::Materialize {
+                    digest: manifest_digest.to_string(),
+                    message: "fsmeta vanished while waiting for VMDK regen lock".into(),
+                    source: None,
+                });
+            }
+        }
+
+        let work_dir = self.work_dir(manifest_digest);
+        std::fs::create_dir_all(&work_dir).map_err(|source| ImageError::Cache {
+            path: work_dir.clone(),
+            source,
+        })?;
+        let _work_guard = scopeguard::guard((), |_| {
+            let _ = std::fs::remove_dir_all(&work_dir);
+        });
+        if let Some(progress) = progress {
+            progress.send(PullProgress::StitchWritingVmdk);
+        }
+
+        let temp = work_dir.join("rootfs.vmdk");
+        crate::stitch::write_vmdk_descriptor(&temp, &extents).map_err(|source| match mode {
+            VmdkWriteMode::ReplaceExisting => ImageError::Cache {
+                path: vmdk.clone(),
+                source,
+            },
+            VmdkWriteMode::KeepExisting => ImageError::Materialize {
+                digest: manifest_digest.to_string(),
+                message: format!("VMDK write failed: {source}"),
+                source: None,
+            },
+        })?;
+        std::fs::rename(&temp, &vmdk).map_err(|source| ImageError::Cache { path: vmdk, source })?;
+
+        if let Some(progress) = progress {
+            progress.send(PullProgress::StitchComplete);
+        }
+
+        Ok(())
+    }
+
+    // ── Flat ext4 artifact paths (manifest ref → content blob) ───────
+
+    /// Path to the manifest-keyed flat rootfs reference.
+    pub fn flat_ref_path(&self, manifest_digest: &Digest) -> PathBuf {
+        self.flat_refs_dir
+            .join(format!("{}.json", manifest_digest.to_path_safe()))
+    }
+
+    /// Path to the immutable content-addressed raw ext4 artifact.
+    pub fn flat_blob_path(&self, artifact_digest: &Digest) -> PathBuf {
+        self.flat_blobs_dir
+            .join(format!("{}.raw", artifact_digest.to_path_safe()))
+    }
+
+    /// Path to the per-derivation flat materialization lock.
+    pub fn flat_lock_path(&self, derivation_digest: &Digest) -> PathBuf {
+        self.flat_locks_dir
+            .join(format!("{}.lock", derivation_digest.to_path_safe()))
+    }
+
+    /// Same-filesystem work directory for one flat-rootfs derivation.
+    pub fn flat_work_dir(&self, derivation_digest: &Digest) -> PathBuf {
+        self.tmp_dir
+            .join(format!("{}.flat.work", derivation_digest.to_path_safe()))
+    }
+
+    /// Publish a synchronized candidate as an immutable content-addressed blob.
+    pub fn publish_flat_blob(
+        &self,
+        candidate: &Path,
+        artifact_digest: &Digest,
+        expected_size: u64,
+    ) -> ImageResult<PathBuf> {
+        let destination = self.flat_blob_path(artifact_digest);
+        if let Ok(metadata) = std::fs::metadata(&destination) {
+            if metadata.len() != expected_size {
+                return Err(ImageError::Cache {
+                    path: destination,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "content-addressed flat blob has an unexpected size",
+                    ),
+                });
+            }
+            if flat_blob_matches_digest(&destination, artifact_digest)? {
+                let _ = std::fs::remove_file(candidate);
+                return Ok(destination);
+            }
+
+            // A content-addressed name must never retain different bytes. The
+            // candidate has already been synchronized and validated, while a
+            // missing destination makes every existing ref safely miss after
+            // a crash between removal and rename.
+            std::fs::remove_file(&destination).map_err(|source| ImageError::Cache {
+                path: destination.clone(),
+                source,
+            })?;
+        }
+        std::fs::rename(candidate, &destination).map_err(|source| ImageError::Cache {
+            path: destination.clone(),
+            source,
+        })?;
+        sync_directory(&self.flat_blobs_dir)?;
+        Ok(destination)
+    }
+
+    /// Read and validate the manifest-keyed flat rootfs reference.
+    pub fn read_flat_ref(&self, manifest_digest: &Digest) -> ImageResult<Option<FlatRootfsRef>> {
+        let path = self.flat_ref_path(manifest_digest);
+        let data = match std::fs::read_to_string(&path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(ImageError::Cache { path, source }),
+        };
+        let reference = match serde_json::from_str::<FlatRootfsRef>(&data) {
+            Ok(reference)
+                if reference.schema == 1
+                    && reference.manifest_digest == manifest_digest.to_string() =>
+            {
+                reference
+            }
+            Ok(_) => return Ok(None),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "corrupt flat rootfs ref, ignoring");
+                return Ok(None);
+            }
+        };
+        let artifact_digest = match reference.artifact_digest.parse::<Digest>() {
+            Ok(digest) => digest,
+            Err(_) => return Ok(None),
+        };
+        let blob_path = self.flat_blob_path(&artifact_digest);
+        match std::fs::metadata(&blob_path) {
+            Ok(metadata) if metadata.len() == reference.virtual_size_bytes => Ok(Some(reference)),
+            Ok(_) | Err(_) => Ok(None),
+        }
+    }
+
+    /// Atomically replace a flat rootfs reference after its immutable blob is durable.
+    pub fn write_flat_ref(
+        &self,
+        manifest_digest: &Digest,
+        reference: &FlatRootfsRef,
+    ) -> ImageResult<()> {
+        let path = self.flat_ref_path(manifest_digest);
+        let temp_path = path.with_extension("json.part");
+        let payload = serde_json::to_vec_pretty(reference).map_err(|error| {
+            ImageError::ConfigParse(format!("failed to serialize flat rootfs ref: {error}"))
+        })?;
+        let mut temp = std::fs::File::create(&temp_path).map_err(|source| ImageError::Cache {
+            path: temp_path.clone(),
+            source,
+        })?;
+        use std::io::Write;
+        temp.write_all(&payload)
+            .map_err(|source| ImageError::Cache {
+                path: temp_path.clone(),
+                source,
+            })?;
+        temp.sync_all().map_err(|source| ImageError::Cache {
+            path: temp_path.clone(),
+            source,
+        })?;
+        std::fs::rename(&temp_path, &path).map_err(|source| ImageError::Cache {
+            path: path.clone(),
+            source,
+        })?;
+        sync_directory(&self.flat_refs_dir)?;
+        Ok(())
+    }
+
+    // ── Staging/tmp paths (downloads, work dirs) ─────────────────────
+
+    /// Root staging directory.
+    pub fn tmp_dir(&self) -> &Path {
+        &self.tmp_dir
+    }
+
+    /// Path to the partial download file for a blob.
+    pub fn part_path(&self, blob_digest: &Digest) -> PathBuf {
+        self.tmp_dir
+            .join(format!("{}.part", blob_digest.to_path_safe()))
+    }
+
+    /// Path to the download lock file for a blob.
+    pub fn download_lock_path(&self, blob_digest: &Digest) -> PathBuf {
+        self.tmp_dir
+            .join(format!("{}.download.lock", blob_digest.to_path_safe()))
+    }
+
+    /// Path to the materialization work directory for an EROFS build.
+    pub fn work_dir(&self, key: &Digest) -> PathBuf {
+        self.tmp_dir.join(format!("{}.work", key.to_path_safe()))
+    }
+
+    // ── Manifest metadata cache ──────────────────────────────────────
+
+    /// Root manifest metadata directory.
+    pub fn manifests_dir(&self) -> &Path {
+        &self.manifests_dir
+    }
+
+    /// Path to the pull lock file for an image reference.
+    pub fn image_lock_path(&self, reference: &Reference) -> PathBuf {
+        self.manifests_dir
+            .join(format!("{}.lock", image_cache_key(reference)))
+    }
+
+    /// Read cached metadata for an image reference.
+    pub fn read_image_metadata(
+        &self,
+        reference: &Reference,
+    ) -> ImageResult<Option<CachedImageMetadata>> {
+        Ok(self
+            .read_image_entry(reference)?
+            .map(|entry| entry.metadata))
+    }
+
+    /// Resolve metadata and provenance together under the reference publication gate.
+    pub(crate) fn read_image_entry(
+        &self,
+        reference: &Reference,
+    ) -> ImageResult<Option<CachedImageEntry>> {
+        let path = self.image_metadata_path(reference);
+        let path = path.as_path();
+        let key = StorageLease::key(path)?;
+        let entry = match self.retained_lease(&key)? {
+            Some(lease) => lease,
+            None => StorageLease::shared_keyed(&key)?,
+        };
+        let _gate = StorageLease::shared_keyed(&key.with_extension("publication"))?;
+        let data = match std::fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ImageError::Cache {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let metadata = parse_cached_image_metadata(path, &data)?;
+        if let Some(metadata) = &metadata {
+            let Ok(paths) = self.metadata_paths(&metadata.metadata) else {
+                return Ok(None);
+            };
+            self.retain_lease(key, entry.clone())?;
+            // Safe under the publication gate: artifact deletion only tries exclusive
+            // leases, so no waiting dependency writer can close a lock-order cycle.
+            let _dependencies = self.lease_paths(paths)?;
+        }
+        Ok(metadata)
+    }
+
+    /// Read and admit metadata without blocking the async executor on locks.
+    pub async fn read_image_metadata_async(
+        &self,
+        reference: &Reference,
+    ) -> ImageResult<Option<CachedImageMetadata>> {
+        Ok(self
+            .read_image_entry_async(reference)
+            .await?
+            .map(|entry| entry.metadata))
+    }
+
+    pub(crate) async fn read_image_entry_async(
+        &self,
+        reference: &Reference,
+    ) -> ImageResult<Option<CachedImageEntry>> {
+        self.read_image_metadata_matching_async_inner(self.image_metadata_path(reference), None)
+            .await
+    }
+
+    pub(crate) async fn read_image_metadata_matching_async(
+        &self,
+        path: PathBuf,
+        manifest_digest: String,
+    ) -> ImageResult<Option<CachedImageEntry>> {
+        self.read_image_metadata_matching_async_inner(path, Some(manifest_digest))
+            .await
+    }
+
+    async fn read_image_metadata_matching_async_inner(
+        &self,
+        path: PathBuf,
+        manifest_digest: Option<String>,
+    ) -> ImageResult<Option<CachedImageEntry>> {
+        // Scans release nonmatching entries immediately instead of retaining every candidate
+        // in the operation scope. That keeps descriptor use bounded on large caches.
+        let key_path = path.clone();
+        let key = tokio::task::spawn_blocking(move || StorageLease::key(&key_path))
+            .await
+            .map_err(std::io::Error::other)??;
+        let entry = match self.retained_lease(&key)? {
+            Some(lease) => lease,
+            None => StorageLease::shared_async_keyed(key.clone()).await?,
+        };
+        let _gate = StorageLease::shared_async_keyed(key.with_extension("publication")).await?;
+
+        let read_path = key.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            let data = match std::fs::read_to_string(&read_path) {
+                Ok(data) => data,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(source) => {
+                    return Err(ImageError::Cache { path, source });
+                }
+            };
+
+            parse_cached_image_metadata(&path, &data)
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+
+        if let Some(metadata) = &metadata {
+            if manifest_digest
+                .as_deref()
+                .is_some_and(|digest| digest != metadata.metadata.manifest_digest)
+            {
+                return Ok(None);
+            }
+            let Ok(paths) = self.metadata_paths(&metadata.metadata) else {
+                return Ok(None);
+            };
+            self.retain_lease(key, entry.clone())?;
+            // Artifact deletion only tries exclusive leases; a waiting dependency
+            // writer here could deadlock with publication while this gate is held.
+            let _dependencies = self.lease_paths_async(paths).await?;
+        }
+        Ok(metadata)
+    }
+
+    /// Publish complete metadata under a short exclusive gate. Lifetime pins use a
+    /// different lock, allowing existing readers to finish using an older generation.
+    #[cfg(test)]
+    pub(crate) fn write_image_metadata(
+        &self,
+        reference: &Reference,
+        metadata: &CachedImageMetadata,
+    ) -> ImageResult<()> {
+        let path = self.image_metadata_path(reference);
+        let mut paths = self.metadata_paths(metadata)?;
+        paths.push(path.clone());
+        let _leases = self.lease_paths(paths)?;
+        let _gate = StorageLease::exclusive(&path.with_extension("publication"))?;
+        self.write_image_metadata_file(&path, metadata.clone(), CacheAuthProvenance::Anonymous)
+    }
+
+    /// Publish metadata from an owned worker so cancellation cannot release its gate
+    /// while the filesystem replacement is still in flight.
+    pub async fn write_image_metadata_async(
+        &self,
+        reference: &Reference,
+        metadata: &CachedImageMetadata,
+    ) -> ImageResult<()> {
+        self.write_image_metadata_with_provenance_async(
+            reference,
+            metadata,
+            CacheAuthProvenance::Unknown,
+        )
+        .await
+    }
+
+    /// Publish image metadata with provenance established by a trusted local operation.
+    pub async fn write_image_metadata_with_provenance_async(
+        &self,
+        reference: &Reference,
+        metadata: &CachedImageMetadata,
+        pull_auth: CacheAuthProvenance,
+    ) -> ImageResult<()> {
+        let cache = self.clone();
+        let path = self.image_metadata_path(reference);
+        let metadata = metadata.clone();
+        let mut paths = self.metadata_paths(&metadata)?;
+        paths.push(path.clone());
+        let leases = self.lease_paths_async(paths).await?;
+        let gate = StorageLease::exclusive_async(path.with_extension("publication")).await?;
+        tokio::task::spawn_blocking(move || {
+            let _protection = (leases, gate);
+            cache.write_image_metadata_file(&path, metadata, pull_auth)
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Install archived metadata without replacing an equivalent local entry. Recheck under
+    /// the same publication gate used by image pulls, so a concurrent retag cannot be lost.
+    ///
+    /// Archived metadata cannot establish anonymous upstream registry access, so any
+    /// serialized provenance marker is stripped before writing a new entry.
+    pub async fn install_image_metadata_if_compatible_async(
+        &self,
+        reference: &Reference,
+        archived_bytes: Vec<u8>,
+    ) -> ImageResult<()> {
+        self.prepare_image_metadata_install(reference, archived_bytes)
+            .await?
+            .commit()
+            .await
+    }
+
+    /// Check archived metadata before installing any artifacts and reserve its publication.
+    ///
+    /// Drops provenance asserted by the archive. Equivalent existing metadata is kept intact.
+    pub async fn prepare_image_metadata_install(
+        &self,
+        reference: &Reference,
+        archived_bytes: Vec<u8>,
+    ) -> ImageResult<ImageMetadataInstall> {
+        let (metadata, archived_bytes) = tokio::task::spawn_blocking(move || {
+            crate::snapshot::manifest::reject_duplicate_json_keys(&archived_bytes)
+                .map_err(|error| ImageError::ConfigParse(error.to_string()))?;
+            let metadata: CachedImageMetadata = serde_json::from_slice(&archived_bytes)
+                .map_err(|error| ImageError::ConfigParse(error.to_string()))?;
+            let normalized_bytes = strip_provenance_from_metadata_json(&archived_bytes)?;
+            Ok::<_, ImageError>((metadata, normalized_bytes))
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        let path = self.image_metadata_path(reference);
+        let mut paths = self.metadata_paths(&metadata)?;
+        paths.push(path.clone());
+        let leases = self.lease_paths_async(paths).await?;
+        let gate = StorageLease::exclusive_async(path.with_extension("publication")).await?;
+        let cache = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let new_bytes = if cache.check_image_metadata_target(&path, &archived_bytes)? {
+                None
+            } else {
+                Some(archived_bytes)
+            };
+            Ok(ImageMetadataInstall {
+                cache,
+                path,
+                new_bytes,
+                _leases: leases,
+                _gate: gate,
+            })
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
+    /// Delete cached metadata for an image reference.
+    pub fn delete_image_metadata(&self, reference: &Reference) -> ImageResult<()> {
+        let path = self.image_metadata_path(reference);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ImageError::Cache { path, source: e }),
+        }
+    }
+
+    /// Delete cached metadata for an image reference using async filesystem I/O.
+    pub async fn delete_image_metadata_async(&self, reference: &Reference) -> ImageResult<()> {
+        let path = self.image_metadata_path(reference);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ImageError::Cache { path, source: e }),
+        }
+    }
+
+    /// Path to the cached metadata file for an image reference.
+    pub fn image_metadata_path(&self, reference: &Reference) -> PathBuf {
+        self.manifests_dir
+            .join(format!("{}.json", image_cache_key(reference)))
+    }
+
+    // ── Blob cache paths ──────────────────────────────────────────────
+
+    /// Path to the cached compressed tarball for a layer blob.
+    pub fn tar_path(&self, digest: &Digest) -> PathBuf {
+        self.layers_dir
+            .join(format!("{}.tar.gz", digest.to_path_safe()))
+    }
+
+    /// Write metadata while the caller holds its publication gate and artifact pins.
+    fn write_image_metadata_file(
+        &self,
+        path: &Path,
+        metadata: CachedImageMetadata,
+        pull_auth: CacheAuthProvenance,
+    ) -> ImageResult<()> {
+        let temporary_path = path.with_extension("json.part");
+        let mut temporary = std::fs::File::create(&temporary_path)?;
+        let entry = CachedImageEntry {
+            metadata,
+            pull_auth,
+        };
+        serde_json::to_writer(&mut temporary, &entry)
+            .map_err(|error| ImageError::ConfigParse(error.to_string()))?;
+        temporary.flush()?;
+        temporary.sync_all()?;
+        std::fs::rename(&temporary_path, path)?;
+        sync_directory(&self.manifests_dir)
+    }
+
+    /// Check for a compatible existing entry under publication protection.
+    fn check_image_metadata_target(&self, path: &Path, archived_bytes: &[u8]) -> ImageResult<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(existing) if existing.file_type().is_file() => {
+                let existing_bytes = std::fs::read(path)?;
+                if image_metadata_json_equivalent(archived_bytes, &existing_bytes) {
+                    return Ok(true);
+                }
+                return Err(ImageError::Cache {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "cache target already exists with different content",
+                    ),
+                });
+            }
+            Ok(_) => {
+                return Err(ImageError::Cache {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "cache target is not a regular file",
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ImageError::Cache {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn install_image_metadata_file(&self, path: &Path, archived_bytes: &[u8]) -> ImageResult<()> {
+        // The gate covers the shared .json.part path until the complete file is durable.
+        let temporary_path = path.with_extension("json.part");
+        let mut temporary = std::fs::File::create(&temporary_path)?;
+        temporary.write_all(archived_bytes)?;
+        temporary.sync_all()?;
+        std::fs::rename(temporary_path, path)?;
+        sync_directory(&self.manifests_dir)
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn image_cache_key(reference: &Reference) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(reference.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn strip_provenance_from_value(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("pull_auth");
+        object.remove("authenticated");
+    }
+}
+
+fn strip_provenance_from_metadata_json(bytes: &[u8]) -> ImageResult<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| ImageError::ConfigParse(error.to_string()))?;
+    let had_provenance = value.as_object().is_some_and(|object| {
+        object.contains_key("pull_auth") || object.contains_key("authenticated")
+    });
+    if !had_provenance {
+        return Ok(bytes.to_vec());
+    }
+    strip_provenance_from_value(&mut value);
+    serde_json::to_vec(&value).map_err(|error| ImageError::ConfigParse(error.to_string()))
+}
+
+/// Compare two cached image metadata JSON documents for immutable content equivalence,
+/// ignoring object key order and local auth-provenance markers.
+pub fn image_metadata_json_equivalent(left: &[u8], right: &[u8]) -> bool {
+    if crate::snapshot::manifest::reject_duplicate_json_keys(left).is_err()
+        || crate::snapshot::manifest::reject_duplicate_json_keys(right).is_err()
+    {
+        return false;
+    }
+    match (
+        serde_json::from_slice::<serde_json::Value>(left),
+        serde_json::from_slice::<serde_json::Value>(right),
+    ) {
+        (Ok(mut left), Ok(mut right)) => {
+            strip_provenance_from_value(&mut left);
+            strip_provenance_from_value(&mut right);
+            left == right
+        }
+        _ => false,
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> ImageResult<()> {
+    let directory = std::fs::File::open(path).map_err(|source| ImageError::Cache {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    directory.sync_all().map_err(|source| ImageError::Cache {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> ImageResult<()> {
+    Ok(())
+}
+
+fn parse_cached_image_metadata(path: &Path, data: &str) -> ImageResult<Option<CachedImageEntry>> {
+    match serde_json::from_str::<CachedImageEntry>(data) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "corrupt image metadata cache, ignoring"
+            );
+            Ok(None)
+        }
+    }
+}
+
+pub(crate) fn is_valid_erofs_artifact(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let len = meta.len();
+    if !meta.is_file() || len == 0 || len % EROFS_ALIGNMENT_BYTES != 0 {
+        return false;
+    }
+
+    // Length alone accepts any aligned garbage as a cache hit. Parse the
+    // superblock and root inode so corrupt cached layers are re-materialized
+    // instead of failing later while composing a flat rootfs or booting a VM.
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(mut reader) = ErofsReader::new(file) else {
+        return false;
+    };
+    reader.root_directory_metadata().is_ok()
+}
+
+pub(crate) async fn is_valid_erofs_artifact_async(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || is_valid_erofs_artifact(&path))
+        .await
+        .unwrap_or(false)
+}
+
+fn flat_blob_matches_digest(path: &Path, expected: &Digest) -> ImageResult<bool> {
+    let mut file = std::fs::File::open(path).map_err(|source| ImageError::Cache {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| ImageError::Cache {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())) == expected.to_string())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(byte: char) -> Digest {
+        format!("sha256:{}", byte.to_string().repeat(64))
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn pinned_vmdk_readiness_checks_the_full_extent_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let manifest = digest('a');
+        let layer = digest('b');
+        let tree = crate::tree::FileTree::new();
+        crate::erofs::write_erofs(&tree, &cache.fsmeta_erofs_path(&manifest)).unwrap();
+        crate::erofs::write_erofs(&tree, &cache.layer_erofs_path(&layer)).unwrap();
+        cache
+            .rewrite_vmdk(&manifest, std::slice::from_ref(&layer))
+            .unwrap();
+        assert!(cache.is_vmdk_complete(&manifest));
+        assert!(cache.is_vmdk_complete_for_layers(&manifest, std::slice::from_ref(&layer)));
+
+        std::fs::remove_file(cache.layer_erofs_path(&layer)).unwrap();
+        assert!(cache.is_vmdk_materialized(&manifest));
+        assert!(!cache.is_vmdk_complete(&manifest));
+        assert!(!cache.is_vmdk_complete_for_layers(&manifest, std::slice::from_ref(&layer)));
+    }
+
+    #[tokio::test]
+    async fn archived_metadata_rechecks_after_a_concurrent_retag() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap().operation();
+        let reference: Reference = "example.com/test:latest".parse().unwrap();
+        let archived = CachedImageMetadata {
+            manifest_digest: digest('a').to_string(),
+            config_digest: digest('a').to_string(),
+            raw_manifest_json: "{}".into(),
+            raw_config_json: "{}".into(),
+            config: ImageConfig::default(),
+            layers: Vec::new(),
+        };
+        let archived_bytes = serde_json::to_vec(&archived).unwrap();
+        cache.write_image_metadata(&reference, &archived).unwrap();
+        let path = cache.image_metadata_path(&reference);
+        assert!(image_metadata_json_equivalent(
+            &archived_bytes,
+            &std::fs::read(&path).unwrap()
+        ));
+
+        // Model another image pull changing the mutable tag after archive preflight.
+        let mut retagged = archived.clone();
+        retagged.manifest_digest = digest('b').to_string();
+        cache.write_image_metadata(&reference, &retagged).unwrap();
+        let retagged_bytes = std::fs::read(&path).unwrap();
+
+        let error = cache
+            .install_image_metadata_if_compatible_async(&reference, archived_bytes)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cache target already exists with different content")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), retagged_bytes);
+    }
+
+    #[test]
+    fn async_metadata_read_wait_does_not_occupy_the_blocking_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap().operation();
+        let reference: Reference = "example.com/test:latest".parse().unwrap();
+        let metadata = CachedImageMetadata {
+            manifest_digest: digest('a').to_string(),
+            config_digest: digest('a').to_string(),
+            raw_manifest_json: "{}".into(),
+            raw_config_json: "{}".into(),
+            config: ImageConfig::default(),
+            layers: Vec::new(),
+        };
+        cache.write_image_metadata(&reference, &metadata).unwrap();
+        let publication = cache
+            .image_metadata_path(&reference)
+            .with_extension("publication");
+        let held = crate::storage_lease::StorageLease::exclusive(&publication).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let read_cache = cache.clone();
+            let read_reference = reference.clone();
+            let reader =
+                tokio::spawn(
+                    async move { read_cache.read_image_metadata_async(&read_reference).await },
+                );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            let marker = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::task::spawn_blocking(|| 42),
+            )
+            .await
+            .expect("a metadata waiter must not monopolize the only blocking thread")
+            .unwrap();
+            assert_eq!(marker, 42);
+
+            drop(held);
+            let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+                .await
+                .expect("the metadata read should resume after publication")
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.manifest_digest, metadata.manifest_digest);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_admission_reuses_its_pin_while_an_entry_writer_waits() {
+        for synchronous in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let cache = GlobalCache::new(directory.path()).unwrap();
+            let reference: Reference = "example.com/test:latest".parse().unwrap();
+            let metadata = CachedImageMetadata {
+                manifest_digest: digest('a').to_string(),
+                config_digest: digest('a').to_string(),
+                raw_manifest_json: "{}".into(),
+                raw_config_json: "{}".into(),
+                config: ImageConfig::default(),
+                layers: Vec::new(),
+            };
+            cache.write_image_metadata(&reference, &metadata).unwrap();
+            let path = cache.image_metadata_path(&reference);
+            let publication = StorageLease::exclusive(&path.with_extension("publication")).unwrap();
+            let scope = cache.operation();
+            let read_scope = scope.clone();
+            let read_reference = reference.clone();
+            let reader = tokio::spawn(async move {
+                if synchronous {
+                    tokio::task::spawn_blocking(move || {
+                        read_scope.read_image_metadata(&read_reference)
+                    })
+                    .await
+                    .unwrap()
+                } else {
+                    read_scope.read_image_metadata_async(&read_reference).await
+                }
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while StorageLease::try_exclusive(&path).unwrap().is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "reader did not pin metadata"
+                );
+                tokio::task::yield_now().await;
+            }
+            let writer_path = path.clone();
+            let writer =
+                tokio::spawn(async move { StorageLease::exclusive_async(writer_path).await });
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            drop(publication);
+            let read = tokio::time::timeout(std::time::Duration::from_secs(1), reader)
+                .await
+                .expect("metadata admission must reuse its already-held pin")
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(read.manifest_digest, metadata.manifest_digest);
+            assert!(
+                !writer.is_finished(),
+                "the operation scope must retain the metadata pin"
+            );
+
+            let repeat_scope = scope.clone();
+            let repeated = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+                if synchronous {
+                    tokio::task::spawn_blocking(move || {
+                        repeat_scope.read_image_metadata(&reference)
+                    })
+                    .await
+                    .unwrap()
+                } else {
+                    repeat_scope.read_image_metadata_async(&reference).await
+                }
+            })
+            .await
+            .expect("a repeated read must reuse the scope's retained pin")
+            .unwrap()
+            .unwrap();
+            assert_eq!(repeated.manifest_digest, metadata.manifest_digest);
+
+            drop(scope);
+            let lease = tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+                .await
+                .expect("the writer should proceed after the scope is released")
+                .unwrap()
+                .unwrap();
+            drop(lease);
+        }
+    }
+
+    #[test]
+    fn flat_cache_separates_manifest_refs_from_content_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let manifest = digest('a');
+        let derivation = digest('b');
+        let artifact = digest('c');
+
+        assert!(cache.flat_ref_path(&manifest).ends_with(
+            "flat/refs/sha256_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json"
+        ));
+        assert!(cache.flat_blob_path(&artifact).ends_with(
+            "flat/blobs/sha256_cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.raw"
+        ));
+        assert!(cache.flat_lock_path(&derivation).ends_with(
+            "flat/locks/sha256_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.lock"
+        ));
+
+        let blob_path = cache.flat_blob_path(&artifact);
+        let blob = std::fs::File::create(&blob_path).unwrap();
+        blob.set_len(4096).unwrap();
+        let reference = FlatRootfsRef {
+            schema: 1,
+            manifest_digest: manifest.to_string(),
+            derivation_digest: derivation.to_string(),
+            artifact_digest: artifact.to_string(),
+            materializer_abi: 1,
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 4096,
+            inode_count: 2,
+            content_bytes: 7,
+        };
+        cache.write_flat_ref(&manifest, &reference).unwrap();
+
+        assert_eq!(cache.read_flat_ref(&manifest).unwrap(), Some(reference));
+    }
+
+    #[test]
+    fn aligned_garbage_is_not_a_valid_erofs_cache_artifact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("corrupt.erofs");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(EROFS_ALIGNMENT_BYTES).unwrap();
+
+        assert!(!is_valid_erofs_artifact(&path));
+    }
+
+    #[test]
+    fn flat_ref_must_name_the_manifest_that_indexes_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let indexed_manifest = digest('a');
+        let wrong_manifest = digest('b');
+        let artifact = digest('c');
+        std::fs::write(cache.flat_blob_path(&artifact), [0u8; 8]).unwrap();
+        let reference = FlatRootfsRef {
+            schema: 1,
+            manifest_digest: wrong_manifest.to_string(),
+            derivation_digest: digest('d').to_string(),
+            artifact_digest: artifact.to_string(),
+            materializer_abi: 1,
+            uuid: "00".repeat(16),
+            virtual_size_bytes: 8,
+            inode_count: 2,
+            content_bytes: 0,
+        };
+        cache.write_flat_ref(&indexed_manifest, &reference).unwrap();
+
+        assert_eq!(cache.read_flat_ref(&indexed_manifest).unwrap(), None);
+    }
+
+    #[test]
+    fn publishing_replaces_same_size_blob_with_wrong_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap();
+        let candidate = directory.path().join("candidate.raw");
+        let expected_bytes = b"good";
+        std::fs::write(&candidate, expected_bytes).unwrap();
+        let expected: Digest = format!("sha256:{}", hex::encode(Sha256::digest(expected_bytes)))
+            .parse()
+            .unwrap();
+        let destination = cache.flat_blob_path(&expected);
+        std::fs::write(&destination, b"evil").unwrap();
+
+        cache
+            .publish_flat_blob(&candidate, &expected, expected_bytes.len() as u64)
+            .unwrap();
+
+        assert_eq!(std::fs::read(destination).unwrap(), expected_bytes);
+    }
+
+    #[tokio::test]
+    async fn archived_metadata_equivalence_ignores_provenance_and_strips_archived_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = GlobalCache::new(directory.path()).unwrap().operation();
+        let reference: Reference = "example.com/private:v1".parse().unwrap();
+
+        // 1. Existing authenticated entry matches an archive lacking provenance,
+        //    and keeps its stricter Authenticated provenance on disk.
+        let auth_meta = CachedImageMetadata {
+            manifest_digest: digest('a').to_string(),
+            config_digest: digest('a').to_string(),
+            raw_manifest_json: "{}".into(),
+            raw_config_json: "{}".into(),
+            config: ImageConfig::default(),
+            layers: Vec::new(),
+        };
+        cache
+            .write_image_metadata_with_provenance_async(
+                &reference,
+                &auth_meta,
+                CacheAuthProvenance::Authenticated,
+            )
+            .await
+            .unwrap();
+
+        let archived_claiming_anon = CachedImageEntry {
+            metadata: auth_meta.clone(),
+            pull_auth: CacheAuthProvenance::Anonymous,
+        };
+        let archived_bytes = serde_json::to_vec(&archived_claiming_anon).unwrap();
+
+        cache
+            .install_image_metadata_if_compatible_async(&reference, archived_bytes.clone())
+            .await
+            .unwrap();
+        let preserved = cache.read_image_entry(&reference).unwrap().unwrap();
+        assert_eq!(preserved.pull_auth, CacheAuthProvenance::Authenticated);
+
+        // 2. Installing into a fresh reference strips any archived pull_auth claim
+        //    so an archive cannot establish anonymous upstream registry access.
+        let fresh_ref: Reference = "example.com/imported:v1".parse().unwrap();
+        cache
+            .install_image_metadata_if_compatible_async(&fresh_ref, archived_bytes)
+            .await
+            .unwrap();
+        let installed = cache.read_image_entry(&fresh_ref).unwrap().unwrap();
+        assert_eq!(installed.pull_auth, CacheAuthProvenance::Unknown);
+
+        // 3. Equivalence also ignores Unknown vs Anonymous/Authenticated.
+        let unknown_bytes = serde_json::to_vec(&auth_meta).unwrap();
+        let auth_bytes = std::fs::read(cache.image_metadata_path(&reference)).unwrap();
+        assert!(image_metadata_json_equivalent(&unknown_bytes, &auth_bytes));
+    }
+}

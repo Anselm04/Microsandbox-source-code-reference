@@ -1,0 +1,1060 @@
+---
+title: Sandbox commands
+"og:title": Microsandbox CLI sandbox commands
+sidebarTitle: "Sandbox"
+description: Create, run, connect to, and remove microVM sandboxes with the microsandbox CLI.
+icon: "cube"
+---
+
+Use mutually exclusive `--local` / `--remote` to select a destination for this command. Explicit flags override profile/environment selection while preserving managed backend restrictions; see [selection and credentials](/cloud/connect#explicit-cli-selection).
+
+Use the short form, such as `msb run`. `msb sandbox run` and `msb sbx run` accept the same arguments.
+
+<span id="cli-management" />
+
+Aliases include `ls`, `ps`, `rm`, `cp`, and `mod`. See [SSH](/cli/ssh-commands), [Snapshots](/cli/snapshot-commands), and [CLI management](/cli/management) for other commands.
+
+<span id="msb-sandbox-run" />
+
+## msb run
+
+<Tooltip tip="The core run workflow works on our managed cloud, but replace-on-create, published ports, custom DNS and interfaces, flat OCI roots, full snapshots, and several host-integrated options are unavailable."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Create a sandbox and run its image command. Arguments after `--` replace CMD but preserve ENTRYPOINT. Unnamed sandboxes are removed when the command finishes; named sandboxes persist. Piped input is forwarded to the command; use `--no-stdin` to leave it for the calling script.
+
+<Accordion title="Examples">
+
+<CodeGroup>
+```bash Shell
+# Ephemeral: runs and cleans up
+msb run python -- python -c "print('hello')"
+
+# Named: persists after exit
+msb run --name devbox ubuntu -- bash
+
+# Override the entrypoint executable and pass its arguments after `--`
+msb run --entrypoint /bin/sh alpine -- -c 'echo foo; exec sleep 30'
+
+# With volumes, ports, and environment
+msb run --name api \
+  -v ./src:/app \
+  -v pydata:/data \
+  -p 8000:8000 \
+  -e DEBUG=true \
+  --label user.id=alice \
+  -w /app \
+  python
+
+# Detached: run the resolved command in the background
+msb run -d --name worker python -- python worker.py
+msb logs -f worker
+
+# Boot an idle sandbox for later exec calls
+msb create --name devbox python
+msb exec devbox -- python -c "print('hello')"
+
+# Publish on all IPv4 host interfaces instead of the default 127.0.0.1
+msb run --name public-api -p 0.0.0.0:8000:8000 python
+```
+</CodeGroup>
+
+</Accordion>
+
+`--entrypoint` accepts one executable, not a shell command string. Put each
+argument after the image and `--`; microsandbox preserves those argument
+boundaries. Invoke a shell explicitly, as above, when the command uses shell
+syntax such as `;`, pipes, or redirects.
+
+Common flags:
+
+| Flag | Description |
+|------|-------------|
+| `-n`, `--name` | Sandbox name. If omitted, the sandbox is ephemeral |
+| `-c`, `--cpus` | Virtual CPU limit |
+| `--max-cpus` | Boot-time maximum possible virtual CPUs for future resize capacity |
+| `-m`, `--memory` | Memory limit, such as `512M` or `1G` |
+| `--max-memory` | Boot-time maximum hotpluggable memory, such as `2G` or `8G` |
+| `--nested-virt`, `--nested-virt false` | Enable or disable local nested virtualization. Defaults to off unless configured. See [requirements](/sandboxes/snapshots#nested-vm-snapshots). |
+| `--thp` | Guest transparent huge-page policy: `always`, `madvise` (default), or `never` |
+| `--guest-clock` | `sync` (default) follows host time; `off` stops host clock updates after boot. Local-only. See [guest clock](/sandboxes/snapshots#keep-the-guest-clock) |
+| `--root-disk` | OCI root storage, such as `8G`, `tmpfs:2G`, `flat:8G,clone=auto`, or `./rootfs.qcow2:format=qcow2,fstype=ext4` |
+| `-v`, `--volume` | Mount a host path or named volume, such as `./src:/app:ro` |
+| `--mount-owned` | Private storage removed with this sandbox: `/data` for a directory, or `/var/lib/docker:kind=disk,size=10G` for an ext4 disk. Local-only |
+| `--mount-dir` | Mount a host directory: `SOURCE:DEST[:OPTIONS]`. Supports `quota` and paired `uid`/`gid` |
+| `--mount-file` | Mount a host file: `SOURCE:DEST[:OPTIONS]`. Supports `quota` and paired `uid`/`gid` |
+| `--mount-disk` | Mount a disk image: `SOURCE:DEST[:OPTIONS]` |
+| `--mount-named` | Create or reuse a named volume: `NAME:DEST[:OPTIONS]`. See [kind, size, and quota options](/cli/volume-commands#using-volumes-with-sandboxes) |
+| `-p`, `--port` | Publish a port, such as `8000:8000` for loopback-only or `0.0.0.0:8000:8000` for all host interfaces |
+| `--tcp-accept-queue-size` | Accept-queue depth for published TCP ports, `1` to `2147483647` (default: `1024`). See [Published ports](#published-ports) |
+| `--max-inbound-tcp-connections` | Active inbound TCP limit; `0` means unlimited. See [defaults and compatibility](#published-ports). |
+| `--vsock` | Expose local host IPC at host CID 2 using `HOST_PATH:PORT[/stream\|/dgram]`; Unix sockets and local Windows named pipes are supported, the flag is repeatable, and stream is the default |
+| `-e`, `--env` | Set an environment variable |
+| `--label` | Attach a label for metric attribution (`KEY=VALUE`, or bare `KEY`). Repeatable |
+| `-w`, `--workdir` | Set the working directory |
+| `--entrypoint` | Override the image entrypoint executable. Pass its arguments after the image and `--` |
+| `-d`, `--detach` | Run the resolved image command in the background and print the sandbox name |
+| `--no-tty` | Disable PTY allocation and run non-interactively |
+| `--no-stdin` | Leave host input untouched and give the command EOF; disables automatic terminal mode and conflicts with `--tty` |
+| `--replace` | Replace an existing sandbox with the same name |
+| `--no-net` | Disable network access |
+| `--deployment-profile` | Select `single-tenant` or `multi-tenant` host-runtime isolation; managed backends may override it |
+| `--net` | Add a high-level network profile (`public`, `private`, `host`, `all`, or `none`) |
+| `--net-rule` | Add a network policy rule |
+| `--net-nat64-prefix` | Add a NAT64 `/96` prefix for network policy classification |
+| `--net-strict[=BOOL]` | Enabled by default; use `--net-strict false` to opt out. Require hostname-based network allows to use inspectable request authority. Non-intercepted HTTPS fails closed when only a hostname rule allows it |
+| `--proxy` | Route eligible outbound traffic through an `http://IP:PORT`, `socks4://IP:PORT`, or `socks5://IP:PORT` proxy. Local-only. See [Proxies](#outbound-proxy) |
+| `--socks4-user-id` | Optional SOCKS4 user ID. Requires a `socks4://` proxy |
+| `--socks5-username`, `--socks5-password-env` | SOCKS5 username and the host environment variable containing its password. Both flags are required together |
+| `--http-connect-username`, `--http-connect-password-env` | HTTP CONNECT username and the host environment variable containing its password. Both flags are required together and require an `http://` proxy |
+| `--secret` | Configure `NAME[:OPTIONS]@HOST[,HOST...]`; options control substitution and placeholder passthrough |
+| `--secret-violation-action` | Set `block`, `block-and-log`, or `block-and-terminate` for blocked placeholders |
+| `--tmpfs` | Mount an in-memory filesystem |
+| `--copy`, `--copy-file`, `--copy-dir`, `--mkdir`, `--rm` | Patch the rootfs before boot |
+| `--file`, `--conf` | Load a [Sandboxfile](/cli/configuration). Repeat to layer configuration files in order |
+| `--net-conf`, `--resource-conf`, `--runtime-conf`, `--fs-conf`, `--secret-conf`, `--script-conf` | Load an unwrapped, concern-specific [scoped config](/cli/configuration#scoped-config-files). Repeatable |
+
+Use `msb run --help` for the full flag list.
+
+Pass configuration files explicitly. Files merge left to right; explicit CLI arguments override them. See [Configuration](/cli/configuration).
+
+### Start from a snapshot
+
+Use `--from-snapshot` with one installed group or one or more explicit local archive/artifact paths. `--from-snap` is an alias. An explicit snapshot source conflicts with a positional image. This launch path is local-only.
+
+<CodeGroup>
+```bash Shell
+# Persistent child from the group's current head
+msb create --from-snapshot devbox-history --name worker
+
+# Run a new command from a specific disk checkpoint
+msb run --from-snapshot devbox-history --checkpoint ready -- echo hello
+
+# Resolve an incremental archive together with its dependencies
+msb run --from-snapshot ./base.msb ./tip.msb -- cat /root/result
+
+# Cold-boot a full snapshot's disk and start a new command
+msb run --from-snapshot ./full.msb --disk-only -- echo hello
+```
+</CodeGroup>
+
+Prefix local paths with `./`, `../`, or an absolute path so they cannot be mistaken for group names. Archive filenames do not need a particular extension. Paths form one dependency set: their order does not choose the checkpoint. A unique terminal checkpoint is selected automatically; use `--checkpoint SNAPSHOT_ID` to select an exact supplied checkpoint when there is more than one possible tip. A group accepts a checkpoint name or ID and otherwise uses its head. Missing dependencies and conflicting artifacts fail before launch. Launching from paths does not install a group.
+
+`create` boots a persistent, detached sandbox; a full checkpoint resumes its captured processes. `run` starts a new command and therefore requires `--disk-only` for a full checkpoint. Init, hostname, guest THP, and guest security changes require a disk boot. `--cow-mem` selects private copy-on-write memory for full resume and conflicts with `--disk-only`.
+
+For a disk boot, explicit command environment, user, working directory, entrypoint, hostname, and init options apply to the child. An unnamed run is ephemeral; a named run persists. A snapshot-backed run refuses an existing destination unless `--replace` is specified. The deprecated restore interfaces retain their existing options; they do not accept the new path-set grammar.
+
+For a local disk boot, pass an ordered `patches` list through `--fs-conf` or `--conf`. For example, `msb create --from-snapshot devbox-history --fs-conf edits.yaml --name worker` applies the edits to a private child disk in one helper VM before starting the workload. If an edit fails, the command identifies the failing path and a running `--replace` destination keeps running. A full checkpoint accepts edits with `--disk-only`. The helper requires a runtime with the embedded disk editor.
+
+Supply destination resources explicitly. For snapshot launches, `-v SOURCE:GUEST[:OPTIONS]` maps a destination resource and `-v /guest/path` selects a private copy of a captured additional disk. Explicit mappings at the same guest path replace earlier choices; explicit mount-kind flags are applied after `-v`. A captured-disk selector must identify a disk actually present in the checkpoint. Image-based create/run retains its existing volume grammar.
+
+Use a size-only `--root-disk 20G` to grow a snapshot child's root disk and ext4 filesystem before boot. The captured managed or flat layout is preserved, and source layers remain unchanged. Shrinking, switching layouts or formats, and replacing the captured root with a file or tmpfs are rejected. A full checkpoint requires `--disk-only` for growth. Unsupported ext4 layouts fail during private staging, before `--replace` stops the existing sandbox. The deprecated `--oci-upper-size` spelling has the same size-only behavior.
+
+An ordinary disk snapshot records external mount paths without saving those external disks' bytes; supply their destination backing explicitly. Full checkpoints can carry additional disk payloads for private restoration. Allowing missing resources does not make an absent captured-disk selection valid.
+
+| Flag | Effect on snapshot-backed create/run |
+| --- | --- |
+| `--allow-missing-resources` | Permit unavailable captured external filesystems or additional disks. Full resume reports warnings even with `--quiet`; guest access can fail. Required root and owned snapshot data must remain complete. |
+| `--dangerously-inherit-resources` | Fill unspecified bindings from validated source-local records where available. This is explicit permission to share host resources, not permission to recover credentials or look up a replacement source by name. |
+| `--external-mount-policy strict\|relaxed` | Select object-compatibility validation. Relaxed mode does not authorize inheritance or waive missing backing. |
+| `--forked` | Deprecated alias for `--cow-mem`; emits a warning. |
+
+### Flat OCI rootfs
+
+<Tooltip tip="Flat OCI roots use host-local image artifacts and are not available on our managed cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Use a complete ext4 root instead of the default layered root. Each sandbox gets a private copy of the cached base.
+
+<CodeGroup>
+```bash Shell
+msb pull python --materialize flat
+msb run --root-disk flat:8G,clone=auto python -- python -c "print('hello')"
+```
+</CodeGroup>
+
+Pre-pulling is optional. See [clone strategies](/sandboxes/optimization#clone-strategies) for copy behavior and host requirements.
+
+Flat roots support pre-boot patches and local snapshots. Patches change only the private disk; snapshots preserve its layout. Set `sandbox_defaults.oci.root_disk` to use flat roots by default. See [storage optimization](/sandboxes/optimization).
+
+### Published ports
+
+<Tooltip tip="Published ports bind on the computer running the local backend and are not available on our managed cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Ports bind to `127.0.0.1` by default. Use an explicit address to expose them beyond localhost. Windows may prompt for firewall access.
+
+`--port` (or `-p`) accepts inclusive, equal-length host and guest ranges, paired in ascending order:
+
+<CodeGroup>
+```bash Shell
+msb create node --name media -p 0.0.0.0:10240-11264:10240-11264/udp
+msb create node --name services -p 8000-8002:80-82/tcp
+```
+</CodeGroup>
+
+The second mapping forwards host ports 8000, 8001, and 8002 to guest ports 80, 81, and 82. TCP is the default; `/udp` selects UDP. IPv6 bind addresses require brackets, for example `[::1]:8000-8002:80-82`. Range endpoints must be from 1 to 65535; reversed ranges and unequal lengths are rejected. The same syntax works with run, create, restore, and fork, and in configuration-file `ports` lists.
+
+<Accordion title="Port-range resource use">
+
+Ranges expand into individual mappings. The UDP example opens 1,025 host sockets; large ranges require enough host socket/file-descriptor capacity and consume resources per port. A range does not reserve ports as one atomic block; existing per-port listener startup and error reporting apply.
+
+`--max-inbound-tcp-connections` limits active connections across published TCP ports; `0` means unlimited. Omission uses the runtime default: unlimited in **0.7.9+**, or **256** in older versions. Unsupported overrides fail with an upgrade-required error. This limit is separate from the listener queue. See [connection limits](/networking/overview#deployment-profiles).
+
+</Accordion>
+
+Each published TCP port's host listener queues up to 1,024 connections that the runtime has not yet accepted. Connections that arrive while the queue is full never reach the sandbox. A burst larger than the queue can fail at the proxy. For example, a reverse proxy may open one upstream connection per request for a page that loads many assets at once. Set `--tcp-accept-queue-size` to change the depth for every published TCP port of the sandbox:
+
+<CodeGroup>
+```bash Shell
+msb create node --name web -p 127.0.0.1:3000:3000 --tcp-accept-queue-size 4096
+```
+</CodeGroup>
+
+<Accordion title="Host queue limits and runtime compatibility">
+
+The host kernel caps the queue at its own limit: `net.core.somaxconn` on Linux (4,096 by default) and `kern.ipc.somaxconn` on macOS (128 by default). A larger value is accepted but has no further effect until that limit is raised. The setting requires a runtime that supports it; the SDK refuses to launch an older runtime rather than silently ignoring it.
+
+</Accordion>
+
+### VSock
+
+<Tooltip tip="VSock routes connect to IPC on the computer running the local backend and are unavailable on our managed cloud or multi-tenant deployments."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Use the repeatable `--vsock HOST_PATH:PORT[/stream|/dgram]` flag to expose a host Unix socket or local Windows named pipe on guest host CID `2`. Stream is the default. Datagram routes preserve message boundaries and are unavailable on Windows.
+
+See [Host sockets](/networking/host-sockets) for guest connection details, limits, and SDK examples.
+
+### Network profiles
+
+<Tooltip tip="On our managed cloud, the host profile targets endpoints reachable from the cloud worker, not the machine running the CLI."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+`--net` is repeatable and accepts comma-separated profiles. `public`, `private`, and `host` compose; DNS through the sandbox gateway is enabled automatically and only once. `all` and `none` are terminal policies and cannot be mixed with the three positive profiles.
+
+<CodeGroup>
+```bash Shell
+msb run alpine --net public
+msb run alpine --net "public,private"
+msb run alpine --net public --net private
+msb run alpine --net host --net-rule "deny@host:tcp:22"
+```
+</CodeGroup>
+
+Explicit `--net-rule` entries are evaluated before profile-generated rules, so they can narrow or deny part of a profile. `--net` conflicts with `--no-net` and the `--net-default*` flags because those select a different policy baseline.
+
+NAT64 destinations inside the well-known `64:ff9b::/96` prefix are classified by their embedded IPv4 address, so a public-only policy still blocks translated private, loopback, link-local, and metadata addresses. If your environment uses another routed NAT64 prefix, add it with repeatable `--net-nat64-prefix <ipv6-cidr>` entries. Only IPv6 `/96` prefixes are accepted.
+
+### Outbound proxy
+
+<Tooltip tip="User-configured outbound proxies are not available on our managed cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Use `--proxy` with `msb run` or `msb create` to configure one HTTP CONNECT, SOCKS4, or SOCKS5 proxy:
+
+<CodeGroup>
+```bash Shell
+msb run alpine --proxy http://127.0.0.1:3128
+msb run alpine --proxy http://127.0.0.1:3128 \
+  --http-connect-username sandbox \
+  --http-connect-password-env HTTP_CONNECT_PASSWORD
+msb run alpine --proxy socks4://127.0.0.1:1080
+msb run alpine --proxy socks4://127.0.0.1:1080 \
+  --socks4-user-id sandbox
+
+msb run alpine --proxy socks5://127.0.0.1:1080
+msb run alpine --proxy socks5://127.0.0.1:1080 \
+  --socks5-username sandbox \
+  --socks5-password-env SOCKS5_PASSWORD
+```
+</CodeGroup>
+
+HTTP CONNECT and SOCKS4 support TCP; SOCKS5 also supports non-DNS UDP. HTTP CONNECT and SOCKS5 authentication each require both flags and read the password from the host environment at startup. Pass `--http-connect-username ""` when the proxy authenticates with a token and no username. Proxy URLs cannot contain credentials, paths, queries, or fragments. See [Proxies](/networking/outbound-proxy).
+
+### Network rule syntax
+
+`--net-rule` takes one or more comma-separated rule tokens. The token grammar is:
+
+```text
+<action>[:<direction>]@<target>[:<proto>[:<ports>]]
+```
+
+| Field | Values |
+| ----- | ------ |
+| `action` | `allow`, `deny` |
+| `direction` | `egress` (default), `ingress`, `any` |
+| `target` | See *Targets* below |
+| `proto` | `tcp`, `udp`, `icmpv4`, `icmpv6`, `any` (default) |
+| `ports` | `<port>`, `<lo>-<hi>`, or `any` (default) |
+
+**Targets**
+
+| Form | Example | Notes |
+| ---- | ------- | ----- |
+| IP / CIDR | `198.51.100.5`, `10.0.0.0/8`, `[2001:db8::/32]` | IPv6 must be bracketed |
+| Domain (exact) | `example.com` | Use `domain=public` to disambiguate from the `public` group |
+| DNS | `dns` | Semantic gateway DNS target: UDP/53 + TCP/53. May be qualified with `tcp`, `udp`, or `any` |
+| Domain suffix | `*.example.com`, `suffix=example.com` | Matches the apex and any subdomain at any depth. Suffixes must be at least two labels: `*.com` and `suffix=local` are rejected to prevent accidental blast radius |
+| Group | `public`, `private`, `loopback`, `link-local`, `meta`, `multicast`, `host`, `any` | Pre-defined destination groups (`any` is the catch-all target) |
+
+Quote rule values so the shell does not interpret wildcard characters.
+
+**Common compositions**
+
+<Accordion title="Examples">
+
+<CodeGroup>
+```bash Shell
+# Allowlist: deny by default, allow specific destinations
+msb run alpine --net-default deny --net-rule "allow@github.com,allow@*.githubusercontent.com"
+
+# Blocklist: allow by default, deny specific destinations
+msb run alpine --net-default allow --net-rule "deny@*.tracking.com,deny@*.ads.example"
+
+# Airgapped: equivalent to `--net-default deny`
+msb run alpine --no-net
+
+# Airgapped except one host (allowlist with --no-net sugar)
+msb run alpine --no-net --net-rule "allow@api.internal.corp"
+
+# Public profile with DNS disabled by a higher-priority explicit rule
+msb run alpine --net public --net-rule "deny@dns"
+```
+</CodeGroup>
+
+</Accordion>
+
+<span id="msb-sandbox-create" />
+
+## msb create
+
+<Tooltip tip="The core create workflow works on our managed cloud, but replace-on-create, published ports, custom DNS and interfaces, flat OCI roots, full snapshots, and several host-integrated options are unavailable."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Create and boot a sandbox without running a command. Takes the same flags as `msb run` (except `--detach`).
+
+<CodeGroup>
+```bash Shell
+msb create python --name worker -c 2 -m 1G
+msb create --replace python --name worker            # Replace existing
+msb create --replace-with-timeout 30s python --name worker  # Give the old one 30s to exit
+msb create --replace-with-timeout 0 python --name worker    # SIGKILL immediately
+```
+</CodeGroup>
+
+<span id="msb-sandbox-restore" />
+
+<a id="msb-restore"></a>
+
+## msb snap restore
+
+This deprecated interface restores into a new sandbox using its existing 0.7.x grammar and flags. Use [create/run with `--from-snapshot`](#start-from-a-snapshot) for the canonical local launch workflow. Disk snapshots boot fresh; full snapshots resume execution. Cloud supports the existing disk restore path. Use `msb exec` to run new commands. The existing `msb restore`, `msb sandbox restore`, and `msb sbx restore` forms accept the same legacy flags.
+
+<CodeGroup>
+```bash Shell
+msb snap restore devbox:ready --name worker --cow-mem
+msb exec worker -- echo hello
+msb snap restore ./saved.msb --name disk-copy --disk-only
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `-n`, `--name` | Required destination sandbox name |
+| `--cow-mem` | Restore full snapshots using private CoW memory; off by default |
+| `--forked` | Deprecated alias for `--cow-mem`; emits a warning |
+| `--disk-only` | Restore only the disk from a full snapshot; conflicts with `--cow-mem` and `--forked` |
+| `--snapshot-base` | Exact base snapshot or archive for a dependent export |
+| `--allow-missing-resources` | Resume with missing external filesystems or additional disks unavailable (full restore prints warnings); restore otherwise requires their bindings |
+| `-v`, `--volume` | Bind `SOURCE:GUEST[:OPTIONS]`, or select a private captured disk with `GUEST` alone |
+| `--mount-disk` | Mount a disk image: `SOURCE:DEST[:OPTIONS]`, as in `msb create`; it wins over `-v` at the same guest path. A full restore accepts a disk only at a guest path captured in the snapshot, and the image must hold that disk's contents; use `--disk-only` to attach one at a new path |
+| `-p`, `--port` | Publish `[BIND:]HOST:GUEST[/tcp\|udp]` |
+| `--tcp-accept-queue-size` | Accept-queue depth for the child's published TCP ports (default: `1024`) |
+| `--max-inbound-tcp-connections` | Active inbound TCP limit; `0` means unlimited. See [defaults and compatibility](#published-ports). |
+| `--vsock` | Bind `HOST_PATH:PORT[/stream\|/dgram]` |
+| `--external-mount-policy` | Validate supplied mappings: `strict` (default) or `relaxed` |
+| `--dangerously-inherit-resources` | Inherit unspecified host bindings; may share host resources |
+| `-u`, `--user` | Override the default user for new exec commands |
+| `-c`, `--cpus` | CPU count for disk boot; full restore requires the captured count |
+| `-m`, `--memory` | Memory for disk boot, e.g. `2G`; full restore requires the captured size |
+| `--security` | `default` or `restricted`, applied at disk boot; rejected for full execution restore |
+| `--guest-clock` | `sync` or `off`; inherits the snapshot's setting unless overridden. Supports full restores |
+| `--no-net` | Deny traffic in both directions by default; keeps the captured device and accepts explicit allow rules |
+| `--net-default` | Set both traffic defaults to `allow` or `deny` |
+| `--net-rule` | Repeatable host-policy rule; requires `--net-default` or `--no-net` |
+| `--max-tcp-connections` | Concurrent TCP limit; zero explicitly means unlimited |
+| `--max-udp-connections` | Concurrent UDP session limit; zero explicitly means unlimited |
+| `--max-connections` | Deprecated TCP-only alias; cannot be combined with `--max-tcp-connections` |
+| `--max-duration` | Destination sandbox lifetime bound, e.g. `10m` |
+| `--idle-timeout` | Destination inactivity bound, e.g. `2m` |
+| `-q`, `--quiet` | Hide progress, but not unavailable-resource warnings |
+
+Progress is shown by default. Memory preparation has no fixed timeout and does not consume the activation timeout.
+
+Full restore must keep captured CPU and memory settings and cannot apply a guest security profile. Use `--disk-only` to change them.
+
+Network flags replace the destination policy. `--net-rule` requires `--net-default` or `--no-net`; omitting all policy flags keeps configured defaults. Restore requires a new name and does not accept a startup command.
+
+Supply host resources explicitly when restoring or forking. `-v /host/path:/guest/path` maps a host directory; `-v /guest/path` selects a private captured disk.
+
+`-p HOST:GUEST` publishes a new listener. `--vsock HOST_PATH:PORT` exposes a host service for clients to reconnect to.
+
+Restore requires recorded external filesystems and, for full restores, additional disks. `--allow-missing-resources` permits unavailable resources, but access can fail or make a guest filesystem read-only. Root and owned snapshot storage must still be complete.
+
+<CodeGroup>
+```bash Shell
+msb snap restore saved.msb --name worker -v /srv/project:/work -v /data
+msb snap restore saved.msb --name inspection --allow-missing-resources
+```
+</CodeGroup>
+
+<Accordion title="Missing resources and validation">
+
+Full restores warn about unavailable resources even with `--quiet`; disk restores omit unmapped mounts without warnings. Cached guest memory may remain readable, but device I/O fails and can abort filesystem journals.
+
+`--external-mount-policy relaxed` tolerates supported stale-object mismatches; it does not allow missing backing. `--dangerously-inherit-resources` reuses validated source-local bindings. Direct forks retain their existing unavailable-resource behavior. See [external mounts](/sandboxes/snapshots#external-mounts).
+
+</Accordion>
+
+<span id="msb-sandbox-start" />
+
+## msb start
+
+Resume a stopped sandbox. Name one or more sandboxes, or select them by label.
+
+<CodeGroup>
+```bash Shell
+msb start devbox
+msb start --label app=engine          # Start every sandbox labeled app=engine
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `--label` | Start every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
+| `-q`, `--quiet` | Suppress progress output |
+
+<span id="msb-sandbox-stop" />
+
+## msb stop
+
+<Tooltip tip="Graceful stop works on our managed cloud; explicit force mode is unavailable."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+<CodeGroup>
+```bash Shell
+msb stop devbox                # Wait indefinitely for graceful completion
+msb stop --force devbox        # Force kill immediately
+msb stop -t 30 devbox          # Fail after 30s without killing
+msb stop --label app=engine    # Stop every sandbox labeled app=engine
+```
+</CodeGroup>
+
+Stop waits until shutdown completes, with no default timeout. A timeout fails without killing; a dispatched stop may still finish later. Zero expires before dispatch. Paused or unreachable sandboxes return an error; resume or force-stop them.
+
+`--force` kills immediately and may lose unsynced writes.
+
+| Flag | Description |
+|------|-------------|
+| `--label` | Stop every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
+| `-f`, `--force` | Force terminate immediately. Pending writes may be lost |
+| `-t`, `--timeout` | Total graceful-completion budget in seconds; expiry fails without killing. Omit to wait indefinitely |
+| `-q`, `--quiet` | Suppress progress output |
+
+<span id="msb-sandbox-pause-resume" />
+
+## msb pause / resume {#msb-pause-resume}
+
+Suspend a resident sandbox without creating a snapshot, then resume it. These operations also accept the top-level `msb pause` and `msb resume` forms.
+
+<CodeGroup>
+```bash Shell
+msb pause devbox
+msb resume devbox
+```
+</CodeGroup>
+
+`pause --guest-flush required` flushes captured persistent filesystems before pausing, so a later disk snapshot can reuse that boundary without resuming. The default `auto` and explicit `skip` omit optional writeback; mandatory storage barriers remain. An already-paused VM without the required flush fails rather than resuming implicitly. `resume` has no flush option. See [guest filesystem flush](/sandboxes/snapshots#guest-flushing).
+
+<span id="msb-sandbox-branch" />
+<span id="msb-branch" />
+<span id="msb-sandbox-fork" />
+
+## msb fork
+
+`msb branch` remains a deprecated alias. Use `fork` in new scripts.
+
+<Tooltip tip="Forking is not yet available on cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Create a local child from running or paused execution without saving a snapshot. Memory is shared through copy-on-write; each child’s memory writes stay private.
+
+<CodeGroup>
+```bash Shell
+msb fork devbox -n experiment
+```
+</CodeGroup>
+
+Use `--names` to capture once and start several independent children from the same state:
+
+<CodeGroup>
+```bash Shell
+msb fork devbox --names alice bob charlie
+msb fork devbox --names worker-{1..10} # Bash/Zsh expand the names
+```
+</CodeGroup>
+
+| Flag | Description |
+| --- | --- |
+| `-n`, `--name NAME` | One child name; conflicts with `--names` |
+| `--names NAME...` | Several child names from one capture |
+| `--guest-flush` | Guest writeback policy: `auto` (default), `required`, or `skip`; see [advanced guest flushing](/sandboxes/snapshots#guest-flushing) |
+| `--integrity` | Record disk content hashes |
+| `--mount-disk` | Rebind a captured disk to a host image: `SOURCE:DEST[:OPTIONS]`, as in `msb create`; it wins over `-v` at the same guest path |
+| `-q`, `--quiet` | Suppress progress |
+
+<Accordion title="Fork writeback behavior">
+
+Both fork forms accept the [guest writeback policy](/sandboxes/snapshots#guest-flushing) through `--guest-flush`. Auto and skip preserve dirty memory without flushing root or owned block filesystems; required adds writeback. Host-backed directory synchronization and host disk barriers remain in effect.
+
+</Accordion>
+
+Volume, port, TCP accept queue size, user, vsock, inheritance, and mount-policy flags match [`restore`](#msb-restore).
+
+A fork cannot add a new block device. `--mount-disk` only rebinds a captured disk, such as a named disk volume, at `DEST` to a host image consistent with the captured state. Images are attached directly, so batch forks must not share a writable image. See [fork disk bindings](/sandboxes/snapshots#forking) for details.
+
+Batch forking captures once. Results follow input order; failed children produce a nonzero exit status without removing successful ones.
+
+<span id="msb-sandbox-restart" />
+
+## msb restart
+
+<Tooltip tip="Graceful restart works on our managed cloud; explicit force mode is unavailable."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Stop and start one or more sandboxes. Running, draining, and paused sandboxes are stopped first, then started from their persisted configuration. Stopped, crashed, and created sandboxes skip the stop phase and are started directly.
+
+<CodeGroup>
+```bash Shell
+msb restart devbox
+msb restart api worker
+msb restart --label app=engine
+msb restart --force devbox
+msb restart -t 30 devbox
+```
+</CodeGroup>
+
+`msb restart --force` kills immediately. Otherwise `--timeout` bounds graceful completion; expiry fails without killing or starting a replacement. Unlike standalone Stop, Restart always bounds the stop phase: without `--timeout` it waits up to ten seconds locally and six minutes on cloud.
+
+| Flag | Description |
+|------|-------------|
+| `--label` | Restart every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
+| `-f`, `--force` | Force terminate immediately before starting again. Pending writes may be lost |
+| `-t`, `--timeout` | Total graceful-completion budget in seconds; expiry fails without killing. Defaults to 10 locally, 360 on cloud |
+| `-q`, `--quiet` | Suppress progress output |
+
+<span id="msb-sandbox-wait" />
+
+## msb wait
+
+Wait for an existing sandbox to reach `Stopped` or `Crashed`. Also available as
+`msb sandbox wait` and `msb sbx wait`.
+
+Use `msb run --name worker --detach …` to keep the sandbox available for a later
+`msb wait`; unnamed runs are removed when they finish.
+
+<CodeGroup>
+```bash Shell
+msb wait worker
+msb wait worker --timeout 30s
+msb wait worker --timeout 5m --format json
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `-t`, `--timeout` | Stop waiting after a duration such as `500ms`, `30s`, `5m`, or `1h`. Without this flag, wait indefinitely |
+| `--format json` | Emit the observed terminal state as JSON |
+
+The timeout covers lookup and waiting. It returns an error without stopping the
+sandbox. Missing sandboxes return an error; stopped or crashed sandboxes return
+immediately.
+
+A successful wait means the sandbox stopped or crashed, not that its workload
+succeeded.
+
+<Accordion title="Wait output fields">
+
+Text output shows the sandbox name and status. JSON includes `name`, `status`,
+`terminal`, `exit_code`, `signal`, `observed_at`, and `source`. Exit codes and
+signals are currently unavailable (`null`); `observed_at` records when the
+terminal state was observed.
+
+</Accordion>
+
+<span id="msb-sandbox-ping" />
+
+## msb ping
+
+<Tooltip tip="Not yet available on our managed cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Check whether running sandboxes respond. Add `--touch` to refresh the idle timer on success.
+
+<CodeGroup>
+```bash Shell
+msb ping devbox
+msb ping api worker
+msb ping --label app=engine
+msb ping api --touch
+```
+</CodeGroup>
+
+
+| Flag | Description |
+|------|-------------|
+| `--label` | Ping every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
+| `--touch` | Refresh the sandbox idle timer after a successful ping |
+| `-q`, `--quiet` | Suppress progress output |
+
+<span id="msb-sandbox-touch" />
+
+## msb touch
+
+<Tooltip tip="Not yet available on our managed cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Refresh the idle timer for one or more running sandboxes.
+
+<CodeGroup>
+```bash Shell
+msb touch devbox
+msb touch api worker
+msb touch --label app=engine
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `--label` | Touch every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
+| `-q`, `--quiet` | Suppress progress output |
+
+<span id="msb-sandbox-modify" />
+
+## msb modify
+
+<Tooltip tip="On our managed cloud, modify changes secrets only: a value, allowed hosts and removal can apply live; other secret changes need the next-start policy."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+`msb mod` is a shorter alias for `msb modify`.
+
+Change a running sandbox's configuration. Every change is planned and applied all-or-nothing. CPU and memory resize live within the `max_cpus` / `max_memory` ceilings; other changes that can't apply live need `--restart` or `--next-start`.
+
+<CodeGroup>
+```bash Shell
+msb modify api -c 4                         # Live when 4 <= max_cpus
+msb modify api -e MODE=prod --restart       # Restart to apply now
+msb modify api --max-memory 16G --next-start # Raise the ceiling on next start
+msb modify api --cpus 8 --dry-run           # Show the plan, apply nothing
+```
+</CodeGroup>
+
+Like create/run, modify accepts `-c`/`--cpus`, `-m`/`--memory`, `-e`/`--env`, and `-w`/`--workdir`. Use `--wait` to wait for resize completion and `-t`/`--timeout SECS` to bound that wait (default 60 seconds). The timeout option requires `--wait`.
+
+Before lowering a live memory target, a capable runtime asks the guest how much memory is available. If the guest clearly cannot release enough memory, the request fails before unplugging. The previous target stays in effect. Free memory or request a larger target and retry. A process can still allocate memory after the check, and the guest can run out of memory during an accepted shrink. Older guests without pressure reporting retain their existing shrink behavior.
+
+When both the client and runtime support combined resize requests, a pressure refusal from `msb modify NAME --cpus N --memory SIZE` preserves the previous CPU and memory targets. Older clients and runtimes submit the two targets separately, so the CPU change can succeed before the memory request fails. A device failure after admission can still leave one target applied. Inspect the resize status before issuing another change.
+
+Set `--max-cpus` and `--max-memory` at creation to leave room for live growth. They default to the initial CPU and memory allocation; increasing the ceilings requires a restart.
+
+Resize can take time. The immediate output and JSON `resize_status` report the [`accepted` resize state](/sdk/rust/sandbox#resourceresizestatus) after the runtime accepts a target. The plan's `applied` field means the modification request was applied; it does not confirm usable guest capacity. Equal reported quantities, or current memory above a shrink target, do not prove guest completion.
+
+On runtimes that support guest confirmation, pending resizes are observed in the background even when no caller waits. CPU and memory share one bounded query; paused sandboxes wait for resume, and unsupported guests receive no observation request. A response from before an intervening runtime change cannot confirm completion afterward. When `--restart` actually restarts the sandbox, `--wait` returns after that startup completes; it does not wait for live-resize history in the fresh runtime.
+
+Env and workdir changes on a running sandbox apply to future execs only; running processes keep their current environment. The plan reports this as a warning.
+
+<Accordion title="Secret updates, substitution, and passthrough">
+
+`--secret` reads the same-named host environment variable; inline values are rejected. Options are `query`, `body`, `no-headers`, `headers=[FIELD,...]` (substitute only in those header fields; `headers=*` restores all headers, `*` cannot be combined with named fields, and `headers=` cannot be combined with `no-headers`), and `passthrough=HOST` or `passthrough=[HOST,...]`. Restrict `headers` to the credential header the API reads, since substituting in every header lets a reflecting endpoint return the secret to the guest. Without `query`, `body`, `no-headers`, or `headers=`, modify keeps the secret's current substitution rule. Any of them replaces the whole rule, and unstated locations reset to defaults, so `query` alone re-enables every header. Repeated declarations merge. See [secret updates](/sandboxes/secrets#update-secrets).
+
+</Accordion>
+
+| Flag | Description |
+|------|-------------|
+| `--cpus` | Desired effective vCPU count |
+| `--max-cpus` | Boot-time maximum possible vCPUs (restart-backed) |
+| `--memory` | Desired effective guest memory, such as `512M` or `4G` |
+| `--max-memory` | Boot-time maximum hotpluggable memory (restart-backed) |
+| `--env`, `--env-rm` | Set (`KEY=VALUE`) or remove an environment variable for future execs |
+| `--label`, `--label-rm` | Set (`KEY=VALUE`) or remove a label |
+| `--workdir` | Working directory for future execs |
+| `--secret`, `--secret-rm` | Add or rotate a secret (`NAME[:OPTIONS]@HOST[,HOST...]`), or remove one |
+| `--secret-violation-action` | Set the sandbox-wide blocking action for placeholder violations |
+| `-p`, `--port` | Add or update `[BIND_ADDR:]HOST[-END]:GUEST[-END][/tcp\|udp]`; ranges must have equal lengths and other mappings stay unchanged |
+| `--port-rm` | Remove `[BIND_ADDR:]HOST[/tcp\|udp]`; defaults to loopback TCP |
+| `--dry-run` | Show the plan without applying anything |
+| `--next-start` | Save changes for the next start without mutating a running VM |
+| `--restart` | Restart if needed so restart-required changes become active now |
+| `--format json` | Emit the plan/result as JSON |
+
+See [live changes](/sandboxes/tuning) for resize behavior. Use `msb modify --help` for the full flag list.
+
+### Compaction
+
+Merge sealed layers in the local root and owned disks. Run separately from configuration changes; the sandbox must be running or fully stopped.
+
+<CodeGroup>
+```bash Shell
+msb modify api --compact --dry-run
+msb modify api --compact --layers 3
+```
+</CodeGroup>
+
+| Flag | Description |
+| --- | --- |
+| `--compact` | Merge sealed layers; excludes named/external disks and directories |
+| `--layers N` | Oldest sealed layers to merge, including the base. Minimum two; omit for all |
+| `--disk PATH` | Select one owned disk; `/` selects the root |
+| `--root-disk-only` | Select only the root; conflicts with `--disk` |
+| `--dry-run` | Preview per-disk results without writing |
+
+The writable layer is excluded. Fewer than two sealed layers or no eligible disks means no change. See [compaction recovery](/sandboxes/snapshots#compact-disks) before applying.
+
+<span id="msb-sandbox-exec" />
+
+## msb exec
+
+Execute a command inside a sandbox.
+
+An already-running sandbox stays running. Stopped or crashed sandboxes start temporarily and stop again before the command returns, including after execution errors. Invalid environment, resource-limit, or timeout arguments fail before startup.
+
+<CodeGroup>
+```bash Shell
+msb exec devbox -- python -c "print('hello')"
+msb exec devbox -- ls -la /app
+```
+</CodeGroup>
+
+<span id="managed-exec-jobs" />
+
+Use `--detach` to keep a command running after you disconnect. It requires a running local sandbox and prints a job ID after startup is confirmed. See [background jobs](/sandboxes/commands#managed-jobs) for logs, reattachment, and lifecycle details.
+
+| Flag | Description |
+|------|-------------|
+| `-d`, `--detach` | Run as a background job; requires a running local sandbox and conflicts with `--stream` |
+| `-t`, `--tty` | Allocate a pseudo-terminal (enables colors, line editing) |
+| `--no-tty` | Disable PTY allocation and run non-interactively |
+| `--no-stdin` | Leave host input untouched and give the command EOF; disables automatic terminal mode and conflicts with `--tty` |
+| `--stream` | Forward stdin and flush output incrementally without a PTY; requires piped stdin or `--no-stdin` |
+| `-e`, `--env` | Set an environment variable (`KEY=VALUE`) |
+| `-w`, `--workdir` | Override working directory |
+| `-u`, `--user` | Run the command as the specified guest user |
+| `--timeout` | Kill the command after this duration (e.g. `30s`, `5m`, `1h`) |
+| `--rlimit` | Set a POSIX resource limit (e.g. `nofile=1024`, `nproc=64`) |
+| `-q`, `--quiet` | Suppress progress output |
+
+Resource limits apply inside the guest before switching to `--user`, so non-root commands can use explicitly raised hard limits. The override affects only that command and its descendants; it does not change the guest agent's limits or the host's limits. For example, allow a command to lock up to 64 MiB for registered `io_uring` buffers:
+
+<CodeGroup>
+```bash Shell
+msb exec --user 1000:1000 --rlimit memlock=67108864 devbox -- ./worker
+```
+</CodeGroup>
+
+<Tip>
+  The CLI auto-detects whether stdin is a terminal. When interactive, `msb exec` uses `attach` mode (TTY, line editing). When piped, it forwards input while the command runs and captures output until the command exits. Use `--no-tty` to force captured, non-interactive execution even from a terminal; terminal input is not forwarded in that mode.
+</Tip>
+
+Use `--stream` for an ongoing conversation with a guest process, such as an ACP agent. It returns output as it arrives instead of waiting for command completion. Piped commands can exit or time out while the host input pipe is still open. Commands that read until EOF, such as `cat`, still need their input closed to finish normally.
+
+Use `--no-stdin` to leave input available to the calling script and give the guest immediate EOF:
+
+<CodeGroup>
+```bash Shell
+while IFS= read -r sandbox; do
+  msb exec --no-stdin "$sandbox" -- echo ready
+done < sandboxes.txt
+```
+</CodeGroup>
+
+Combine `--no-stdin` with `--stream` when you want live output without forwarding input. Omit `--no-stdin` for ACP agents, which need input from the IDE.
+
+<span id="msb-sandbox-copy" />
+
+## msb copy
+
+Copy files between the host and a sandbox.
+
+<CodeGroup>
+```bash Shell
+msb copy ./local.txt devbox:/tmp/local.txt
+msb copy devbox:/tmp/out.txt ./out.txt
+msb copy devbox:/tmp/a devbox:/tmp/b
+msb copy devbox:/tmp/a otherbox:/tmp/a
+```
+</CodeGroup>
+
+Supports host-to-sandbox, sandbox-to-host, and copies within or between sandboxes.
+
+Stopped sandboxes start temporarily, as with [`msb exec`](#msb-exec). Alias: `msb cp`.
+
+| Flag | Description |
+|------|-------------|
+| `-q`, `--quiet` | Suppress progress output |
+
+<span id="msb-sandbox-logs" />
+
+## msb logs
+
+<Tooltip tip="On our managed cloud, use msb logs -f for a live stream. Bounded and historical reads remain local-only."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Read output from running or stopped local sandboxes. On cloud, use `--follow` to stream a running sandbox; historical reads and time filters are unavailable.
+
+<Accordion title="Examples">
+
+<CodeGroup>
+```bash Shell
+# Captured user-program output (default sources: stdout + stderr + output)
+msb logs devbox
+
+# Tail and follow
+msb logs devbox --tail 100
+msb logs devbox -f --grep ERROR
+
+# Time-bounded
+msb logs devbox --since 5m
+msb logs devbox --since 2026-04-30T20:00:00Z --until 5m
+
+# JSON Lines passthrough: feed to jq, vector, etc.
+msb logs devbox --json | jq 'select(.s == "stderr")'
+
+# Multi-session view: prefix each line with [id:N] so you can tell sessions apart
+msb logs devbox --show-id
+
+# Color each session's output a distinct color (implies --show-id)
+msb logs devbox --color-sessions
+
+# Include runtime/kernel diagnostics
+msb logs devbox --source system
+msb logs devbox --source all                # everything, chronologically merged
+```
+</CodeGroup>
+
+</Accordion>
+
+| Flag | Description |
+|------|-------------|
+| `--tail` | Show only the last N entries |
+| `--since` | Show entries at or after this time (RFC 3339 or relative `5m`/`2h`/`1d`) |
+| `--until` | Show entries strictly before this time (same formats) |
+| `-f`, `--follow` | Follow new entries until the sandbox stops |
+| `--timestamps` | Prefix each line with the entry timestamp |
+| `--source` | Sources to include: `stdout`, `stderr`, `output`, `system`, `all`. Repeat or comma-separate. Default: `stdout,stderr,output` |
+| `--grep` | Client-side regex filter on the entry body |
+| `--json` | Emit raw JSON Lines without decoding (one entry per line) |
+| `--raw` | Opt into base64 encoding for non-UTF-8 bytes |
+| `--show-id` | Prefix each line with `[id:N]` (the session correlation id) |
+| `--color-sessions` | Color each session's lines a distinct color (implies `--show-id`) |
+| `--color` | ANSI handling: `auto` (default), `always`, `never` |
+| `--no-color` | Alias for `--color=never` |
+
+<Accordion title="Log sources">
+
+The `s` field in JSON output identifies the source:
+
+| Source | Contents |
+| --- | --- |
+| `stdout`, `stderr` | Separate streams from commands run without a terminal |
+| `output` | Combined stdout and stderr from a terminal session |
+| `system` | Lifecycle markers and runtime/kernel diagnostics |
+
+</Accordion>
+
+<Tip>
+  If startup failed, logs include the failure stage and a troubleshooting hint.
+</Tip>
+
+<a id="msb-ls"></a>
+
+<span id="msb-sandbox-list" />
+
+## msb list
+
+List all stored sandboxes.
+
+<CodeGroup>
+```bash Shell
+msb ls                    # All sandboxes (running and stopped)
+msb ls --running          # Running sandboxes only
+msb ls --stopped          # Stopped sandboxes only
+msb ls --label app=engine # Only sandboxes labeled app=engine
+msb ls --format json      # JSON output
+msb ls -q                 # Names only
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `--running` | Show only running sandboxes |
+| `--stopped` | Show only stopped sandboxes |
+| `--label` | Show only sandboxes carrying this label (`KEY=VALUE`). Repeatable; AND-matched |
+| `--format` | Output format (`json`) |
+| `-q`, `--quiet` | Show only sandbox names |
+
+<a id="msb-status--ps"></a>
+
+<span id="msb-sandbox-status" />
+
+## msb status
+
+Show sandbox status with process details.
+
+<CodeGroup>
+```bash Shell
+msb ps                    # Running sandboxes
+msb ps my-app             # Single sandbox
+msb ps -a                 # All sandboxes (including stopped)
+msb ps --format json      # JSON output
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `-a`, `--all` | Show all sandboxes, not just running ones |
+| `--label` | Show only sandboxes carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Not combinable with a sandbox name |
+| `--format` | Output format (`json`) |
+| `-q`, `--quiet` | Show only sandbox names |
+
+`CPUS` and `MEM` show current allocation / maximum resize capacity. For measured usage, use [`msb metrics`](#msb-metrics).
+
+<span id="msb-sandbox-metrics" />
+
+## msb metrics
+
+<Tooltip tip="msb metrics is local-only. On our managed cloud, use the dashboard or REST API."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Show live CPU, memory, disk, network, and optional upper disk metrics for running sandboxes.
+
+<CodeGroup>
+```bash Shell
+msb metrics                 # All running sandboxes (one-shot table)
+msb metrics my-app          # Single sandbox, in any state
+msb metrics --watch         # Refresh the table in place (like docker stats)
+msb metrics --follow        # Stream JSON Lines, one object per sandbox per tick
+msb metrics --all           # Include recently exited sandboxes
+msb metrics --sort cpu      # Sort by CPU instead of name
+msb metrics --format json   # One-shot JSON output
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `-w`, `--watch` | Continuously refresh the table in place. Ctrl+C to quit. Requires a terminal |
+| `-f`, `--follow` | Stream one JSON Lines object per sandbox per interval to stdout |
+| `--interval` | Refresh interval for `--watch`/`--follow` (e.g. `500ms`, `2s`). Default `1s` |
+| `-a`, `--all` | Include `exited` rows: terminal metrics preserved in the registry until the slot is reused |
+| `--sort` | Sort rows by `name` (default), `cpu`, or `mem` |
+| `--format` | Output format (`json`) |
+
+<Accordion title="Metric columns">
+
+| Column | Meaning |
+| --- | --- |
+| `STATE` | `running`: fresh sample; `stalled`: no sample for three sampling intervals; `exited`: final sample |
+| `CPU` | Busy cores / allocated cores, such as `0.80 / 2c` |
+| `MEM` | Guest-used memory / current memory limit |
+| Disk and network rates | Per-second change; exited rows show cumulative totals |
+
+Limits reflect live resizes. One-shot output samples twice to calculate rates. JSON and follow output keep cumulative counters and include `state` and `cpus`.
+
+</Accordion>
+
+<span id="msb-sandbox-inspect" />
+
+## msb inspect
+
+<Tooltip tip="On our managed cloud, text output omits parsed configuration details; use --format json to view the raw cloud specification."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Show detailed configuration and status.
+
+<CodeGroup>
+```bash Shell
+msb inspect devbox
+msb inspect devbox --format json
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `--format` | Output format (`json`) |
+
+<a id="msb-rm"></a>
+
+<span id="msb-sandbox-remove" />
+
+## msb remove
+
+Remove one or more sandboxes and their associated state.
+
+<CodeGroup>
+```bash Shell
+msb rm devbox
+msb rm --force devbox            # Stop and remove in one step
+msb rm worker-1 worker-2         # Remove multiple
+msb rm --force --label app=engine  # Remove every sandbox labeled app=engine
+```
+</CodeGroup>
+
+| Flag | Description |
+|------|-------------|
+| `--label` | Remove every sandbox carrying this label (`KEY=VALUE`). Repeatable; AND-matched. Unioned with any named sandboxes |
+| `-f`, `--force` | Stop the sandbox if running, then remove it |
+| `-q`, `--quiet` | Suppress progress output |
+
+<span id="msb-self" />
+
+## msb install
+
+Install a sandbox as a system command. Creates an executable in `~/.microsandbox/bin/` that launches `msb run` with the specified image and options.
+
+<CodeGroup>
+```bash Shell
+msb install ubuntu                   # Install as 'ubuntu' command
+msb install --name nodebox node      # Custom command name
+msb install --tmp alpine             # Fresh sandbox every invocation
+msb install -c 2 -m 1G python  # With resource limits
+msb install --list                   # List installed commands
+```
+</CodeGroup>
+
+By default, each run reuses the same sandbox, keeping its files and mounts. Add `--tmp` to create a fresh sandbox each time and delete it on exit. Files in mounted host folders are kept.
+
+To mount the folder you run the command from:
+
+<CodeGroup>
+```bash Shell
+msb install --tmp --name project-shell --mount-dir ./:/workspace:rw -w /workspace alpine -- sh
+```
+</CodeGroup>
+
+Run `project-shell` from any folder to open it at `/workspace` inside the sandbox. Keep `./` as written so the path is resolved on each run, rather than passing a full path during installation.
+
+| Flag | Description |
+|------|-------------|
+| `-n`, `--name` | Command name for the alias (defaults to image name) |
+| `-c`, `--cpus` | Number of virtual CPUs to allocate |
+| `-m`, `--memory` | Amount of memory (e.g. `512M`, `1G`) |
+| `-v`, `--volume` | Mount a host path or named volume (`SOURCE:DEST[:OPTIONS]`, e.g. `./src:/app:ro,noexec`) |
+| `--mount-dir` | Mount a host directory: `SOURCE:DEST[:OPTIONS]`. Supports `quota` and paired `uid`/`gid` |
+| `--mount-file` | Mount a host file: `SOURCE:DEST[:OPTIONS]`. Supports `quota` and paired `uid`/`gid` |
+| `--mount-disk` | Mount a disk image: `SOURCE:DEST[:OPTIONS]` |
+| `--mount-named` | Create or reuse a named volume: `NAME:DEST[:OPTIONS]`. See [kind, size, and quota options](/cli/volume-commands#using-volumes-with-sandboxes) |
+| `--security` | In-guest security profile (`default` or `restricted`) |
+| `-w`, `--workdir` | Working directory inside the sandbox |
+| `--shell` | Shell for interactive sessions |
+| `-e`, `--env` | Set an environment variable (`KEY=VALUE`) |
+| `-f`, `--force` | Overwrite an existing alias with the same name |
+| `--no-pull` | Don't pull the image before installing |
+| `--tmp` | Create a fresh sandbox on every invocation and remove it on exit; host-mounted files persist |
+| `-l`, `--list` | List all installed sandbox commands |
+| `--file`, `--conf` | Load a [Sandboxfile](/cli/configuration). Repeat to layer configuration files in order |
+| `--net-conf`<br />`--resource-conf`<br />`--runtime-conf`<br />`--fs-conf`<br />`--secret-conf`<br />`--script-conf` | Load an explicit [scoped config](/cli/configuration#scoped-config-files). Repeatable |
+
+## msb uninstall
+
+Remove an installed sandbox command.
+
+<CodeGroup>
+```bash Shell
+msb uninstall nodebox
+msb uninstall ubuntu alpine   # Remove multiple
+```
+</CodeGroup>

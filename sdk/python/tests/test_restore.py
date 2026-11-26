@@ -1,0 +1,299 @@
+"""Restore is a distinct operation, never a create call with an ignored field."""
+
+from datetime import timedelta
+
+import pytest
+
+from microsandbox import Network, NetworkPolicy, Sandbox, SecurityProfile
+
+
+@pytest.mark.parametrize(
+    "option", [
+        "image", "network", "foreground_command", "replace", "detached", "background_command",
+    ],
+)
+def test_restore_rejects_create_options(option):
+    with pytest.raises(TypeError, match="unexpected restore option"):
+        Sandbox.restore("missing", name="restore-validation", **{option: None})
+
+
+@pytest.mark.parametrize(
+    "option", ["from_snapshot", "forked", "cow_memory", "disk_only", "snapshot_base"],
+)
+def test_create_rejects_restore_options(option):
+    with pytest.raises(TypeError):
+        Sandbox.create("restore-validation", image="alpine", **{option: None})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize("options", [
+    {"forked": True},
+    {"forked": False},
+    {"forked": True, "cow_memory": True},
+])
+async def test_legacy_cow_memory_alias_warns(tmp_path, method, options):
+    with (
+        pytest.warns(DeprecationWarning, match="forked is deprecated; use cow_memory"),
+        pytest.raises(FileNotFoundError),
+    ):
+        result = getattr(Sandbox, method)(
+            tmp_path / "missing", name="restore-alias", **options,
+        )
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+
+
+@pytest.mark.asyncio
+@pytest.mark.filterwarnings("error::DeprecationWarning")
+async def test_restore_missing_artifact_does_not_boot(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        await Sandbox.restore(tmp_path / "missing", name="restore-validation", cow_memory=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+async def test_missing_resource_opt_out_is_restore_only(tmp_path, method):
+    with pytest.raises(FileNotFoundError):
+        result = getattr(Sandbox, method)(
+            tmp_path / "missing", name="restore-opt-out",
+            allow_missing_resources=True, external_mount_policy="strict",
+        )
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+    with pytest.raises(TypeError):
+        Sandbox.create("fresh", image="alpine", allow_missing_resources=True)
+
+
+@pytest.mark.asyncio
+async def test_restore_accepts_explicit_destination_controls(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        await Sandbox.restore(
+            tmp_path / "missing", name="restore-controls", disk_only=True,
+            cpus=2, memory=512, network_policy=NetworkPolicy.none(),
+            max_tcp_connections=0, max_udp_connections=7,
+            disable_network=True, security=SecurityProfile.DEFAULT,
+            max_duration=timedelta(0), idle_timeout=timedelta(minutes=1),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize("limits", [
+    {},
+    {"max_tcp_connections": None, "max_udp_connections": None},
+    {"max_tcp_connections": 0, "max_udp_connections": 7},
+    {"max_tcp_connections": 64, "max_udp_connections": 0},
+    {"max_connections": None, "max_tcp_connections": 0},
+])
+async def test_restore_connection_limits_reach_artifact_validation(tmp_path, method, limits):
+    # A missing artifact proves these options reach restore, never fresh creation.
+    with pytest.raises(FileNotFoundError):
+        result = getattr(Sandbox, method)(tmp_path / "missing", name="restore-limits", **limits)
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+async def test_restore_legacy_tcp_alias_warns_and_accepts_udp(tmp_path, method):
+    with (
+        pytest.warns(DeprecationWarning, match="use max_tcp_connections"),
+        pytest.raises(FileNotFoundError),
+    ):
+        result = getattr(Sandbox, method)(
+            tmp_path / "missing", name="restore-limits", max_connections=0, max_udp_connections=7,
+        )
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+
+
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize("tcp", [0, 64])
+def test_restore_rejects_duplicate_tcp_aliases(method, tcp):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        getattr(Sandbox, method)(
+            "missing", name="restore-limits", max_connections=0, max_tcp_connections=tcp,
+        )
+
+
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize(
+    "option", ["max_connections", "max_tcp_connections", "max_udp_connections"],
+)
+def test_restore_rejects_negative_connection_limits(method, option):
+    with pytest.raises(OverflowError):
+        getattr(Sandbox, method)("missing", name="restore-limits", **{option: -1})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+async def test_restore_accept_queue_size_reaches_artifact_validation(tmp_path, method):
+    # A missing artifact proves the option is accepted and reaches restore.
+    with pytest.raises(FileNotFoundError):
+        result = getattr(Sandbox, method)(
+            tmp_path / "missing", name="restore-queue", ports={8080: 80},
+            tcp_accept_queue_size=4096,
+        )
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+
+
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize(("value", "error"), [
+    (-1, OverflowError), (4_294_967_297, OverflowError), (1.5, TypeError),
+])
+def test_restore_rejects_accept_queue_size_it_cannot_represent(method, value, error):
+    # Never wrapped or truncated into a different size.
+    with pytest.raises(error):
+        getattr(Sandbox, method)("missing", name="restore-queue", tcp_accept_queue_size=value)
+
+
+def test_restore_policy_rejects_broad_network_configuration():
+    with pytest.raises(TypeError):
+        Sandbox.restore("missing", name="restore-controls", network_policy=Network.none())
+
+
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf")])
+@pytest.mark.parametrize("option", ["max_duration", "idle_timeout"])
+def test_restore_duration_rejects_invalid_values(option, value):
+    with pytest.raises(ValueError):
+        Sandbox.restore("missing", name="restore-controls", **{option: value})
+
+
+def test_fork_public_surface_and_outcome_alias():
+    from microsandbox import BranchOutcome, ForkOutcome
+
+    assert BranchOutcome is ForkOutcome
+    for cls in (Sandbox,):
+        for method in ("fork", "fork_many", "branch", "branch_many"):
+            assert callable(getattr(cls, method))
+
+
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+def test_restore_rejects_unknown_guest_clock(method):
+    with pytest.raises(ValueError, match="guest_clock must be sync or off"):
+        getattr(Sandbox, method)("missing", name="clock-invalid", guest_clock="unknown")
+
+
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize("value", [42, {"cmd": "/sbin/init", "args": [42]}])
+def test_restore_init_reuses_create_validation(method, value):
+    with pytest.raises(TypeError):
+        getattr(Sandbox, method)("missing", name="init-validation", init=value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize("init", [
+    "auto", {"cmd": "/sbin/init", "args": ["--flag"], "env": {"KEY": "value"}},
+])
+async def test_restore_boot_controls_reach_source_validation(tmp_path, method, init):
+    with pytest.raises(FileNotFoundError):
+        options = {"name": "boot-controls", "init": init, "hostname": "child", "disk_only": True}
+        if method == "restore":
+            await Sandbox.restore(tmp_path / "missing", **options)
+        else:
+            progress = Sandbox.restore_with_progress(tmp_path / "missing", **options)
+            await progress.result()
+
+
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+@pytest.mark.parametrize("option, value", [
+    ("max_cpus", -1), ("max_cpus", 256), ("max_memory", -1), ("max_memory", 2**32),
+])
+def test_restore_rejects_unrepresentable_resource_ceilings(method, option, value):
+    with pytest.raises(OverflowError):
+        getattr(Sandbox, method)("missing", name="ceiling-validation", **{option: value})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+async def test_restore_ceilings_reach_source_validation(tmp_path, method):
+    with pytest.raises(FileNotFoundError):
+        result = getattr(Sandbox, method)(
+            tmp_path / "missing", name="ceiling-validation", max_cpus=2, max_memory=512,
+        )
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+async def test_restore_destination_options_reach_source_validation(tmp_path, method):
+    with pytest.raises(FileNotFoundError):
+        result = getattr(Sandbox, method)(
+            tmp_path / "missing", name="label-validation",
+            labels={"team": "dev"},
+        )
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["restore", "restore_with_progress"])
+async def test_destination_command_defaults_reach_source_validation(tmp_path, method):
+    with pytest.raises(FileNotFoundError):
+        result = getattr(Sandbox, method)(
+            tmp_path / "missing", name="command-defaults", workdir="/root", shell="/bin/ash",
+            entrypoint=[], cmd=[], env={"KEY": "", "OTHER": "literal"},
+        )
+        if method == "restore":
+            await result
+        else:
+            await result.result()
+
+
+@pytest.mark.parametrize("field", ["workdir", "shell", "entrypoint", "cmd", "env"])
+def test_destination_command_defaults_reject_wrong_types(field):
+    with pytest.raises(TypeError):
+        Sandbox.restore("missing", name="command-defaults", **{field: 42})
+
+
+@pytest.mark.parametrize("method", ["create", "restore"])
+@pytest.mark.parametrize("policy", ["always", "if-missing", "never"])
+def test_pull_policy_uses_existing_enum_contract_before_dispatch(method, policy):
+    from microsandbox import PullPolicy
+
+    # Without an event loop, valid parsing reaches the async boundary but cannot launch.
+    def call(**kwargs):
+        if method == "create":
+            return Sandbox.create("policy-probe", image="alpine", **kwargs)
+        return Sandbox.restore("saved", name="policy-probe", **kwargs)
+    with pytest.raises(RuntimeError) as baseline:
+        call()
+    with pytest.raises(RuntimeError) as selected:
+        call(pull_policy=PullPolicy(policy))
+    assert type(selected.value) is type(baseline.value)
+    with pytest.raises(TypeError, match="expected PullPolicy"):
+        call(pull_policy="invalid")
+
+
+
+@pytest.mark.parametrize("field", ["max_duration", "idle_timeout"])
+@pytest.mark.parametrize("value", [1.5, 1e-20, timedelta(microseconds=1), timedelta.max])
+def test_create_and_restore_reject_fractional_lifetimes(field, value):
+    for method, kwargs in [
+        (Sandbox.create, {"image": "alpine"}),
+        (Sandbox.restore, {"name": "restored"}),
+    ]:
+        with pytest.raises(ValueError, match=f"{field} must be a whole number of seconds"):
+            method("worker", **kwargs, **{field: value})

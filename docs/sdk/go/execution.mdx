@@ -1,0 +1,1211 @@
+---
+title: Execution
+"og:title": Go SDK Execution reference
+description: Run sandbox commands and stream their output with the Go SDK.
+keywords: ["Go SDK", "Go execution", "microsandbox execution"]
+---
+
+Non-zero exit codes are returned in [`ExecOutput`](#execoutput), not as Go errors. See [Commands](/sandboxes/commands) for usage examples.
+
+## Sandbox
+
+The exec entry points live on [`*Sandbox`](/sdk/go/sandbox#sandbox).
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">Exec()</span>
+
+```go
+func (s *Sandbox) Exec(ctx context.Context, cmd string, args []string, opts ...ExecOption) (*ExecOutput, error)
+```
+
+<Accordion title="Example">
+
+```go
+out, err := sb.Exec(ctx, "make", []string{"build"},
+    m.WithExecCwd("/app"),
+    m.WithExecEnv(map[string]string{"DEBUG": "1"}),
+)
+```
+
+</Accordion>
+
+Run a command in the sandbox and return its collected output. Blocks until the command exits. The returned error is non-nil only on transport or runtime failures; a non-zero exit code is reported via [`ExecOutput.ExitCode`](#out-exitcode), not as an error.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the wait. The guest process may continue in the background.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>cmd</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Program to run. Passed literally to the guest agent (the image ENTRYPOINT is not consulted).</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>args</code><span className="msb-type">[]string</span></div>
+    <div className="msb-param-desc">Command arguments. May be <code>nil</code>.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#execoption">...ExecOption</a></div>
+    <div className="msb-param-desc">Per-command cwd, timeout, TTY allocation, user, and env.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#execoutput">*ExecOutput</a></div>
+    <div className="msb-param-desc">Collected stdout, stderr, and exit code.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">Shell()</span>
+
+```go
+func (s *Sandbox) Shell(ctx context.Context, command string, opts ...ExecOption) (*ExecOutput, error)
+```
+
+<Accordion title="Example">
+
+```go
+out, err := sb.Shell(ctx, "echo $HOME && ls /tmp")
+if err != nil {
+    return err
+}
+fmt.Print(out.Stdout())
+```
+
+</Accordion>
+
+Run `<configured-shell> -c command` in the sandbox and collect its output. The shell comes from `WithShell` and defaults to `/bin/sh`. When loading an older native SDK library without configured-shell support, these methods return an unsupported-operation error with upgrade guidance. Blocks until the command exits. A convenience wrapper over [`Exec`](#sb-exec) for shell one-liners.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the wait.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>command</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Shell command line passed to the configured shell with <code>-c</code>.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#execoption">...ExecOption</a></div>
+    <div className="msb-param-desc">Per-command cwd, timeout, TTY allocation, user, and env.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#execoutput">*ExecOutput</a></div>
+    <div className="msb-param-desc">Collected stdout, stderr, and exit code.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">ExecStream()</span>
+
+```go
+func (s *Sandbox) ExecStream(ctx context.Context, cmd string, args []string, opts ...ExecOption) (*ExecHandle, error)
+```
+
+<Accordion title="Example">
+
+```go
+h, err := sb.ExecStream(ctx, "cat", nil, m.WithExecStdinPipe())
+if err != nil {
+    return err
+}
+defer h.Close()
+```
+
+</Accordion>
+
+Start a streaming exec session and return an [`*ExecHandle`](#exechandle). The handle MUST be closed with [`Close`](#h-close) when the stream is no longer needed. Nonblocking: the handle returns immediately and the stream starts in the background.
+
+`ctx` controls only the start handshake; individual [`Recv`](#h-recv) calls take their own `ctx`. Non-zero exit codes are not errors, inspect [`ExecEventExited`](#execeventkind).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Controls the start handshake only.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>cmd</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Program to run.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>args</code><span className="msb-type">[]string</span></div>
+    <div className="msb-param-desc">Command arguments. May be <code>nil</code>.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#execoption">...ExecOption</a></div>
+    <div className="msb-param-desc">Per-command options; add <a className="msb-type" href="#withexecstdinpipe">WithExecStdinPipe()</a> to enable stdin and <a className="msb-type" href="#withexectty">WithExecTTY(true)</a> to allocate a pseudo-terminal.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#exechandle">*ExecHandle</a></div>
+    <div className="msb-param-desc">Live exec session. Close it when done.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">ShellStream()</span>
+
+```go
+func (s *Sandbox) ShellStream(ctx context.Context, command string, opts ...ExecOption) (*ExecHandle, error)
+```
+
+<Accordion title="Example">
+
+```go
+h, err := sb.ShellStream(ctx, "tail -f /var/log/app.log")
+if err != nil {
+    return err
+}
+defer h.Close()
+
+for {
+    ev, err := h.Recv(ctx)
+    if err != nil {
+        return err
+    }
+    switch ev.Kind {
+    case m.ExecEventStdout:
+        os.Stdout.Write(ev.Data)
+    case m.ExecEventDone:
+        return nil
+    }
+}
+```
+
+</Accordion>
+
+Run `<configured-shell> -c command` with streaming output. The shell comes from `WithShell` and defaults to `/bin/sh`. When loading an older native SDK library without configured-shell support, these methods return an unsupported-operation error with upgrade guidance. A convenience wrapper over [`ExecStream`](#sb-execstream). Nonblocking: the handle returns immediately and the stream starts in the background.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Controls the start handshake only.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>command</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Shell command line passed to the configured shell with <code>-c</code>.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#execoption">...ExecOption</a></div>
+    <div className="msb-param-desc">Per-command options.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#exechandle">*ExecHandle</a></div>
+    <div className="msb-param-desc">Live exec session. Close it when done.</div>
+  </div>
+</div>
+
+## ExecHandle
+
+<p className="msb-backref">Returned by <a href="#sb-execstream">sb.ExecStream()</a> · <a href="#sb-shellstream">sb.ShellStream()</a></p>
+
+A handle to a running streaming execution and its events.
+
+A configured streaming timeout is enforced by the SDK even when the caller is not reading output. At expiry, the SDK waits for process startup before sending SIGKILL. Waiting or collecting reports `ErrExecTimeout` after the guest confirms exit; cancelling a pending wait does not cancel the deadline. Raw event readers receive the actual exit event. If termination cannot be delivered, the SDK reports a separate error without claiming the process exited. The SDK connection must remain open for this client-owned deadline to run.
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">ID()</span>
+
+```go
+func (h *ExecHandle) ID() (string, error)
+```
+
+Return the unique identifier for this exec session, assigned by the guest agent. Useful for correlating log entries or referencing the session from external tooling.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Session correlation id.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">TakeStdin()</span>
+
+```go
+func (h *ExecHandle) TakeStdin() *ExecSink
+```
+
+<Accordion title="Example">
+
+```go
+sink := h.TakeStdin()
+sink.Write([]byte("hello\n"))
+sink.Close()
+```
+
+</Accordion>
+
+Return the stdin sink for this exec session. Single-take: returns `nil` if the session was not started with [`WithExecStdinPipe`](#withexecstdinpipe), or if `TakeStdin` was already called on this handle (matching the Node and Python SDKs). The caller is responsible for closing the sink when done writing; closing the sink without closing the exec handle is fine, they own different Rust-side resources.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#execsink">*ExecSink</a></div>
+    <div className="msb-param-desc">Stdin writer, or <code>nil</code> if unavailable.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">Recv()</span>
+
+```go
+func (h *ExecHandle) Recv(ctx context.Context) (*ExecEvent, error)
+```
+
+<Accordion title="Example">
+
+```go
+for {
+    ev, err := h.Recv(ctx)
+    if err != nil {
+        return err
+    }
+    switch ev.Kind {
+    case m.ExecEventStarted:
+        fmt.Printf("started pid=%d\n", ev.PID)
+    case m.ExecEventStdout:
+        os.Stdout.Write(ev.Data)
+    case m.ExecEventStderr:
+        os.Stderr.Write(ev.Data)
+    case m.ExecEventExited:
+        fmt.Printf("exited code=%d\n", ev.ExitCode)
+    case m.ExecEventDone:
+        return nil
+    }
+}
+```
+
+</Accordion>
+
+Block until the next event arrives or the stream ends. Returns an event with `Kind == ExecEventDone` when all events have been consumed. `ctx` controls the wait. Cancellation signals the native call and returns `ctx.Err()` after it releases its borrowed FFI buffers. This is not necessarily immediate and does not establish that the guest process exited.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the wait for the next event.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#execevent">*ExecEvent</a></div>
+    <div className="msb-param-desc">The next streamed event.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">Collect()</span>
+
+```go
+func (h *ExecHandle) Collect(ctx context.Context) (*ExecOutput, error)
+```
+
+<Accordion title="Example">
+
+```go
+out, err := h.Collect(ctx)
+if err != nil {
+    return err
+}
+fmt.Print(out.Stdout())
+```
+
+</Accordion>
+
+Drain the stream, accumulate all output, and return it as an [`*ExecOutput`](#execoutput). Equivalent to calling [`Recv`](#h-recv) in a loop and assembling the result. The handle should be closed after `Collect` returns.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the drain.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#execoutput">*ExecOutput</a></div>
+    <div className="msb-param-desc">Collected stdout, stderr, and exit code.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">Wait()</span>
+
+```go
+func (h *ExecHandle) Wait(ctx context.Context) (int, error)
+```
+
+Block until the process exits and return its exit code, discarding remaining output. Once `Wait`, `Collect`, or `Recv` observes a terminal outcome, subsequent `Wait` calls return the recorded exit code or terminal execution error while the handle remains open. They do not rerun the command or replay output. Cancelling a wait or losing the transport does not establish that the command finished. Close the handle when finished using it.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the wait.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">int</span></div>
+    <div className="msb-param-desc">Process exit code.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">Kill()</span>
+
+```go
+func (h *ExecHandle) Kill(ctx context.Context) error
+```
+
+Send SIGKILL to the running process.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the call.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">Signal()</span>
+
+```go
+func (h *ExecHandle) Signal(ctx context.Context, signal int) error
+```
+
+<Accordion title="Example">
+
+```go
+import "syscall"
+
+if err := h.Signal(ctx, int(syscall.SIGTERM)); err != nil {
+    return err
+}
+```
+
+</Accordion>
+
+Send a Unix signal to the running process. Pass values from `syscall` (e.g. `int(syscall.SIGTERM)`).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the call.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>signal</code><span className="msb-type">int</span></div>
+    <div className="msb-param-desc">Signal number, e.g. <code>int(syscall.SIGTERM)</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">Resize()</span>
+
+```go
+func (h *ExecHandle) Resize(ctx context.Context, rows, cols uint16) error
+```
+
+<Accordion title="Example">
+
+```go
+if err := h.Resize(ctx, 40, 120); err != nil {
+    return err
+}
+```
+
+</Accordion>
+
+Resize the pseudo-terminal for this exec session. Use with a session started with [`WithExecTTY(true)`](#withexectty), typically when relaying a terminal-size change from a remote client.
+
+`Resize` may be called concurrently while another goroutine is blocked in [`Recv`](#h-recv).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the resize call.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>rows</code><span className="msb-type">uint16</span></div>
+    <div className="msb-param-desc">New terminal height in character cells.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>cols</code><span className="msb-type">uint16</span></div>
+    <div className="msb-param-desc">New terminal width in character cells.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">Close()</span>
+
+```go
+func (h *ExecHandle) Close() error
+```
+
+<Accordion title="Example">
+
+```go
+defer h.Close()
+```
+
+</Accordion>
+
+Release the Rust-side exec handle. Does not kill the running process; call [`Signal`](#h-signal) or [`Kill`](#h-kill) first if you need to terminate it. Safe to call after `ExecEventDone` has been received.
+
+## ExecOutput
+
+Collected `Exec` and `ExecDefault` output preserves arbitrary bytes, including invalid UTF-8 and NUL bytes. Use `StdoutBytes()` and `StderrBytes()` for binary data. The native response retains its legacy text fields and adds a base64 field only for a stream containing invalid UTF-8, so ordinary text keeps its existing response size and older readers remain compatible. With an older native library, the SDK falls back to the text fields; recovering invalid UTF-8 requires the updated native library. Collected responses must fit the 1 MiB FFI buffer after JSON and any base64 encoding; use streaming execution and consume events incrementally for larger output.
+
+<p className="msb-backref">Returned by <a href="#sb-exec">sb.Exec()</a> · <a href="#sb-shell">sb.Shell()</a> · <a href="#h-collect">h.Collect()</a></p>
+
+Collected output and exit status. Non-zero exit codes are results, not Go errors.
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">Stdout()</span>
+
+```go
+func (e *ExecOutput) Stdout() string
+```
+
+Captured standard output as a string.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Collected stdout.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">StdoutBytes()</span>
+
+```go
+func (e *ExecOutput) StdoutBytes() []byte
+```
+
+Captured standard output as raw bytes. Use when the output may not be valid UTF-8.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">[]byte</span></div>
+    <div className="msb-param-desc">Raw stdout bytes.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">Stderr()</span>
+
+```go
+func (e *ExecOutput) Stderr() string
+```
+
+Captured standard error as a string.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Collected stderr.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">StderrBytes()</span>
+
+```go
+func (e *ExecOutput) StderrBytes() []byte
+```
+
+Captured standard error as raw bytes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">[]byte</span></div>
+    <div className="msb-param-desc">Raw stderr bytes.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">ExitCode()</span>
+
+```go
+func (e *ExecOutput) ExitCode() int
+```
+
+The process's exit code, or `-1` if the guest did not report one (e.g. the process was killed by a signal).
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">int</span></div>
+    <div className="msb-param-desc">Exit code, or <code>-1</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">out.</span><span className="msb-hn">Success()</span>
+
+```go
+func (e *ExecOutput) Success() bool
+```
+
+Reports whether the command exited with code `0`.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc"><code>true</code> if <code>ExitCode()</code> is <code>0</code>.</div>
+  </div>
+</div>
+
+## ExecSink
+
+<p className="msb-backref">Returned by <a href="#h-takestdin">h.TakeStdin()</a></p>
+
+```go
+type ExecSink = ffi.ExecSink
+```
+
+A write-only pipe to a running process's stdin. Implements `io.WriteCloser`.
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">Write()</span>
+
+```go
+func (sk *ExecSink) Write(p []byte) (int, error)
+```
+
+<Accordion title="Example">
+
+```go
+h, err := sb.ExecStream(ctx, "cat", nil, m.WithExecStdinPipe())
+if err != nil {
+    return err
+}
+defer h.Close()
+
+sink := h.TakeStdin()
+sink.Write([]byte("hello\n"))
+sink.Close()
+
+out, _ := h.Collect(ctx)
+fmt.Print(out.Stdout()) // "hello\n"
+```
+
+</Accordion>
+
+Send data to the process stdin. Implements `io.Writer`. The write completes once the guest accepts the data, so it waits while the command is slow to read; for a command that also produces output, read output concurrently to avoid blocking each other. Uses `context.Background()` internally, there is no way to cancel a stuck write through this method alone. An empty write does nothing. Call [`Close`](#sink-close) when done writing; in pipe mode it sends EOF.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>p</code><span className="msb-type">[]byte</span></div>
+    <div className="msb-param-desc">Bytes to write to stdin.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">int</span></div>
+    <div className="msb-param-desc">Number of bytes written.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">WriteCtx()</span>
+
+```go
+func (sk *ExecSink) WriteCtx(ctx context.Context, p []byte) (int, error)
+```
+
+Like [`Write`](#sink-write), but with a caller-controlled context, so a stuck stdin write can be cancelled.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>ctx</code><span className="msb-type">context.Context</span></div>
+    <div className="msb-param-desc">Cancels the write.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>p</code><span className="msb-type">[]byte</span></div>
+    <div className="msb-param-desc">Bytes to write to stdin.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">int</span></div>
+    <div className="msb-param-desc">Number of bytes written.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">Close()</span>
+
+```go
+func (sk *ExecSink) Close() error
+```
+
+<Accordion title="Example">
+
+```go
+sink.Close()
+```
+
+</Accordion>
+
+Close the stdin sink. In non-TTY pipe mode this sends EOF to the process. In TTY mode it prevents further writes through this sink, but the guest PTY remains open; send the terminal's EOF control character (usually `\x04` in canonical mode) when the interactive program needs one. Implements `io.Closer`.
+
+## Options
+
+#### <span className="msb-hn">WithExecCwd()</span>
+
+```go
+func WithExecCwd(path string) ExecOption
+```
+
+Set the working directory for a single command.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+</div>
+
+#### <span className="msb-hn">WithExecTimeout()</span>
+
+```go
+func WithExecTimeout(d time.Duration) ExecOption
+```
+
+<Accordion title="Example">
+
+```go
+out, err := sb.Shell(ctx, "long-running-task",
+    m.WithExecTimeout(30*time.Second))
+if m.IsKind(err, m.ErrExecTimeout) {
+    log.Println("timed out")
+}
+```
+
+</Accordion>
+
+Set a per-command timeout. When exceeded, the guest terminates the process and the call returns an error with `Kind == ErrExecTimeout`. Sub-second precision rounds up to whole seconds; pass at least 1 second.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>d</code><span className="msb-type">time.Duration</span></div>
+    <div className="msb-param-desc">Timeout duration, rounded up to whole seconds.</div>
+  </div>
+</div>
+
+#### <span className="msb-hn">WithExecStdinPipe()</span>
+
+```go
+func WithExecStdinPipe() ExecOption
+```
+
+Collected `Exec`, `ExecDefault` and `Shell` reject this option with `ErrInvalidConfig`. Use a streaming method to obtain the stdin sink.
+
+Enable a stdin pipe for the exec session, allowing data to be written via [`ExecHandle.TakeStdin`](#h-takestdin).
+
+#### <span className="msb-hn">WithExecTTY()</span>
+
+```go
+func WithExecTTY(enabled bool) ExecOption
+```
+
+<Accordion title="Example">
+
+```go
+h, err := sb.ExecStream(ctx, "/bin/bash", nil,
+    m.WithExecStdinPipe(),
+    m.WithExecTTY(true),
+)
+if err != nil {
+    return err
+}
+defer h.Close()
+
+stdin := h.TakeStdin()
+if stdin == nil {
+    return errors.New("stdin pipe is unavailable")
+}
+
+if err := h.Resize(ctx, 40, 120); err != nil {
+    return err
+}
+if _, err := stdin.Write([]byte("echo hello\n")); err != nil {
+    return err
+}
+```
+
+</Accordion>
+
+Control whether the command runs inside a pseudo-terminal. Enable it for interactive programs such as shells, editors, REPLs, and `top`. Default: `false`.
+
+When enabled, the guest process runs with its stdin, stdout, and stderr connected to the PTY. Streaming sessions expose the combined terminal output through [`ExecEventStdout`](#execeventkind); they do not emit a separately attributable stderr stream. Collected output similarly places the combined stream in [`Stdout`](#out-stdout) and leaves [`Stderr`](#out-stderr) empty. Add [`WithExecStdinPipe()`](#withexecstdinpipe) to write to the terminal programmatically, and use [`Resize`](#h-resize) to update its dimensions after the session starts.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>enabled</code><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc"><code>true</code> to allocate a pseudo-terminal.</div>
+  </div>
+</div>
+
+#### <span className="msb-hn">WithExecUser()</span>
+
+```go
+func WithExecUser(user string) ExecOption
+```
+
+Run the command as the given guest user (UID or name).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>user</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Guest user, as a UID or name.</div>
+  </div>
+</div>
+
+#### <span className="msb-hn">WithExecEnv()</span>
+
+```go
+func WithExecEnv(env map[string]string) ExecOption
+```
+
+<Accordion title="Example">
+
+```go
+out, err := sb.Exec(ctx, "make", []string{"build"},
+    m.WithExecCwd("/app"),
+    m.WithExecEnv(map[string]string{"DEBUG": "1"}),
+)
+```
+
+</Accordion>
+
+Add per-command environment variables. Called repeatedly, maps merge; later keys overwrite earlier ones.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>env</code><span className="msb-type">map[string]string</span></div>
+    <div className="msb-param-desc">Environment variables for this command.</div>
+  </div>
+</div>
+
+## Types
+
+### ExecEvent
+
+<p className="msb-backref">Returned by <a href="#h-recv">h.Recv()</a></p>
+
+One event from a streaming exec session. [`Kind`](#execeventkind) identifies which fields are populated.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Kind` | [`ExecEventKind`](#execeventkind) | Identifies which fields are populated |
+| `PID` | `uint32` | Guest process id, set on `ExecEventStarted` |
+| `Data` | `[]byte` | Chunk of stdout or stderr, set on `ExecEventStdout` / `ExecEventStderr` |
+| `ExitCode` | `int` | Process exit code, set on `ExecEventExited` |
+| `Failure` | [`*ExecFailure`](#execfailure) | Failure detail, set on `ExecEventFailed` and `ExecEventStdinError` |
+
+### ExecEventKind
+
+<p className="msb-backref">Field of <a href="#execevent">ExecEvent</a></p>
+
+```go
+type ExecEventKind = ffi.ExecEventKind
+```
+
+Identifies what an [`ExecEvent`](#execevent) carries.
+
+| Constant | Description |
+|----------|-------------|
+| `ExecEventStarted` | Sent once when the guest process starts; `PID` is valid |
+| `ExecEventStdout` | A chunk of stdout; in TTY mode, carries the combined terminal output stream. `Data` is valid |
+| `ExecEventStderr` | A chunk of stderr; not emitted separately in TTY mode. `Data` is valid |
+| `ExecEventExited` | The process exited; `ExitCode` is valid |
+| `ExecEventFailed` | The user program never started (binary missing, permission denied, ...); `Failure` is valid and `ExitCode` is not meaningful |
+| `ExecEventStdinError` | A stdin write failed; `Failure` is valid. Non-terminal: the process may still exit normally |
+| `ExecEventDone` | All events have been consumed |
+
+### ExecFailure
+
+<p className="msb-backref">Field of <a href="#execevent">ExecEvent</a></p>
+
+```go
+type ExecFailure = ffi.ExecFailure
+```
+
+Structured detail about a failed-to-start exec, populated on `ExecEventFailed` and `ExecEventStdinError`. Failure kinds use the snake-case forms of the [failure-kind definitions](/sdk/rust/execution#execfailurekind). See [Error handling](/sdk/errors#spawn-time-exec-failures) for branching examples.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Kind` | `string` | Failure category, e.g. `not_found`, `permission_denied` |
+| `Errno` | `*int` | Underlying errno, if known |
+| `ErrnoName` | `string` | Symbolic errno name, if known |
+| `Message` | `string` | Human-readable failure message |
+| `Path` | `string` | Offending path, if applicable |
+
+### ExecConfig
+
+<p className="msb-backref">Populated by <a href="#execoption">ExecOption</a></p>
+
+Configures a single [`Exec`](#sb-exec) or [`ExecStream`](#sb-execstream) call. Most callers set fields through the `WithExec*` functional options; `ExecConfig` is exported for parity with the other SDKs' config types.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Cwd` | `string` | Working directory inside the guest |
+| `Timeout` | `time.Duration` | Kill the process after this duration; sub-second precision is rounded up |
+| `StdinPipe` | `bool` | Enable a stdin pipe; required for [`TakeStdin`](#h-takestdin) |
+| `TTY` | `bool` | Allocate a pseudo-terminal; default `false` |
+| `User` | `string` | Guest user (UID or name) |
+| `Env` | `map[string]string` | Per-command environment variables |
+
+### ExecOption
+
+<p className="msb-backref">Accepted by <a href="#sb-exec">sb.Exec()</a> · <a href="#sb-shell">sb.Shell()</a> · <a href="#sb-execstream">sb.ExecStream()</a> · <a href="#sb-shellstream">sb.ShellStream()</a></p>
+
+```go
+type ExecOption func(*ExecConfig)
+```
+
+A functional option that mutates an [`ExecConfig`](#execconfig). Construct them with the `WithExec*` functions below.
+
+## Managed jobs
+
+Run and reconnect to background commands. See [Background jobs](/sandboxes/commands#background-jobs) for lifecycle, retention, and runtime limits.
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">ExecDetached()</span>
+
+```go
+func (s *Sandbox) ExecDetached(ctx context.Context, cmd string, args []string, opts ...JobExecOption) (*Job, error)
+```
+
+Start a job after confirming guest startup. Accepts existing `ExecOption` values and the job options below. Stdin defaults to a retained pipe.
+
+<Accordion title="Example">
+
+```go
+job, err := sb.ExecDetached(ctx, "cat", nil, msb.WithExecCwd("/tmp"))
+if err != nil { return err }
+defer job.Close()
+io, err := job.Attach(ctx)
+if err != nil { return err }
+defer io.Close()
+if err := io.WriteStdin(ctx, []byte("hello\n")); err != nil { return err }
+if err := io.Detach(ctx); err != nil { return err }
+if err := job.EOF(ctx); err != nil { return err }
+result, err := job.Wait(ctx)
+```
+
+</Accordion>
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">GetJob()</span>
+
+```go
+func (s *Sandbox) GetJob(ctx context.Context, id string) (*Job, error)
+```
+
+Retrieve a retained job by ID.
+
+#### <span className="msb-recv">sb.</span><span className="msb-hn">ListJobs()</span>
+
+```go
+func (s *Sandbox) ListJobs(ctx context.Context, opts ...JobListOption) (*JobPage, error)
+```
+
+List active jobs, or include retained history with the all option. Returns items and a next-page cursor. Default page size: 50; range: 1–100.
+
+### Job
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">ID()</span>
+
+```go
+func (j *Job) ID() string
+```
+
+The job ID within its sandbox.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">Inspect()</span>
+
+```go
+func (j *Job) Inspect(ctx context.Context) (*JobInfo, error)
+```
+
+Read current metadata without starting a stopped sandbox.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">Wait()</span>
+
+```go
+func (j *Job) Wait(ctx context.Context) (*JobExit, error)
+```
+
+Wait for a confirmed exit without consuming output. The result contains the exit code, success flag, and timeout flag. Cancelling a context cancels the operation without stopping the job.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">Signal()</span>
+
+```go
+func (j *Job) Signal(ctx context.Context, signal int) error
+```
+
+Send a Linux signal to the process group.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">Kill()</span>
+
+```go
+func (j *Job) Kill(ctx context.Context) error
+```
+
+Request SIGKILL. Wait separately to confirm exit.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">EOF()</span>
+
+```go
+func (j *Job) EOF(ctx context.Context) error
+```
+
+Permanently close pipe input after accepted bytes. PTYs reject this operation; use terminal control characters instead.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">Logs()</span>
+
+```go
+func (j *Job) Logs(ctx context.Context, options JobLogOptions) ([]JobLogEntry, error)
+```
+
+Read retained output. Entries contain original bytes, a source, a Unix-millisecond timestamp, and an opaque cursor belonging to this job.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">LogStream()</span>
+
+```go
+func (j *Job) LogStream(ctx context.Context, options JobLogOptions) (*JobLogStream, error)
+```
+
+Read retained output and optionally follow new records. Close the stream when finished.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">FollowLogs()</span>
+
+```go
+func (j *Job) FollowLogs(ctx context.Context, options JobLogOptions) (*JobLogStream, error)
+```
+
+Stream logs with following enabled.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">Attach()</span>
+
+```go
+func (j *Job) Attach(ctx context.Context, opts ...JobAttachOption) (*JobAttachment, error)
+```
+
+Attach to live I/O. Only one attachment may own input; read-only observers may coexist. Recent-byte replay and cursor replay are alternatives.
+
+#### <span className="msb-recv">job.</span><span className="msb-hn">Close()</span>
+
+```go
+func (j *Job) Close() error
+```
+
+Release the native job handle when finished. This does not stop the job.
+
+### JobAttachment
+
+#### <span className="msb-recv">attachment.</span><span className="msb-hn">Recv()</span>
+
+```go
+func (a *JobAttachment) Recv(ctx context.Context) (*JobEvent, error)
+```
+
+Read an output, history-gap, or completion event. Returns `io.EOF` at the end.
+
+#### <span className="msb-recv">attachment.</span><span className="msb-hn">WriteStdin()</span>
+
+```go
+func (a *JobAttachment) WriteStdin(ctx context.Context, data []byte) error
+```
+
+Write up to 16 KiB through the input-owning attachment.
+
+#### <span className="msb-recv">attachment.</span><span className="msb-hn">Resize()</span>
+
+```go
+func (a *JobAttachment) Resize(ctx context.Context, rows, cols uint16) error
+```
+
+Resize the job terminal.
+
+#### <span className="msb-recv">attachment.</span><span className="msb-hn">Detach()</span>
+
+```go
+func (a *JobAttachment) Detach(ctx context.Context) error
+```
+
+Detach without stopping the job or closing its input.
+
+#### <span className="msb-recv">attachment.</span><span className="msb-hn">Close()</span>
+
+```go
+func (a *JobAttachment) Close() error
+```
+
+Release the native attachment handle when finished.
+
+### JobLogStream
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">Next()</span>
+
+```go
+func (s *JobLogStream) Next(ctx context.Context) (*JobLogEntry, error)
+```
+
+Read the next entry; returns `io.EOF` at the end.
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">Close()</span>
+
+```go
+func (s *JobLogStream) Close() error
+```
+
+Release the native log-stream handle when finished.
+
+### Job options
+
+#### <span className="msb-hn">WithJobInput()</span>
+
+```go
+func WithJobInput(data []byte) JobExecOption
+```
+
+Send at most 64 KiB of input, then EOF. Use attachment writes for larger input.
+
+#### <span className="msb-hn">WithJobRlimits()</span>
+
+```go
+func WithJobRlimits(limits ...JobRlimit) JobExecOption
+```
+
+Set Linux resource limits. `JobRlimit` contains `Resource string`, `Soft uint64`, and `Hard uint64`.
+
+#### <span className="msb-hn">WithExecStdinNull()</span>
+
+```go
+func WithExecStdinNull() ExecOption
+```
+
+Close detached pipe input after startup.
+
+#### <span className="msb-hn">WithAllJobs()</span>
+
+```go
+func WithAllJobs() JobListOption
+```
+
+Include retained terminal jobs.
+
+#### <span className="msb-hn">WithJobLimit()</span>
+
+```go
+func WithJobLimit(limit uint) JobListOption
+```
+
+Set the page size, from 1 to 100. Default: 50.
+
+#### <span className="msb-hn">WithJobCursor()</span>
+
+```go
+func WithJobCursor(cursor string) JobListOption
+```
+
+Continue from the previous page’s `NextCursor`.
+
+#### <span className="msb-hn">WithJobReadOnly()</span>
+
+```go
+func WithJobReadOnly() JobAttachOption
+```
+
+Observe without owning input.
+
+#### <span className="msb-hn">WithJobReplayRecent()</span>
+
+```go
+func WithJobReplayRecent(bytes uint) JobAttachOption
+```
+
+Replay recent output, up to 1 MiB.
+
+#### <span className="msb-hn">WithJobReplayAfter()</span>
+
+```go
+func WithJobReplayAfter(cursor string) JobAttachOption
+```
+
+Resume after an output cursor from this job.
+
+### JobLogOptions
+
+```go
+type JobLogOptions struct {
+    Tail       *uint
+    Since      *int64
+    Until      *int64
+    Sources    []JobOutputSource
+    FromCursor string
+    Follow     bool
+}
+```
+
+`Tail` selects the last N filtered records. `Since` is inclusive and `Until` exclusive, both in Unix milliseconds. Use `JobOutputStdout`, `JobOutputStderr`, `JobOutputPTY` or `JobOutputStdinError` to filter by source. Empty `Sources` selects program output. `FromCursor` resumes after a job cursor and cannot be combined with `Since`. `Follow` continues after retained output.

@@ -1,0 +1,146 @@
+---
+title: Metrics
+description: Monitor sandbox resource usage
+icon: "chart-line"
+---
+
+<Tooltip tip="SDK metrics methods and msb metrics are local-only. On our managed cloud, use the dashboard or REST API."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Query resource usage for a running sandbox: CPU, memory, and more. Get a single point-in-time snapshot, or open a streaming subscription that delivers updates at a fixed interval.
+
+While a sandbox is paused, the runtime skips host page-residency scans and reports `memory_host_resident_bytes` as unavailable. Host residency can change even when guest execution is stopped, so the runtime does not reuse the previous value. Other metrics continue to be sampled; residency sampling returns on the next sample after resume.
+
+OCI sandboxes also expose optional upper filesystem fields for capacity dashboards. Guest-visible `upper_used_bytes` and `upper_free_bytes` are available when the protected bundled-kernel reporter is fresh. Host-observed `upper_host_allocated_bytes` is available when microsandbox can inspect the writable upper image from the host. SDKs surface those as nullable fields because custom kernels and non-OCI roots may not provide them.
+
+<Note>
+Need continuous shipping to Grafana, Datadog, Prometheus, or any other OTel-compatible backend? See [`msb-metrics`](/observability/msb-metrics), a sidecar binary that reads the same data and ships it over OTLP.
+</Note>
+
+## Point-in-time
+
+<CodeGroup>
+```typescript TypeScript
+const metrics = await sb.metrics();
+console.log(`CPU: ${metrics.cpuPercent.toFixed(1)}%, Mem: ${Math.floor(metrics.memoryBytes / 1024 / 1024)} MB`);
+```
+
+```rust Rust
+use microsandbox::Sandbox;
+
+let metrics = sb.metrics().await?;
+println!("CPU: {:.1}%, Mem: {} MB", metrics.cpu_percent, metrics.memory_bytes / 1024 / 1024);
+```
+
+```python Python
+m = await sb.metrics()
+print(f"CPU: {m.cpu_percent:.1f}%, Mem: {m.memory_bytes // 1024 // 1024} MB")
+```
+
+```go Go
+metrics, err := sb.Metrics(ctx)
+fmt.Printf("CPU: %.1f%%, Mem: %d MB\n", metrics.CPUPercent, metrics.MemoryBytes/1024/1024)
+```
+
+```ruby Ruby
+metrics = sb.metrics.to_h
+puts format("CPU: %.1f%%, Mem: %d MB",
+  metrics.fetch("cpu_percent"), metrics.fetch("memory_bytes") / 1024 / 1024)
+```
+</CodeGroup>
+
+## Streaming
+
+Subscribe to metric updates at a regular interval. Each update arrives as a separate event. Ruby exposes point-in-time metrics only; it does not expose streaming or fleet-wide metrics.
+
+<CodeGroup>
+```typescript TypeScript
+for await (const m of await sb.metricsStream(1000)) {
+    console.log(`[${m.timestamp.toISOString()}] CPU: ${m.cpuPercent.toFixed(1)}%`);
+}
+```
+
+```rust Rust
+use std::time::Duration;
+use futures::StreamExt;
+
+let mut stream = sb.metrics_stream(Duration::from_secs(1));
+while let Some(m) = stream.next().await {
+    let m = m?;
+    println!("CPU: {:.1}%, Mem: {} MB", m.cpu_percent, m.memory_bytes / 1024 / 1024);
+}
+```
+
+```python Python
+async for m in await sb.metrics_stream(interval=1.0):
+    print(f"[{m.timestamp_ms}] CPU: {m.cpu_percent:.1f}%")
+```
+
+```go Go
+stream, err := sb.MetricsStream(ctx, time.Second)
+defer stream.Close()
+for {
+    metrics, err := stream.Recv(ctx)
+    if err != nil {
+        return err
+    }
+    if metrics == nil {
+        break
+    }
+    fmt.Printf("CPU: %.1f%%\n", metrics.CPUPercent)
+}
+```
+
+</CodeGroup>
+
+## Fleet-wide metrics
+
+Get the latest metrics for every running sandbox at once. Useful for dashboards or capacity planning.
+
+<CodeGroup>
+```typescript TypeScript
+import { allSandboxMetrics } from "microsandbox";
+
+const all = await allSandboxMetrics();
+```
+
+```rust Rust
+use microsandbox::all_sandbox_metrics;
+
+let all = all_sandbox_metrics().await?;
+```
+
+```python Python
+from microsandbox import all_sandbox_metrics
+
+all_metrics = await all_sandbox_metrics()
+```
+
+```go Go
+all, err := m.AllSandboxMetrics(ctx)
+```
+
+</CodeGroup>
+
+Fleet snapshots only include sandboxes whose runtime process is actually alive. A runtime that crashed without cleanup used to keep reporting its last sample as if the sandbox were running; readers now detect the dead owner and retire the entry on first read.
+
+Memory limits follow live memory resizes on current runtimes: per-sandbox metrics, metrics reports, `msb metrics`, fleet snapshots, and `msb-metrics` all report the guest's current memory size. For sandboxes without memory hotplug, or started by an older runtime, per-sandbox metrics and reports fall back to the configured size, while fleet snapshots and `msb-metrics` report the boot allocation until the sandbox is restarted.
+
+Memory usage is the guest memory in use, measured against the live memory size when the runtime reports it. Right after a resize, usage can briefly be off or missing until the guest's memory statistics catch up. In particular, growing memory can temporarily overstate usage. OTLP omits unavailable usage samples, and the collector's stdout output displays `N/A`; SDK numeric usage fields and `msb metrics` still represent unavailable usage as zero.
+
+<span id="metrics-reports-rust" />
+
+## Metrics reports
+
+`msb metrics` joins each sample with catalog information. CPU allocation comes from the active configuration; the memory limit comes from the live sample, falling back to active configuration when unavailable. Reports therefore reflect live resizes.
+
+Reports distinguish a fresh sample, a live runtime that has missed three sampling intervals, and the preserved terminal sample of a stopped sandbox. See [report states](/sdk/rust/sandbox#sandboxmetricsstate) for their definitions. Programmatic reports are currently available only through the [Rust report APIs](/sdk/rust/sandbox#metrics-reports).
+
+## Reference
+
+For exact per-sandbox metrics APIs, see [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), [Go](/sdk/go/sandbox), or [Ruby](/sdk/ruby/sandbox). For local reports and fleet snapshots, see [`msb metrics`](/cli/sandbox-commands#msb-metrics).
+
+## Upgrading with running sandboxes
+
+Upgraded SDK readers search both the registry derived from the normalized home and the legacy registry derived from its original spelling. Existing runtimes keep writing to their current registry and do not need restarting; each newly started run writes only to the normalized-home registry. All metrics APIs validate matches against the catalog and process identity and merge results without duplicate runs.
+
+This uses in-memory reader state only: there is no database migration, sidecar, config rewrite, or change to registry cleanup. Keep the original home spelling available when upgrading. Discovering a legacy registry after that spelling is lost is outside this lookup's scope. Older readers do not automatically gain support for the new registry names.

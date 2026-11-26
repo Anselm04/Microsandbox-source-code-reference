@@ -1,0 +1,430 @@
+---
+title: TLS inspection
+sidebarTitle: TLS
+description: Inspect HTTPS traffic and manage certificate trust
+icon: "lock"
+---
+
+<Tooltip tip="TLS inspection and host CA trust are not available on our managed cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+TLS inspection lets microsandbox inspect HTTPS traffic. This enables URL policy checks, request logging, and secure secret injection for matching hosts.
+
+## How it works
+
+When interception is enabled, microsandbox:
+
+1. Loads an interception certificate authority, or CA.
+2. Adds that CA to the guest's trust store.
+3. Creates a certificate for each intercepted host.
+4. Opens a separate verified TLS connection to the upstream server.
+
+Creating a local sandbox with interception enabled generates a dedicated CA unless you supply one. The private key stays in host storage. The guest receives the public certificate at `/.msb/tls/ca.pem`. Existing sandboxes that use the shared CA at `~/.microsandbox/tls/ca.{crt,key}` continue to use it. If you supplied a CA, keep its certificate and key available at the configured paths.
+
+For new local sandboxes, relative paths to upstream CA certificates and interception CA certificate/key files are resolved when the sandbox is created and saved as absolute paths. Starting the same sandbox from another working directory does not select different TLS files. Existing saved sandboxes with relative TLS paths retain their previous resolution behavior. They remain usable without recreation, and restart does not rewrite their saved paths.
+
+## Moving a full snapshot to another machine
+
+An installed full checkpoint can retain a dedicated sandbox CA. Its signing key is sealed with a wrapping key in the source microsandbox home and bound to the captured checkpoint. Back up the checkpoint with an age recipient before removing that home or its wrapping key. A plaintext export omits signing keys.
+
+To transfer a dedicated CA, export to the destination’s age X25519 public key. On the destination, import with the matching private identity file and restore the imported group.
+
+```bash
+msb snapshot export backend --checkpoint ready --with-image --recipient "$AGE_RECIPIENT" --output backend.msb
+msb snapshot import imported --file backend.msb --identity ./receiver.key
+msb snapshot restore imported --name backend-copy
+```
+
+The destination seals the imported credential under its own wrapping key. If the group already contains a plaintext copy of that checkpoint, importing its encrypted backup attaches the verified signer in the same transaction as the rest of the batch. Repeating the import preserves the installed signer. A signer-only import keeps the current head selection unless you explicitly pass `--set-head`. A holder of a matching age identity can recover the sandbox signing key from the backup. Keep recipient identities private. A source that uses a custom or historical machine-wide CA requires a matching signer supplied separately. Full restore also requires compatible guest architecture and runtime support. Configure destination network policy and upstream certificate trust for the new host.
+
+## Connections after a full restore or fork
+
+A full snapshot includes guest memory. The host proxy and upstream server each hold connection state outside the guest. On a supported guest, full restore and fork close inherited external TCP connections before the restored workloads resume. Applications can then open fresh connections. An older guest produces a warning and an existing read may wait for its application timeout.
+
+A server might already have processed a request when the snapshot was taken. Microsandbox does not replay it. For a request such as a payment or a job submission, check its outcome or use the service’s idempotency mechanism before retrying. An ordinary pause and resume of the same VM does not trigger this reset.
+
+## Enabling interception
+
+Enable interception with the default settings as shown below. Configuring TLS options also enables it, so no separate shortcut is needed when setting bypass hosts or custom certificates.
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+await using sb = await Sandbox.builder("worker")
+  .image("python")
+  .interceptTls()
+  .create();
+```
+
+```rust Rust
+use microsandbox::Sandbox;
+
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .intercept_tls()
+    .create()
+    .await?;
+```
+
+```python Python
+from microsandbox import Sandbox
+
+sb = await Sandbox.create(
+    "worker",
+    image="python",
+    intercept_tls=True,
+)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("python"),
+    m.WithInterceptTLS(),
+)
+```
+
+```ruby Ruby
+require "microsandbox"
+
+sb = Microsandbox::Sandbox.create("worker", image: "python", intercept_tls: true)
+```
+
+```bash CLI
+msb create python --name worker --tls-intercept
+```
+</CodeGroup>
+
+<a id="application-trust"></a>
+
+## Trusting certificates in applications
+
+Applications with their own certificate stores may need extra setup.
+We provide [msb-trust.sh](https://github.com/superradcompany/microsandbox/blob/main/scripts/msb-trust/msb-trust.sh),
+a helper script that configures common applications to trust the Microsandbox TLS CA.
+Save it as `./msb-trust.sh`, copy it into the sandbox, and run it after boot.
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+const sb = await Sandbox.builder("app")
+  .image("ubuntu:24.04")
+  .interceptTls()
+  .patch((p) => p.copyFile("./msb-trust.sh", "/msb-trust.sh"))
+  .create();
+
+const setup = await sb.shell("sh /msb-trust.sh all");
+if (!setup.success) throw new Error(setup.stderr());
+console.log(setup.stdout());
+```
+
+```rust Rust
+use microsandbox::Sandbox;
+
+let sb = Sandbox::builder("app")
+    .image("ubuntu:24.04")
+    .intercept_tls()
+    .patch(|p| p.copy_file("./msb-trust.sh", "/msb-trust.sh", None, false))
+    .create()
+    .await?;
+
+let setup = sb.shell("sh /msb-trust.sh all").await?;
+if !setup.status().success {
+    return Err(setup.stderr()?.into());
+}
+print!("{}", setup.stdout()?);
+```
+
+```python Python
+from microsandbox import Patch, Sandbox
+
+sb = await Sandbox.create(
+    "app",
+    image="ubuntu:24.04",
+    intercept_tls=True,
+    patches=[Patch.copy_file("./msb-trust.sh", "/msb-trust.sh")],
+)
+
+setup = await sb.shell("sh /msb-trust.sh all")
+if setup.exit_code != 0:
+    raise RuntimeError(setup.stderr_text)
+print(setup.stdout_text)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "app",
+    m.WithImage("ubuntu:24.04"),
+    m.WithInterceptTLS(),
+    m.WithPatches(m.Patch.CopyFile(
+        "./msb-trust.sh", "/msb-trust.sh", m.PatchOptions{},
+    )),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+setup, err := sb.Shell(ctx, "sh /msb-trust.sh all")
+if err != nil {
+    log.Fatal(err)
+}
+if !setup.Success() {
+    log.Fatal(setup.Stderr())
+}
+fmt.Print(setup.Stdout())
+```
+
+```ruby Ruby
+require "microsandbox"
+
+sb = Microsandbox::Sandbox.create("app", image: "ubuntu:24.04", intercept_tls: true)
+sb.fs.write("/msb-trust.sh", File.binread("./msb-trust.sh"))
+
+setup = sb.shell("sh /msb-trust.sh all")
+raise setup.stderr unless setup.success?
+puts setup.stdout
+sb.detach
+```
+
+```bash CLI
+msb create ubuntu:24.04 --name app \
+  --tls-intercept \
+  --copy-file ./msb-trust.sh:/msb-trust.sh
+
+msb exec app -- sh /msb-trust.sh all
+```
+</CodeGroup>
+
+The examples use `all` to configure supported applications whose tools are installed
+and report missing prerequisites. To choose specific applications, run
+`sh /msb-trust.sh --help` for the supported names, then pass one or more names
+instead of `all`.
+The helper tries every selected application and returns an error if any cannot be configured.
+
+<Note>
+Missing your application? PRs are welcome. We consider broad usefulness and
+maintenance effort when deciding which applications to support.
+</Note>
+
+## Bypass patterns
+
+Some clients trust a specific certificate or public key instead of the guest's trust store. Interception will fail for these clients.
+
+Add their hosts to the bypass list. Exact domains such as `api.example.com` and wildcards such as `*.apple.com` are supported. Bypassed traffic stays encrypted between the guest and upstream server, so content-based policy checks and secret injection do not apply.
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+await using sb = await Sandbox.builder("worker")
+  .image("python")
+  .network((n) => n.tls((t) =>
+    t.bypass("pinned-api.example.com").bypass("*.gov"),
+  ))
+  .create();
+```
+
+```rust Rust
+use microsandbox::Sandbox;
+
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .network(|n| n.tls(|t| t
+        .bypass("pinned-api.example.com")
+        .bypass("*.gov")
+    ))
+    .create()
+    .await?;
+```
+
+```python Python
+from microsandbox import Network, Sandbox, TlsConfig
+
+sb = await Sandbox.create(
+    "worker",
+    image="python",
+    network=Network(
+        tls=TlsConfig(bypass=("pinned-api.example.com", "*.gov")),
+    ),
+)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("python"),
+    m.WithNetwork(&m.NetworkConfig{
+        TLS: &m.TLSConfig{
+            Bypass: []string{"pinned-api.example.com", "*.gov"},
+        },
+    }),
+)
+```
+
+```bash CLI
+msb create python --name worker \
+  --tls-intercept \
+  --tls-bypass "pinned-api.example.com" \
+  --tls-bypass "*.gov"
+```
+</CodeGroup>
+
+## Upstream CA trust
+
+The proxy verifies upstream certificates against host trust by default. On Windows, native chain validation follows Windows trust policy and can retrieve approved roots and issuers when that policy allows it. Other platforms load the host's native root certificates. Certificate and hostname checks remain enabled unless you explicitly override verification.
+
+Additional CA certificates apply only to the configured upstream connections; they are not installed in the host's trusted root store. You can add:
+
+- a CA trusted for every intercepted host
+- a CA trusted only for matching hosts
+- a host pattern that skips upstream verification
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+await using sb = await Sandbox.builder("agent")
+  .image("python")
+  .network((n) => n.tls((t) =>
+    t.upstreamCaCert("/etc/ssl/corp-root.pem")
+      .upstreamCaCertFor("api.internal.example.com", "./certs/api-ca.pem")
+      .verifyUpstreamFor("*.preview.internal", false),
+  ))
+  .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("agent")
+    .image("python")
+    .network(|n| n.tls(|t| t
+        .upstream_ca_cert("/etc/ssl/corp-root.pem")
+        .upstream_ca_cert_for("api.internal.example.com", "./certs/api-ca.pem")
+        .verify_upstream_for("*.preview.internal", false)
+    ))
+    .create()
+    .await?;
+```
+
+```python Python
+from microsandbox import (
+    Network, Sandbox, ScopedUpstreamCACert, ScopedVerifyUpstream, TlsConfig,
+)
+
+sb = await Sandbox.create(
+    "agent",
+    image="python",
+    network=Network(tls=TlsConfig(
+        upstream_ca_certs=("/etc/ssl/corp-root.pem",),
+        scoped_upstream_ca_certs=(
+            ScopedUpstreamCACert("api.internal.example.com", "./certs/api-ca.pem"),
+        ),
+        scoped_verify_upstream=(
+            ScopedVerifyUpstream("*.preview.internal", False),
+        ),
+    )),
+)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "agent",
+    m.WithImage("python"),
+    m.WithNetwork(&m.NetworkConfig{
+        TLS: &m.TLSConfig{
+            UpstreamCACerts: []string{"/etc/ssl/corp-root.pem"},
+            ScopedUpstreamCACerts: []m.ScopedUpstreamCACert{
+                {Pattern: "api.internal.example.com", Path: "./certs/api-ca.pem"},
+            },
+            ScopedVerifyUpstream: []m.ScopedVerifyUpstream{
+                {Pattern: "*.preview.internal", Verify: false},
+            },
+        },
+    }),
+)
+if err != nil {
+    return err
+}
+```
+
+```bash CLI
+msb create python --name agent \
+  --tls-intercept \
+  --tls-upstream-ca-cert /etc/ssl/corp-root.pem \
+  --tls-upstream-ca-cert-for 'api.internal.example.com=./certs/api-ca.pem' \
+  --tls-no-verify-upstream-for '*.preview.internal'
+```
+</CodeGroup>
+
+For HTTPS to an IP address, clients usually omit SNI. Interception uses the
+original destination IP for the certificate and policy checks. Self-signed
+upstreams still need a trusted CA and a certificate valid for the requested IP,
+or a scoped verification override;
+`curl -k` inside the guest only disables verification of the guest-facing certificate.
+
+Skipping verification is similar to using `curl -k`. Use it only for hosts you control and only when a trusted CA is not available.
+
+## Limits
+
+- Clients that pin certificates or public keys must be bypassed.
+- Bypassed traffic cannot use content-based policy checks or secret injection.
+- microsandbox does not proxy guest client certificates. Bypass hosts that require guest mTLS.
+- microsandbox does not intercept QUIC and HTTP/3 traffic.
+
+## Trusting host CAs
+
+Corporate proxies often replace server certificates with certificates signed by a company CA. The host trusts that CA, but a sandbox normally does not. Commands such as `apk update`, `pip install`, and `curl` can then fail with a certificate error.
+
+Enable host CA trust to copy trusted host roots into the guest when it starts:
+
+<CodeGroup>
+```typescript TypeScript
+await using sb = await Sandbox.builder("devbox")
+  .image("alpine")
+  .network((n) => n.trustHostCAs(true))
+  .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("devbox")
+    .image("alpine")
+    .network(|n| n.trust_host_cas(true))
+    .create()
+    .await?;
+```
+
+```python Python
+sb = await Sandbox.create(
+    "devbox",
+    image="alpine",
+    network=Network(trust_host_cas=True),
+)
+```
+
+```go Go
+trustHostCAs := true
+sb, err := m.CreateSandbox(ctx, "devbox",
+    m.WithImage("alpine"),
+    m.WithNetwork(&m.NetworkConfig{
+        TrustHostCAs: &trustHostCAs,
+    }),
+)
+```
+
+```bash CLI
+msb run alpine --trust-host-cas -- apk update
+```
+</CodeGroup>
+
+<Note>
+Host CA trust gives the guest every root certificate trusted by the host. Enable it only when you trust the host's CA store.
+</Note>
+
+Host CA trust can be used alongside TLS inspection. Enable both when connections that bypass inspection, such as Postgres or Redis over TLS, also need to trust your host's certificates.
+
+## Reference
+
+For exact TLS and network APIs, see [TypeScript](/sdk/typescript/networking#tlsbuilder), [Rust](/sdk/rust/networking#tlsbuilder), [Python](/sdk/python/networking#tlsconfig), or [Go](/sdk/go/networking#tlsconfig). For CLI fields and flags, see [Sandbox configuration](/cli/configuration#network) and [Sandbox commands](/cli/sandbox-commands).
+
+## Related
+
+- [DNS](/networking/dns) explains DNS policy and DNS over TLS.
+- [Proxies](/networking/outbound-proxy) explains routing outbound TCP and non-DNS UDP through an external SOCKS proxy.
+- [Network defenses](/security/network) explains SSRF protection.
+- [Secret handling](/security/secrets) explains credential injection.

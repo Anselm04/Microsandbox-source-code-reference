@@ -1,0 +1,139 @@
+// Snapshot restore example for the microsandbox Go SDK.
+//
+// Exercises creating a snapshot from a stopped sandbox, opening it through the
+// snapshot index, verifying the artifact, and booting a second sandbox from it.
+//
+// Build: from sdk/go, run
+//
+//	go run ./examples/snapshot-fork
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
+)
+
+const markerPath = "/tmp/snapshot-marker.txt"
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	if _, err := microsandbox.EnsureRuntime(ctx, microsandbox.RuntimeConfig{}, microsandbox.InstallOptions{}); err != nil {
+		log.Fatalf("EnsureRuntime: %v", err)
+	}
+
+	suffix := time.Now().Unix()
+	baseName := fmt.Sprintf("go-sdk-snapshot-base-%d", suffix)
+	forkName := fmt.Sprintf("go-sdk-snapshot-fork-%d", suffix)
+	snapshotName := fmt.Sprintf("go-sdk-snapshot-%d", suffix)
+	snapshotSelector := ""
+	snapshotGroupName := ""
+
+	base, err := microsandbox.CreateSandbox(ctx, baseName, microsandbox.WithImage("alpine:3.19"))
+	if err != nil {
+		log.Fatalf("CreateSandbox base: %v", err)
+	}
+	defer cleanupSandbox(baseName)
+	defer func() {
+		if snapshotGroupName != "" {
+			cleanupSnapshot(snapshotGroupName)
+		}
+	}()
+
+	payload := fmt.Sprintf("created by %s\n", baseName)
+	if err := base.FS().WriteString(ctx, markerPath, payload); err != nil {
+		log.Fatalf("WriteString marker: %v", err)
+	}
+
+	if err := base.Stop(ctx); err != nil {
+		log.Fatalf("Stop base: %v", err)
+	}
+	created, err := base.Snapshot(ctx, snapshotName, microsandbox.WithSnapshotCaptureConfig(microsandbox.SnapshotCaptureConfig{Name: "base", RecordIntegrity: true}))
+	if err != nil {
+		log.Fatalf("Snapshot: %v", err)
+	}
+	artifact := created.Checkpoint
+	snapshotGroupName = created.Snapshot.Name()
+	snapshotSelector = snapshotName + ":" + artifact.ID()
+
+	size := "unknown"
+	sizeBytes, err := artifact.SizeBytes(ctx)
+	if err != nil {
+		log.Fatalf("Snapshot size: %v", err)
+	}
+	if sizeBytes != nil {
+		size = fmt.Sprintf("%d", *sizeBytes)
+	}
+	fmt.Printf("snapshot created: digest=%s size=%s bytes\n", artifact.Digest(), size)
+
+	report, err := artifact.Verify(ctx)
+	if err != nil {
+		log.Fatalf("Snapshot Verify: %v", err)
+	}
+	if report.Coverage.Kind != "complete" {
+		log.Fatalf("Snapshot Verify: incomplete coverage %q", report.Coverage.Kind)
+	}
+	fmt.Printf("snapshot verified: coverage=%s upper=%s\n", report.Coverage.Kind, report.Upper.Kind)
+
+	handle, err := microsandbox.GetSnapshot(ctx, snapshotSelector)
+	if err != nil {
+		log.Fatalf("Snapshot.Get: %v", err)
+	}
+	name := "(unnamed)"
+	if indexedName := handle.Name(); indexedName != nil {
+		name = *indexedName
+	}
+	fmt.Printf("snapshot index entry: name=%s digest=%s\n", name, handle.Digest())
+
+	fork, err := artifact.SpawnSandbox(ctx, forkName)
+	if err != nil {
+		log.Fatalf("RestoreSandbox fork: %v", err)
+	}
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = fork.Stop(stopCtx)
+		_ = fork.Close()
+		_ = microsandbox.RemoveSandbox(context.Background(), forkName)
+	}()
+
+	got, err := fork.FS().ReadString(ctx, markerPath)
+	if err != nil {
+		log.Fatalf("ReadString marker from fork: %v", err)
+	}
+	if got != payload {
+		log.Fatalf("fork marker mismatch: got %q want %q", got, payload)
+	}
+	fmt.Printf("fork preserved marker: %q\n", strings.TrimSpace(got))
+
+	fmt.Println("OK - snapshot-fork example passed")
+}
+
+func cleanupSandbox(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sb, err := microsandbox.GetSandbox(ctx, name)
+	if err != nil {
+		return
+	}
+	_ = sb.Stop(ctx)
+	_ = microsandbox.RemoveSandbox(context.Background(), name)
+}
+
+func cleanupSnapshot(name string) {
+	ctx := context.Background()
+	provider, err := microsandbox.NewLocalContext(microsandbox.LocalOptions{})
+	if err != nil {
+		return
+	}
+	group, err := provider.Snapshots().Get(ctx, name)
+	if err == nil {
+		_, _ = group.Remove(ctx)
+	}
+}

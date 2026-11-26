@@ -1,0 +1,45 @@
+//! Shared host-runtime contracts and the optional sandbox VM runner.
+//!
+//! The `client` feature exposes launch, IPC, control, logging, and maintenance
+//! contracts used by SDKs. The `runner` feature adds the VM, relay, metrics,
+//! console, and host-control implementation linked into the `msb` process.
+
+#![warn(missing_docs)]
+
+#[cfg(feature = "client")]
+pub mod checkpoint;
+#[cfg(feature = "client")]
+mod client;
+mod error;
+#[cfg(feature = "runner")]
+mod runner;
+
+//--------------------------------------------------------------------------------------------------
+// Exports
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(all(feature = "client", windows))]
+pub use client::disk_lock_handoff;
+#[cfg(all(feature = "client", target_os = "linux"))]
+pub use client::memory_handoff;
+#[cfg(feature = "client")]
+pub use client::{
+    boot_error, command_bindings, compat, control, ipc, jobs, launch, logging, maintenance,
+    restored_exec_limits, retention, startup_progress, writeback_recovery,
+};
+#[cfg(feature = "runner")]
+pub use runner::{console, cpu, exec_log, heartbeat, metrics, policy, relay, vm};
+#[cfg(all(feature = "client", not(feature = "runner")))]
+/// Backward-compatible access to the process-launch contract without the VM runner.
+pub mod vm {
+    pub use crate::launch::*;
+}
+#[cfg(all(feature = "runner", windows))]
+pub(crate) use runner::bootstrap_fs;
+#[cfg(feature = "runner")]
+pub(crate) use runner::{clock, startup, writeback};
+
+#[cfg(feature = "runner")]
+pub use msb_krun::{default_nested_virt, nested_virt_supported};
+
+pub use error::*;

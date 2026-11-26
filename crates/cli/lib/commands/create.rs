@@ -1,0 +1,91 @@
+//! `msb create` command — create and boot a fresh sandbox.
+
+use clap::Args;
+
+use super::common::{self, SandboxOpts, apply_sandbox_opts, apply_sandbox_opts_after_config};
+use crate::{sandbox_config, ui};
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Create a sandbox and boot it in the background.
+#[derive(Debug, Args)]
+pub struct CreateArgs {
+    /// Image to use (e.g. alpine, python, ./rootfs, ./disk.qcow2).
+    ///
+    /// May be omitted when a config file supplies `image`.
+    pub image: Option<String>,
+
+    /// Snapshot source and restore-mode selection.
+    #[command(flatten)]
+    pub snapshot: crate::snapshot_source::SnapshotSourceArgs,
+
+    /// Sandbox configuration options.
+    #[command(flatten)]
+    pub sandbox: SandboxOpts,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Execute the `msb create` command.
+pub async fn run(
+    mut args: CreateArgs,
+    log_level: Option<microsandbox::LogLevel>,
+) -> anyhow::Result<()> {
+    let is_named = args.sandbox.name.is_some();
+    let name = args.sandbox.name.clone().unwrap_or_else(ui::generate_name);
+
+    if args.sandbox.log_level.is_none()
+        && let Some(log_level) = log_level
+    {
+        args.sandbox.log_level = Some(log_level.to_string());
+    }
+
+    let resolved = sandbox_config::resolve(&args.sandbox.config)?;
+    let builder = resolved.apply(common::selected_context()?.sandboxes().builder(&name))?;
+    let (builder, display_label) = args
+        .snapshot
+        .apply(&resolved, args.image.as_deref(), builder)
+        .await?;
+    let builder = if resolved.loaded() {
+        apply_sandbox_opts_after_config(builder, &args.sandbox)?
+    } else {
+        apply_sandbox_opts(builder, &args.sandbox)?
+    };
+
+    let (mut progress, task) = builder.detached(true).create_detached_with_progress()?;
+    let mut display = if args.sandbox.quiet {
+        ui::PullProgressDisplay::quiet(&display_label)
+    } else {
+        ui::PullProgressDisplay::new(&display_label)
+    };
+
+    while let Some(event) = progress.recv().await {
+        display.handle_creation_event(event);
+    }
+
+    match task.await {
+        Ok(Ok(sandbox)) => {
+            display.finish();
+            super::common::display_restore_warnings(&sandbox).await;
+            sandbox.detach().await?;
+            // Print auto-generated name to stdout so it's scriptable.
+            if !is_named {
+                println!("{name}");
+            }
+        }
+        Ok(Err(e)) => {
+            display.finish();
+            return Err(e.into());
+        }
+        Err(e) => {
+            display.finish();
+            return Err(anyhow::anyhow!("create task panicked: {e}"));
+        }
+    }
+
+    Ok(())
+}

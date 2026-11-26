@@ -1,0 +1,3580 @@
+//! OCI registry client.
+//!
+//! Wraps `oci-client` with platform resolution, caching, and progress reporting.
+//!
+//! # Protection from concurrent prune
+//!
+//! Pulls protect their cache entries while running, but [`PullResult`] and
+//! [`CachedImageMetadata`] do not own leases. To retain protection after a call returns,
+//! create a [`GlobalCache::operation`] scope and pass its clone to [`Registry::new`] or
+//! the cached-pull methods. Keep the scope alive through durable catalog publication.
+//! A registry built with an ordinary cache only retains its internal pull scope until
+//! the pull finishes; keeping that registry or its result alive does not pin the artifacts.
+
+use std::{
+    collections::HashMap,
+    io,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Instant,
+};
+
+use oci_client::{Client, manifest::ImageIndexEntry};
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    sync::Semaphore,
+    task::JoinHandle,
+};
+
+use crate::{
+    cache::{
+        self, CacheAuthProvenance, CachedImageMetadata, CachedLayerMetadata, GlobalCache,
+        VmdkWriteMode, lock::CacheLockGuard,
+    },
+    config::ImageConfig,
+    digest::Digest,
+    erofs,
+    error::{ImageError, ImageResult},
+    flat,
+    layer::Layer,
+    platform::Platform,
+    progress::{self, PullProgress, PullProgressHandle, PullProgressSender},
+    pull::{PullOptions, PullPolicy, PullResult, RootfsMaterialization},
+    tar::{self, Compression},
+    tree::{
+        DeviceNode, DirectoryNode, FileData, FileTree, RegularFileId, RegularFileNode,
+        ResourceLimits, SymlinkNode, TreeNode,
+    },
+};
+
+use super::{RegistryBuilder, manifest::OciManifest};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Minimum byte delta between per-layer materialization progress updates.
+const MATERIALIZE_PROGRESS_EMIT_BYTES: u64 = 256 * 1024;
+
+/// Upper bound for concurrently active layer download/materialize tasks.
+const MAX_LAYER_PIPELINE_CONCURRENCY: usize = 16;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// OCI registry client with platform resolution, caching, and progress reporting.
+pub struct Registry {
+    pub(super) client: Client,
+    pub(super) auth: oci_client::secrets::RegistryAuth,
+    pub(super) platform: Platform,
+    pub(super) cache: GlobalCache,
+}
+
+/// Resolved manifest layer descriptor used during download/materialization.
+#[derive(Debug, Clone)]
+struct LayerDescriptor {
+    digest: Digest,
+    media_type: Option<String>,
+    size: Option<u64>,
+}
+
+struct CachedPullInfo {
+    result: PullResult,
+    metadata: CachedImageMetadata,
+}
+
+struct LayerPipelineFailure {
+    error: ImageError,
+}
+
+struct MaterializeLayersRequest<'a> {
+    oci_ref: &'a oci_client::Reference,
+    manifest_digest: &'a Digest,
+    layer_descriptors: &'a [LayerDescriptor],
+    diff_ids: &'a [String],
+    force: bool,
+    materialization: RootfsMaterialization,
+    progress: Option<PullProgressSender>,
+    staged_layers: Option<Arc<crate::archive::StagedLayerGuard>>,
+}
+
+/// Per-layer pipeline success: EROFS image written, data-stripped tree + data map retained.
+/// `tree` and `data_map` are `None` when the EROFS was already cached.
+struct LayerPipelineTreeSuccess {
+    layer_index: usize,
+    tree: Option<FileTree>,
+    data_map: Option<erofs::ErofsDataMap>,
+}
+
+/// Wraps an `AsyncRead` to emit `LayerMaterializeProgress` events as the
+/// tar stream is read during EROFS materialization.
+///
+/// Progress events are throttled to avoid flooding the channel — an update
+/// is sent only after at least `MATERIALIZE_PROGRESS_EMIT_BYTES` (256 KiB)
+/// have been read since the last event.
+struct MaterializeProgressReader<R> {
+    inner: R,
+    progress: Option<PullProgressSender>,
+    layer_index: usize,
+    total_bytes: u64,
+    bytes_read: u64,
+    last_emitted_bytes: u64,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl<R> MaterializeProgressReader<R> {
+    fn new(
+        inner: R,
+        progress: Option<PullProgressSender>,
+        layer_index: usize,
+        total_bytes: u64,
+    ) -> Self {
+        Self {
+            inner,
+            progress,
+            layer_index,
+            total_bytes: total_bytes.max(1),
+            bytes_read: 0,
+            last_emitted_bytes: 0,
+        }
+    }
+}
+
+impl Registry {
+    /// Create a registry client with anonymous authentication and default TLS settings.
+    pub fn new(platform: Platform, cache: GlobalCache) -> ImageResult<Self> {
+        Self::builder(platform, cache).build()
+    }
+
+    /// Create a builder for configuring auth, TLS, and other registry options.
+    pub fn builder(platform: Platform, cache: GlobalCache) -> RegistryBuilder {
+        RegistryBuilder::new(platform, cache)
+    }
+
+    /// Resolve a pull directly from the on-disk cache without building a registry client.
+    ///
+    /// Pass a [`GlobalCache::operation`] scope and retain it until the caller publishes
+    /// durable ownership. The returned values do not retain prune protection themselves.
+    pub fn pull_cached(
+        cache: &GlobalCache,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+    ) -> ImageResult<Option<(PullResult, CachedImageMetadata)>> {
+        Ok(resolve_cached_pull_result(cache, reference, options)?
+            .map(|cached| (cached.result, cached.metadata)))
+    }
+
+    /// Resolve a cached image without blocking the async executor on a deletion lease.
+    ///
+    /// Like [`Self::pull_cached`], protection after return requires a retained operation scope.
+    pub async fn pull_cached_async(
+        cache: &GlobalCache,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+    ) -> ImageResult<Option<(PullResult, CachedImageMetadata)>> {
+        let cache = cache.clone();
+        let reference = reference.clone();
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || Self::pull_cached(&cache, &reference, &options))
+            .await
+            .map_err(|error| ImageError::Io(io::Error::other(error)))?
+    }
+
+    /// Resolve a pull from any complete cached image metadata matching a manifest digest.
+    ///
+    /// Only entries whose provenance permits unauthenticated cache hits are returned.
+    /// Pass a retained [`GlobalCache::operation`] scope to protect the matched artifacts
+    /// through publication; the returned values do not hold leases.
+    pub async fn pull_cached_by_manifest_digest(
+        cache: &GlobalCache,
+        manifest_digest: &Digest,
+    ) -> ImageResult<Option<(PullResult, CachedImageMetadata)>> {
+        Ok(resolve_cached_pull_result_by_manifest_digest_async(
+            cache,
+            manifest_digest,
+            false,
+            false,
+        )
+        .await?
+        .map(|cached| (cached.result, cached.metadata)))
+    }
+
+    /// Resolve snapshot image defaults by immutable digest. Flat snapshots own
+    /// their complete disk, so they need metadata but no materialized OCI layers.
+    ///
+    /// Only entries whose provenance permits unauthenticated cache hits are returned.
+    pub async fn pull_snapshot_cached(
+        cache: &GlobalCache,
+        references: &[oci_client::Reference],
+        manifest_digest: &Digest,
+        materialization: RootfsMaterialization,
+    ) -> ImageResult<Option<(PullResult, CachedImageMetadata)>> {
+        Self::pull_snapshot_cached_inner(cache, references, manifest_digest, materialization, false)
+            .await
+    }
+
+    /// Resolve snapshot image defaults by immutable digest, permitting entries with
+    /// restricted (`authenticated` / `unknown`) provenance.
+    ///
+    /// Callers must use this only when the caller owns the cached entry — specifically
+    /// after unpacking a caller-supplied `--with-image` archive or during offline
+    /// restore inside an isolated per-tenant cache directory.
+    pub async fn pull_snapshot_cached_allow_restricted(
+        cache: &GlobalCache,
+        references: &[oci_client::Reference],
+        manifest_digest: &Digest,
+        materialization: RootfsMaterialization,
+    ) -> ImageResult<Option<(PullResult, CachedImageMetadata)>> {
+        Self::pull_snapshot_cached_inner(cache, references, manifest_digest, materialization, true)
+            .await
+    }
+
+    async fn pull_snapshot_cached_inner(
+        cache: &GlobalCache,
+        references: &[oci_client::Reference],
+        manifest_digest: &Digest,
+        materialization: RootfsMaterialization,
+        allow_restricted_provenance: bool,
+    ) -> ImageResult<Option<(PullResult, CachedImageMetadata)>> {
+        let metadata_only = materialization == RootfsMaterialization::Flat;
+        let expected = manifest_digest.to_string();
+        // Most snapshots retain either their original tag key or a pinned key.
+        // Avoid scanning every unrelated image on this common path.
+        for reference in references {
+            if let Some(metadata) = cache.read_image_entry_async(reference).await?
+                && metadata.metadata.manifest_digest == expected
+                && (allow_restricted_provenance
+                    || metadata.pull_auth.allows_unauthenticated_cache_hit())
+                && let Some(cached) =
+                    resolve_snapshot_metadata(cache, metadata.metadata, metadata_only).await?
+            {
+                return Ok(Some((cached.result, cached.metadata)));
+            }
+        }
+        Ok(resolve_cached_pull_result_by_manifest_digest_async(
+            cache,
+            manifest_digest,
+            metadata_only,
+            allow_restricted_provenance,
+        )
+        .await?
+        .map(|cached| (cached.result, cached.metadata)))
+    }
+
+    /// Fetch only the immutable manifest and config needed by a flat snapshot.
+    /// Normal pulls still independently require their filesystem artifacts.
+    pub async fn pull_snapshot_metadata(
+        &self,
+        reference: &oci_client::Reference,
+    ) -> ImageResult<PullResult> {
+        let (result, _) = self.pull_snapshot_metadata_with_metadata(reference).await?;
+        Ok(result)
+    }
+
+    /// Fetch pinned snapshot defaults and return the exact metadata published.
+    pub async fn pull_snapshot_metadata_with_metadata(
+        &self,
+        reference: &oci_client::Reference,
+    ) -> ImageResult<(PullResult, CachedImageMetadata)> {
+        let expected = reference.digest().ok_or_else(|| {
+            ImageError::ManifestParse("snapshot metadata requires a digest-pinned reference".into())
+        })?;
+        let (manifest_bytes, digest, config_bytes) =
+            self.fetch_manifest_and_config(reference).await?;
+        if digest != expected {
+            return Err(ImageError::ManifestParse(
+                "snapshot manifest digest differs from pinned reference".into(),
+            ));
+        }
+        let (manifest, config_bytes, resolved) = self
+            .parse_and_resolve_manifest(&manifest_bytes, config_bytes, reference)
+            .await?;
+        let (config, diff_ids) = ImageConfig::parse(&config_bytes)?;
+        let layers = self.extract_layer_digests(&manifest)?;
+        if layers.len() != diff_ids.len() {
+            return Err(ImageError::ManifestParse(
+                "snapshot manifest/config layer count mismatch".into(),
+            ));
+        }
+        let metadata = CachedImageMetadata {
+            manifest_digest: digest,
+            config_digest: manifest.config_digest().unwrap_or_default(),
+            raw_manifest_json: json_bytes_to_string(&resolved, "resolved manifest")?,
+            raw_config_json: json_bytes_to_string(&config_bytes, "image config")?,
+            config,
+            layers: layers
+                .iter()
+                .zip(diff_ids)
+                .map(|(layer, diff_id)| CachedLayerMetadata {
+                    digest: layer.digest.to_string(),
+                    media_type: layer.media_type.clone(),
+                    size_bytes: layer.size,
+                    diff_id,
+                })
+                .collect(),
+        };
+        let mut result = cached_pull_result(&metadata)?;
+        self.cache
+            .write_image_metadata_with_provenance_async(
+                reference,
+                &metadata,
+                pull_auth_provenance(&self.auth),
+            )
+            .await?;
+        result.cached = false;
+        Ok((result, metadata))
+    }
+
+    /// Pull an image. Downloads blobs and materializes EROFS layers concurrently.
+    ///
+    /// To keep the result protected from prune after return, construct this registry with
+    /// a [`GlobalCache::operation`] scope and retain that scope through durable publication.
+    pub async fn pull(
+        &self,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+    ) -> ImageResult<PullResult> {
+        let (result, _) = self.pull_with_metadata(reference, options, None).await?;
+        Ok(result)
+    }
+
+    /// Resolve an image together with the exact metadata admitted by this pull.
+    ///
+    /// Retain a caller-owned cache operation until durable ownership is recorded.
+    pub async fn pull_with_metadata(
+        &self,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+        progress: Option<PullProgressSender>,
+    ) -> ImageResult<(PullResult, CachedImageMetadata)> {
+        self.pull_inner(reference, options, progress).await
+    }
+
+    /// Materialize layers that have already been staged into the cache.
+    ///
+    /// This is used by archive import: layer blobs are written to the cache at
+    /// their descriptor digest first, then the normal EROFS/fsmeta/VMDK
+    /// materialization path can run without contacting a registry.
+    pub async fn materialize_cached_layers(
+        &self,
+        reference: &oci_client::Reference,
+        metadata: &CachedImageMetadata,
+        force: bool,
+    ) -> ImageResult<PullResult> {
+        self.materialize_cached_layers_inner(reference, metadata, force, None, None)
+            .await
+    }
+
+    /// Materialize a reusable flat ext4 rootfs from already cached EROFS layers.
+    pub async fn materialize_flat_rootfs(
+        &self,
+        manifest_digest: &Digest,
+        layer_diff_ids: &[Digest],
+        force: bool,
+    ) -> ImageResult<crate::FlatRootfsRef> {
+        let cache = self.cache.clone();
+        let platform = self.platform.clone();
+        let manifest_digest = manifest_digest.clone();
+        let layer_diff_ids = layer_diff_ids.to_vec();
+
+        // Cache hits retain the same layer protection as materialization misses.
+        let leases = cache
+            .lease_paths_async(
+                layer_diff_ids
+                    .iter()
+                    .map(|id| cache.layer_erofs_path(id))
+                    .collect(),
+            )
+            .await?;
+
+        if !force {
+            let read_cache = cache.clone();
+            let read_manifest = manifest_digest.clone();
+            let read_layers = layer_diff_ids.clone();
+            let read_platform = platform.clone();
+
+            if let Some(reference) = tokio::task::spawn_blocking(move || {
+                flat::read_current_flat_ref(
+                    &read_cache,
+                    &read_manifest,
+                    &read_layers,
+                    &read_platform,
+                )
+            })
+            .await
+            .map_err(|error| ImageError::Io(io::Error::other(error)))??
+            {
+                return Ok(reference);
+            }
+        }
+
+        let (derivation_digest, derivation_bytes) =
+            flat::flat_derivation_digest(&manifest_digest, &layer_diff_ids, &platform);
+        let materializer_guard =
+            CacheLockGuard::acquire_async(&cache.flat_lock_path(&derivation_digest)).await?;
+        tokio::task::spawn_blocking(move || {
+            let _materializer_guard = materializer_guard;
+            let _leases = leases;
+            flat::materialize_flat_rootfs_locked(
+                &cache,
+                &manifest_digest,
+                &layer_diff_ids,
+                force,
+                derivation_digest,
+                derivation_bytes,
+            )
+        })
+        .await
+        .map_err(|error| ImageError::Io(io::Error::other(error)))?
+    }
+
+    pub(crate) async fn materialize_cached_layers_from_paths(
+        &self,
+        reference: &oci_client::Reference,
+        metadata: &CachedImageMetadata,
+        force: bool,
+        staged_layers: Arc<crate::archive::StagedLayerGuard>,
+        progress: Option<PullProgressSender>,
+    ) -> ImageResult<PullResult> {
+        self.materialize_cached_layers_inner(
+            reference,
+            metadata,
+            force,
+            Some(staged_layers),
+            progress,
+        )
+        .await
+    }
+
+    async fn materialize_cached_layers_inner(
+        &self,
+        reference: &oci_client::Reference,
+        metadata: &CachedImageMetadata,
+        force: bool,
+        staged_layers: Option<Arc<crate::archive::StagedLayerGuard>>,
+        progress: Option<PullProgressSender>,
+    ) -> ImageResult<PullResult> {
+        let manifest_digest: Digest = metadata.manifest_digest.parse()?;
+        let layer_descriptors = metadata
+            .layers
+            .iter()
+            .map(|layer| {
+                Ok(LayerDescriptor {
+                    digest: layer.digest.parse()?,
+                    media_type: layer.media_type.clone(),
+                    size: layer.size_bytes,
+                })
+            })
+            .collect::<ImageResult<Vec<_>>>()?;
+        let diff_ids = metadata
+            .layers
+            .iter()
+            .map(|layer| layer.diff_id.clone())
+            .collect::<Vec<_>>();
+
+        self.materialize_layer_stage(MaterializeLayersRequest {
+            oci_ref: reference,
+            manifest_digest: &manifest_digest,
+            layer_descriptors: &layer_descriptors,
+            diff_ids: &diff_ids,
+            force,
+            materialization: RootfsMaterialization::Layered,
+            progress,
+            staged_layers,
+        })
+        .await?;
+
+        let layer_diff_ids = diff_ids
+            .iter()
+            .map(|diff_id| diff_id.parse())
+            .collect::<ImageResult<Vec<Digest>>>()?;
+
+        Ok(PullResult {
+            layer_diff_ids,
+            config: metadata.config.clone(),
+            manifest_digest,
+            cached: false,
+        })
+    }
+
+    /// Pull with progress reporting.
+    ///
+    /// Creates a progress channel internally and returns both the receiver
+    /// handle and the spawned pull task.
+    /// As with [`Self::pull`], retain a caller-owned operation scope through publication
+    /// if the returned result must remain protected after the task finishes.
+    pub fn pull_with_progress(
+        &self,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+    ) -> (PullProgressHandle, JoinHandle<ImageResult<PullResult>>)
+    where
+        Self: Send + Sync + 'static,
+    {
+        let (handle, sender) = progress::progress_channel();
+        let task = self.spawn_pull_task(reference, options, sender);
+        (handle, task)
+    }
+
+    /// Pull with an externally-provided progress sender.
+    ///
+    /// Use [`progress_channel()`](crate::progress_channel) to create the
+    /// channel, keep the [`PullProgressHandle`] receiver, and pass the
+    /// [`PullProgressSender`] here.
+    /// Protection beyond task completion requires the operation scope described in
+    /// [`Self::pull`]; the task result does not own leases.
+    pub fn pull_with_sender(
+        &self,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+        sender: PullProgressSender,
+    ) -> JoinHandle<ImageResult<PullResult>>
+    where
+        Self: Send + Sync + 'static,
+    {
+        self.spawn_pull_task(reference, options, sender)
+    }
+
+    /// Spawn the pull task with a progress sender.
+    fn spawn_pull_task(
+        &self,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+        sender: PullProgressSender,
+    ) -> JoinHandle<ImageResult<PullResult>>
+    where
+        Self: Send + Sync + 'static,
+    {
+        let reference = reference.clone();
+        let options = options.clone();
+        let client = self.client.clone();
+        let auth = self.auth.clone();
+        let platform = self.platform.clone();
+
+        let cache = self.cache.clone();
+
+        tokio::spawn(async move {
+            let registry = Self {
+                client,
+                auth,
+                platform,
+                cache,
+            };
+            let (result, _) = registry
+                .pull_inner(&reference, &options, Some(sender))
+                .await?;
+            Ok(result)
+        })
+    }
+
+    /// Core pull implementation.
+    async fn pull_inner(
+        &self,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+        progress: Option<PullProgressSender>,
+    ) -> ImageResult<(PullResult, CachedImageMetadata)> {
+        let scoped = Self {
+            client: self.client.clone(),
+            auth: self.auth.clone(),
+            platform: self.platform.clone(),
+            cache: self.cache.operation_or_new(),
+        };
+        scoped.pull_scoped_inner(reference, options, progress).await
+    }
+
+    async fn pull_scoped_inner(
+        &self,
+        reference: &oci_client::Reference,
+        options: &PullOptions,
+        progress: Option<PullProgressSender>,
+    ) -> ImageResult<(PullResult, CachedImageMetadata)> {
+        let _reference_lease = self
+            .cache
+            .lease_paths_async(vec![self.cache.image_metadata_path(reference)])
+            .await?;
+        let pull_started_at = Instant::now();
+        let ref_str: Arc<str> = reference.to_string().into();
+        let oci_ref = reference;
+        let image_lock_path = self.cache.image_lock_path(reference);
+        let image_lock_guard = CacheLockGuard::acquire_async(&image_lock_path).await?;
+        // Lock files are intentionally never deleted — stable inodes prevent
+        // TOCTOU races where two processes flock different inodes at the same path.
+        let _image_lock_guard = image_lock_guard;
+
+        // Step 1: Early cache check using persisted image metadata.
+        if let Some(cached) = resolve_cached_pull_result_async(
+            &self.cache,
+            reference,
+            options,
+            &self.platform,
+            &self.auth,
+        )
+        .await?
+        {
+            tracing::debug!(
+                reference = %reference,
+                elapsed_ms = pull_started_at.elapsed().as_millis(),
+                "pull resolved entirely from cached image metadata"
+            );
+
+            if let Some(ref p) = progress {
+                p.send(PullProgress::Resolving {
+                    reference: ref_str.clone(),
+                });
+                p.send(PullProgress::Resolved {
+                    reference: ref_str.clone(),
+                    manifest_digest: cached.metadata.manifest_digest.clone().into(),
+                    layer_count: cached.metadata.layers.len(),
+                    total_download_bytes: cached
+                        .metadata
+                        .layers
+                        .iter()
+                        .filter_map(|layer| layer.size_bytes)
+                        .reduce(|a, b| a + b),
+                });
+                p.send(PullProgress::Complete {
+                    reference: ref_str,
+                    layer_count: cached.metadata.layers.len(),
+                });
+            }
+
+            return Ok((cached.result, cached.metadata));
+        }
+
+        if options.pull_policy == PullPolicy::Never {
+            return Err(ImageError::NotCached {
+                reference: reference.to_string(),
+            });
+        }
+
+        // Step 2: Resolve manifest.
+        if let Some(ref p) = progress {
+            p.send(PullProgress::Resolving {
+                reference: ref_str.clone(),
+            });
+        }
+
+        let resolve_started_at = Instant::now();
+        let (manifest_bytes, manifest_digest, config_bytes) =
+            self.fetch_manifest_and_config(oci_ref).await?;
+        if let Some(expected) = reference.digest()
+            && manifest_digest != expected
+        {
+            return Err(ImageError::DigestMismatch {
+                digest: expected.to_owned(),
+                expected: expected.to_owned(),
+                actual: manifest_digest,
+            });
+        }
+
+        let manifest_digest: Digest = manifest_digest.parse()?;
+
+        // Determine media type from manifest bytes. For multi-platform images,
+        // this also fetches the platform-specific config bytes.
+        let (manifest, config_bytes, resolved_manifest_bytes) = self
+            .parse_and_resolve_manifest(&manifest_bytes, config_bytes, oci_ref)
+            .await?;
+
+        // Step 3: Parse config.
+        let (image_config, diff_ids) = ImageConfig::parse(&config_bytes)?;
+
+        // Step 4: Get layer descriptors.
+        let layer_descriptors = self.extract_layer_digests(&manifest)?;
+
+        // OCI spec requires diff_ids and layer descriptors to have the same count.
+        if diff_ids.len() != layer_descriptors.len() {
+            return Err(ImageError::ManifestParse(format!(
+                "layer count mismatch: config has {} diff_ids but manifest has {} layers",
+                diff_ids.len(),
+                layer_descriptors.len()
+            )));
+        }
+
+        let layer_count = layer_descriptors.len();
+        let total_bytes: Option<u64> = {
+            let sum: u64 = layer_descriptors
+                .iter()
+                .filter_map(|layer| layer.size)
+                .sum();
+            if sum > 0 { Some(sum) } else { None }
+        };
+
+        tracing::debug!(
+            reference = %reference,
+            layer_count,
+            elapsed_ms = resolve_started_at.elapsed().as_millis(),
+            "pull resolved manifest and layer descriptors"
+        );
+
+        if let Some(ref p) = progress {
+            p.send(PullProgress::Resolved {
+                reference: ref_str.clone(),
+                manifest_digest: manifest_digest.to_string().into(),
+                layer_count,
+                total_download_bytes: total_bytes,
+            });
+        }
+
+        // Give the receiver a chance to render the resolved state before the
+        // layer tasks begin flooding download events.
+        tokio::task::yield_now().await;
+
+        // Warn about duplicate layer digests — they can cause contention.
+        {
+            let mut seen = std::collections::HashSet::new();
+            for desc in &layer_descriptors {
+                if !seen.insert(&desc.digest) {
+                    tracing::warn!(
+                        digest = %desc.digest,
+                        "manifest contains duplicate layer digest; \
+                         per-layer processing will be serialized for this digest"
+                    );
+                }
+            }
+        }
+
+        // Materialize the shared EROFS layer stage and requested compositions.
+        self.materialize_layer_stage(MaterializeLayersRequest {
+            oci_ref,
+            manifest_digest: &manifest_digest,
+            layer_descriptors: &layer_descriptors,
+            diff_ids: &diff_ids,
+            force: options.force,
+            materialization: options.materialization,
+            progress: progress.clone(),
+            staged_layers: None,
+        })
+        .await?;
+
+        let layer_diff_ids: Vec<Digest> = diff_ids
+            .iter()
+            .map(|diff_id| diff_id.parse())
+            .collect::<ImageResult<Vec<Digest>>>()?;
+
+        if options.materialization.includes_flat() {
+            self.materialize_flat_rootfs(&manifest_digest, &layer_diff_ids, options.force)
+                .await?;
+        }
+
+        // Clean up compressed tarballs after all layer tasks complete.
+        // Deferred from per-task cleanup to avoid races with duplicate layer digests.
+        for layer_desc in &layer_descriptors {
+            let layer = Layer::new(layer_desc.digest.clone(), &self.cache);
+            let _ = tokio::fs::remove_file(&layer.tar_path_ref()).await;
+        }
+
+        // Persist cached image metadata.
+        let cached_image = CachedImageMetadata {
+            manifest_digest: manifest_digest.to_string(),
+            config_digest: manifest.config_digest().unwrap_or_default(),
+            raw_manifest_json: json_bytes_to_string(&resolved_manifest_bytes, "resolved manifest")?,
+            raw_config_json: json_bytes_to_string(&config_bytes, "image config")?,
+            config: image_config.clone(),
+            layers: layer_descriptors
+                .iter()
+                .enumerate()
+                .map(|(i, layer)| CachedLayerMetadata {
+                    digest: layer.digest.to_string(),
+                    media_type: layer.media_type.clone(),
+                    size_bytes: layer.size,
+                    diff_id: diff_ids.get(i).cloned().unwrap_or_default(),
+                })
+                .collect(),
+        };
+        self.cache
+            .write_image_metadata_with_provenance_async(
+                reference,
+                &cached_image,
+                pull_auth_provenance(&self.auth),
+            )
+            .await?;
+
+        tracing::debug!(
+            reference = %reference,
+            layer_count,
+            elapsed_ms = pull_started_at.elapsed().as_millis(),
+            "pull completed and cached image metadata was persisted"
+        );
+
+        if let Some(ref p) = progress {
+            p.send(PullProgress::Complete {
+                reference: ref_str,
+                layer_count,
+            });
+        }
+
+        let result = PullResult {
+            layer_diff_ids,
+            config: image_config,
+            manifest_digest,
+            cached: false,
+        };
+        Ok((result, cached_image))
+    }
+
+    /// Fetch manifest and config from the registry.
+    async fn fetch_manifest_and_config(
+        &self,
+        reference: &oci_client::Reference,
+    ) -> ImageResult<(Vec<u8>, String, Vec<u8>)> {
+        let (manifest, manifest_digest, config) = self
+            .client
+            .pull_manifest_and_config(reference, &self.auth)
+            .await?;
+
+        let manifest_bytes = serde_json::to_vec(&manifest)
+            .map_err(|e| ImageError::ManifestParse(format!("failed to serialize manifest: {e}")))?;
+
+        Ok((manifest_bytes, manifest_digest, config.into_bytes()))
+    }
+
+    /// Parse manifest, resolving multi-platform index if needed.
+    ///
+    /// Returns the manifest and the correct config bytes. For single-platform
+    /// manifests, the config bytes are passed through unchanged. For multi-platform
+    /// indexes, the platform-specific config bytes are fetched and returned.
+    async fn parse_and_resolve_manifest(
+        &self,
+        manifest_bytes: &[u8],
+        config_bytes: Vec<u8>,
+        reference: &oci_client::Reference,
+    ) -> ImageResult<(OciManifest, Vec<u8>, Vec<u8>)> {
+        // Try to detect media type from the JSON.
+        let media_type = detect_manifest_media_type(manifest_bytes);
+
+        let manifest = OciManifest::parse(manifest_bytes, &media_type)?;
+
+        if manifest.is_index() {
+            // Resolve platform-specific manifest and fetch its config.
+            self.resolve_platform_manifest(manifest_bytes, reference)
+                .await
+        } else {
+            Ok((manifest, config_bytes, manifest_bytes.to_vec()))
+        }
+    }
+
+    /// Resolve a platform-specific manifest from an OCI index.
+    ///
+    /// Returns the resolved manifest and its platform-specific config bytes.
+    async fn resolve_platform_manifest(
+        &self,
+        index_bytes: &[u8],
+        reference: &oci_client::Reference,
+    ) -> ImageResult<(OciManifest, Vec<u8>, Vec<u8>)> {
+        let index: oci_spec::image::ImageIndex = serde_json::from_slice(index_bytes)
+            .map_err(|e| ImageError::ManifestParse(format!("failed to parse index: {e}")))?;
+
+        let manifests = index.manifests();
+
+        // Find matching platform.
+        let mut best_match: Option<&oci_spec::image::Descriptor> = None;
+        let mut exact_variant = false;
+
+        for entry in manifests {
+            // Skip attestation manifests.
+            if entry.media_type().to_string().contains("attestation") {
+                continue;
+            }
+
+            let platform = match entry.platform().as_ref() {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // OS must match.
+            if *platform.os() != self.platform.os {
+                continue;
+            }
+
+            // Architecture must match.
+            if *platform.architecture() != self.platform.arch {
+                continue;
+            }
+
+            // Check variant.
+            if let Some(ref target_variant) = self.platform.variant {
+                if let Some(entry_variant) = platform.variant().as_ref()
+                    && entry_variant == target_variant
+                {
+                    best_match = Some(entry);
+                    exact_variant = true;
+                    continue;
+                }
+                if !exact_variant {
+                    best_match = Some(entry);
+                }
+            } else {
+                best_match = Some(entry);
+            }
+        }
+
+        let entry = best_match.ok_or_else(|| ImageError::PlatformNotFound {
+            reference: reference.to_string(),
+            os: self.platform.os.clone(),
+            arch: self.platform.arch.clone(),
+        })?;
+
+        let digest = entry.digest();
+
+        // Fetch the platform-specific manifest and config.
+        let platform_ref = format!(
+            "{}/{}@{}",
+            reference.registry(),
+            reference.repository(),
+            digest
+        );
+        let platform_ref: oci_client::Reference = platform_ref.parse().map_err(|e| {
+            ImageError::ManifestParse(format!("failed to parse platform reference: {e}"))
+        })?;
+
+        let (manifest_bytes, _digest, config_bytes) =
+            self.fetch_manifest_and_config(&platform_ref).await?;
+
+        let media_type = detect_manifest_media_type(&manifest_bytes);
+        let manifest = OciManifest::parse(&manifest_bytes, &media_type)?;
+        Ok((manifest, config_bytes, manifest_bytes))
+    }
+
+    /// Extract layer digests and sizes from a parsed manifest.
+    fn extract_layer_digests(&self, manifest: &OciManifest) -> ImageResult<Vec<LayerDescriptor>> {
+        match manifest {
+            OciManifest::Image(m) => {
+                let layers: Vec<LayerDescriptor> = m
+                    .layers()
+                    .iter()
+                    .map(|desc| {
+                        let digest: Digest = desc.digest().to_string().parse().map_err(|_| {
+                            ImageError::ManifestParse(format!(
+                                "invalid layer digest: {}",
+                                desc.digest()
+                            ))
+                        })?;
+                        let size = if desc.size() > 0 {
+                            Some(desc.size())
+                        } else {
+                            None
+                        };
+                        Ok(LayerDescriptor {
+                            digest,
+                            media_type: Some(desc.media_type().to_string()),
+                            size,
+                        })
+                    })
+                    .collect::<ImageResult<Vec<_>>>()?;
+                Ok(layers)
+            }
+            OciManifest::Index(_) => Err(ImageError::ManifestParse(
+                "cannot extract layers from an index — resolve platform first".to_string(),
+            )),
+        }
+    }
+
+    /// Materialize per-layer EROFS images, then generate fsmeta + VMDK.
+    async fn materialize_layer_stage(
+        &self,
+        request: MaterializeLayersRequest<'_>,
+    ) -> ImageResult<()> {
+        let MaterializeLayersRequest {
+            oci_ref,
+            manifest_digest,
+            layer_descriptors,
+            diff_ids,
+            force,
+            materialization,
+            progress,
+            staged_layers,
+        } = request;
+
+        // Validate all diff_ids parse as digests before spawning layer tasks.
+        // diff_ids come from the remote config blob (untrusted input).
+        let validated_diff_ids: Vec<Digest> = diff_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                id.parse::<Digest>().map_err(|_| {
+                    ImageError::ManifestParse(format!("invalid diff_id at layer {i}: {id}"))
+                })
+            })
+            .collect::<ImageResult<Vec<_>>>()?;
+
+        let mut protected = vec![
+            self.cache.fsmeta_erofs_path(manifest_digest),
+            self.cache.vmdk_path(manifest_digest),
+        ];
+        protected.extend(
+            validated_diff_ids
+                .iter()
+                .map(|id| self.cache.layer_erofs_path(id)),
+        );
+        let _leases = self.cache.lease_paths_async(protected).await?;
+
+        // Phase-level idempotency is target-aware. Per-layer EROFS images are
+        // the common verified input for both output representations.
+        //
+        // - flat-only + all layers valid: no layer work; the caller builds ext4.
+        // - layered + fsmeta + VMDK valid: no-op.
+        // - layered + fsmeta valid + VMDK missing: re-stitch VMDK only.
+        // - layered + fsmeta missing: rebuild metadata from cached EROFS layers,
+        //   downloading and materializing only genuinely absent layers.
+        let fsmeta_path = self.cache.fsmeta_erofs_path(manifest_digest);
+        let vmdk_path = self.cache.vmdk_path(manifest_digest);
+        let fsmeta_valid = cache::is_valid_erofs_artifact_async(&fsmeta_path).await;
+        let vmdk_valid = path_exists_async(&vmdk_path).await;
+        let all_layers_valid =
+            all_layers_materialized_async(&self.cache, &validated_diff_ids).await;
+
+        if all_layers_valid && !force {
+            if let Some(staged) = &staged_layers {
+                for (layer, diff_id) in layer_descriptors.iter().zip(&validated_diff_ids) {
+                    if let Some(path) = staged.get(&layer.digest.to_string()) {
+                        verify_staged_layer(path, layer.media_type.as_deref(), diff_id).await?;
+                    }
+                }
+            }
+            if !materialization.includes_layered() || (fsmeta_valid && vmdk_valid) {
+                return Ok(());
+            }
+        }
+
+        if materialization.includes_layered()
+            && all_layers_valid
+            && fsmeta_valid
+            && !vmdk_valid
+            && !force
+        {
+            return self
+                .regenerate_vmdk_only(manifest_digest, &validated_diff_ids, progress.as_ref())
+                .await;
+        }
+
+        // `force` deliberately rebuilds every artifact. Otherwise a valid
+        // EROFS layer is reused even when a manifest-specific output is absent.
+        // Layer trees and block maps needed by fsmeta are reconstructed from
+        // EROFS below instead of forcing the source blob through the pipeline.
+        let layer_force = force;
+        let layer_concurrency = layer_pipeline_concurrency(layer_descriptors.len());
+        let semaphore = Arc::new(Semaphore::new(layer_concurrency));
+
+        let layer_tasks: Vec<_> = layer_descriptors
+            .iter()
+            .enumerate()
+            .map(|(i, layer_desc)| {
+                let layer = Layer::new(layer_desc.digest.clone(), &self.cache);
+                let client = self.client.clone();
+                let oci_ref = oci_ref.clone();
+                let size = layer_desc.size;
+                let progress = progress.clone();
+                let media_type = layer_desc.media_type.clone();
+                let diff_id = diff_ids[i].clone();
+                let staged_tar_path = staged_layers
+                    .as_ref()
+                    .and_then(|layers| layers.get(&layer_desc.digest.to_string()).cloned());
+
+                let diff_id_digest: Digest = validated_diff_ids[i].clone();
+                let erofs_path = self.cache.layer_erofs_path(&diff_id_digest);
+                let lock_path = self.cache.layer_erofs_lock_path(&diff_id_digest);
+                let tmp_dir = self.cache.tmp_dir().to_path_buf();
+                let semaphore = Arc::clone(&semaphore);
+                // Detached layer tasks retain their admitted files even if pull is cancelled.
+                let leases = _leases.clone();
+                let staging = staged_layers.clone();
+                tokio::spawn(async move {
+                    let _leases = leases;
+                    let _staging = staging;
+                    let _permit =
+                        semaphore
+                            .acquire_owned()
+                            .await
+                            .map_err(|e| LayerPipelineFailure {
+                                error: ImageError::Io(io::Error::other(format!(
+                                    "layer pipeline semaphore closed: {e}"
+                                ))),
+                            })?;
+                    let layer_started_at = Instant::now();
+
+                    if cache::is_valid_erofs_artifact_async(&erofs_path).await && !layer_force {
+                        if !all_layers_valid && let Some(path) = &staged_tar_path {
+                            verify_staged_layer(path, media_type.as_deref(), &diff_id_digest)
+                                .await
+                                .map_err(|error| LayerPipelineFailure { error })?;
+                        }
+                        if let Some(ref p) = progress {
+                            p.send(PullProgress::LayerMaterializeComplete {
+                                layer_index: i,
+                                diff_id: diff_id.clone().into(),
+                            });
+                        }
+
+                        tracing::debug!(
+                            layer_index = i,
+                            diff_id = %diff_id,
+                            elapsed_ms = layer_started_at.elapsed().as_millis(),
+                            "layer reused existing EROFS image"
+                        );
+
+                        return Ok::<_, LayerPipelineFailure>(LayerPipelineTreeSuccess {
+                            layer_index: i,
+                            tree: None,
+                            data_map: None,
+                        });
+                    }
+
+                    if staged_tar_path.is_none() && _staging.is_some() {
+                        return Err(LayerPipelineFailure {
+                            error: ImageError::ManifestParse(format!(
+                                "archive has no staged layer {}",
+                                diff_id
+                            )),
+                        });
+                    }
+                    if staged_tar_path.is_none()
+                        && let Err(error) = layer
+                            .download(&client, &oci_ref, size, force, progress.as_ref(), i)
+                            .await
+                    {
+                        return Err(LayerPipelineFailure { error });
+                    }
+
+                    // Acquire per-layer flock to coordinate with concurrent pulls.
+                    let materializer_guard = CacheLockGuard::acquire_async(&lock_path)
+                        .await
+                        .map_err(|error| LayerPipelineFailure { error })?;
+
+                    // Re-check after lock — another process may have materialized it.
+                    if cache::is_valid_erofs_artifact_async(&erofs_path).await && !layer_force {
+                        if !all_layers_valid && let Some(path) = &staged_tar_path {
+                            verify_staged_layer(path, media_type.as_deref(), &diff_id_digest)
+                                .await
+                                .map_err(|error| LayerPipelineFailure { error })?;
+                        }
+                        if let Some(ref p) = progress {
+                            p.send(PullProgress::LayerMaterializeComplete {
+                                layer_index: i,
+                                diff_id: diff_id.clone().into(),
+                            });
+                        }
+                        return Ok::<_, LayerPipelineFailure>(LayerPipelineTreeSuccess {
+                            layer_index: i,
+                            tree: None,
+                            data_map: None,
+                        });
+                    }
+
+                    if let Some(ref p) = progress {
+                        p.send(PullProgress::LayerMaterializeStarted {
+                            layer_index: i,
+                            diff_id: diff_id.clone().into(),
+                        });
+                    }
+
+                    let tar_path = staged_tar_path
+                        .clone()
+                        .unwrap_or_else(|| layer.tar_path_ref());
+                    let tar_size =
+                        tokio::fs::metadata(&tar_path)
+                            .await
+                            .map_err(|e| LayerPipelineFailure {
+                                error: ImageError::Cache {
+                                    path: tar_path.clone(),
+                                    source: e,
+                                },
+                            })?;
+                    let tar_file = tokio::fs::File::open(&tar_path).await.map_err(|e| {
+                        LayerPipelineFailure {
+                            error: ImageError::Cache {
+                                path: tar_path.clone(),
+                                source: e,
+                            },
+                        }
+                    })?;
+
+                    let compression =
+                        Compression::from_media_type(media_type.as_deref().unwrap_or(""));
+                    let limits = ResourceLimits::default();
+                    let spool_path = layer_work_path(&tmp_dir, &diff_id_digest, "spool");
+                    let ingest_started_at = Instant::now();
+                    let ingest_result = tar::ingest_compressed_tar(
+                        MaterializeProgressReader::new(
+                            tar_file,
+                            progress.clone(),
+                            i,
+                            tar_size.len(),
+                        ),
+                        compression,
+                        &limits,
+                        Some(&spool_path),
+                    )
+                    .await
+                    .map_err(|e| LayerPipelineFailure {
+                        error: ImageError::Materialize {
+                            digest: diff_id.clone(),
+                            message: format!("tar ingestion failed: {e}"),
+                            source: None,
+                        },
+                    })?;
+
+                    // Verify the uncompressed digest matches the config's diff_id.
+                    // This is the OCI content trust check — the diff_id is signed
+                    // as part of the image config, so a tampered layer would be caught.
+                    let expected_diff_hex = diff_id_digest.hex();
+                    if ingest_result.uncompressed_digest != expected_diff_hex {
+                        return Err(LayerPipelineFailure {
+                            error: ImageError::DigestMismatch {
+                                digest: diff_id.clone(),
+                                expected: format!("sha256:{expected_diff_hex}"),
+                                actual: format!("sha256:{}", ingest_result.uncompressed_digest),
+                            },
+                        });
+                    }
+                    let tree = ingest_result.tree;
+
+                    tracing::debug!(
+                        layer_index = i,
+                        diff_id = %diff_id,
+                        tar_bytes = tar_size.len(),
+                        elapsed_ms = ingest_started_at.elapsed().as_millis(),
+                        "layer tar ingestion completed (diff_id verified)"
+                    );
+
+                    if let Some(ref p) = progress {
+                        p.send(PullProgress::LayerMaterializeWriting { layer_index: i });
+                    }
+
+                    // Write to a temp file, then atomic rename to the final path.
+                    // This prevents partial files from being visible to concurrent readers.
+                    let temp_path = layer_work_path(&tmp_dir, &diff_id_digest, "erofs.part");
+                    let erofs_final = erofs_path.clone();
+                    let diff_id_for_join = diff_id.clone();
+                    let write_started_at = Instant::now();
+                    let worker_leases = _leases.clone();
+                    let (data_map, mut tree) = tokio::task::spawn_blocking(move || {
+                        let _protection = (materializer_guard, worker_leases);
+                        let data_map = erofs::write_erofs(&tree, &temp_path)?;
+                        std::fs::rename(&temp_path, &erofs_final).map_err(erofs::ErofsError::Io)?;
+                        Ok::<(erofs::ErofsDataMap, FileTree), erofs::ErofsError>((data_map, tree))
+                    })
+                    .await
+                    .map_err(|e| LayerPipelineFailure {
+                        error: ImageError::Materialize {
+                            digest: diff_id_for_join.clone(),
+                            message: format!("EROFS write task failed: {e}"),
+                            source: None,
+                        },
+                    })?
+                    .map_err(|e| LayerPipelineFailure {
+                        error: ImageError::Materialize {
+                            digest: diff_id.clone(),
+                            message: format!("EROFS write failed: {e}"),
+                            source: None,
+                        },
+                    })?;
+
+                    // Strip file data from the retained tree to reduce memory.
+                    // Only directory structure and metadata are needed for fsmeta merge.
+                    tree.strip_file_data();
+
+                    tracing::debug!(
+                        layer_index = i,
+                        diff_id = %diff_id,
+                        elapsed_ms = write_started_at.elapsed().as_millis(),
+                        total_elapsed_ms = layer_started_at.elapsed().as_millis(),
+                        "layer EROFS image write completed"
+                    );
+
+                    // Tarball cleanup is deferred — with duplicate layer digests,
+                    // another task may still need the same blob. Tarballs are cleaned
+                    // up after all layer tasks complete.
+                    let _ = tokio::fs::remove_file(&spool_path).await;
+
+                    if let Some(ref p) = progress {
+                        p.send(PullProgress::LayerMaterializeComplete {
+                            layer_index: i,
+                            diff_id: diff_id.clone().into(),
+                        });
+                    }
+
+                    Ok::<_, LayerPipelineFailure>(LayerPipelineTreeSuccess {
+                        layer_index: i,
+                        tree: Some(tree),
+                        data_map: Some(data_map),
+                    })
+                })
+            })
+            .collect();
+
+        // Wait for all layer tasks to complete. Collect trees + data maps.
+        let mut layer_results = wait_for_layer_tree_pipeline(layer_tasks).await?;
+        layer_results.sort_by_key(|r| r.layer_index);
+
+        if !materialization.includes_layered() {
+            return Ok(());
+        }
+
+        // Generate fsmeta + VMDK if not already cached.
+        let fsmeta_path = self.cache.fsmeta_erofs_path(manifest_digest);
+        let vmdk_path = self.cache.vmdk_path(manifest_digest);
+
+        if cache::is_valid_erofs_artifact_async(&fsmeta_path).await
+            && path_exists_async(&vmdk_path).await
+            && !force
+        {
+            tracing::debug!(
+                manifest_digest = %manifest_digest,
+                "fsmeta + VMDK already cached, skipping generation"
+            );
+            return Ok(());
+        }
+
+        // Acquire flock for fsmeta/VMDK generation.
+        let fsmeta_lock_path = self.cache.fsmeta_erofs_lock_path(manifest_digest);
+        let materializer_guard = Arc::new(CacheLockGuard::acquire_async(&fsmeta_lock_path).await?);
+
+        // Re-check after lock acquisition.
+        if cache::is_valid_erofs_artifact_async(&fsmeta_path).await
+            && path_exists_async(&vmdk_path).await
+            && !force
+        {
+            return Ok(());
+        }
+
+        // Newly written layers already carry their data-stripped tree and
+        // block map. For cache hits, reconstruct the same inputs directly
+        // from EROFS. This is what lets a new image reuse shared layers even
+        // when it needs a new manifest-specific fsmeta artifact.
+        let cache = self.cache.clone();
+        let diff_ids = diff_ids.to_vec();
+        let manifest_digest_for_inputs = manifest_digest.to_string();
+        let input_guard = materializer_guard.clone();
+        let (layer_trees, layer_data_maps) = tokio::task::spawn_blocking(move || {
+            let _guard = input_guard;
+            collect_layered_inputs_from_erofs(
+                &cache,
+                &diff_ids,
+                layer_results,
+                &manifest_digest_for_inputs,
+            )
+        })
+        .await
+        .map_err(|error| ImageError::Io(io::Error::other(error)))??;
+
+        // Merge layer trees with provenance tracking.
+        if let Some(ref p) = progress {
+            p.send(PullProgress::StitchMergingTrees {
+                layer_count: layer_trees.len(),
+            });
+        }
+        let (merged_tree, provenance) = crate::tree::merge_layers_with_provenance(layer_trees);
+
+        // Generate fsmeta and VMDK.
+        let fsmeta_path_for_write = fsmeta_path.clone();
+        let vmdk_path_for_write = vmdk_path.clone();
+        let work_dir = self.cache.work_dir(manifest_digest);
+        let manifest_digest_str = manifest_digest.to_string();
+
+        // Collect per-layer EROFS paths for the VMDK extents.
+        let layer_erofs_paths: Vec<std::path::PathBuf> = validated_diff_ids
+            .iter()
+            .map(|d| self.cache.layer_erofs_path(d))
+            .collect();
+
+        let stitch_progress = progress.clone();
+        let worker_cache = self.cache.clone();
+        tokio::task::spawn_blocking(move || {
+            // Both the materializer mutex and the operation pins must outlive cancellation.
+            let _protection = (materializer_guard, worker_cache);
+            std::fs::create_dir_all(&work_dir).map_err(|e| ImageError::Cache {
+                path: work_dir.clone(),
+                source: e,
+            })?;
+            let _work_guard = scopeguard::guard((), |_| {
+                let _ = std::fs::remove_dir_all(&work_dir);
+            });
+
+            // Write fsmeta.
+            if let Some(ref p) = stitch_progress {
+                p.send(PullProgress::StitchWritingFsmeta);
+            }
+            let temp_fsmeta = work_dir.join("fsmeta.erofs");
+            erofs::fsmeta::write_fsmeta(&merged_tree, &provenance, &layer_data_maps, &temp_fsmeta)
+                .map_err(|e| ImageError::Materialize {
+                    digest: manifest_digest_str.clone(),
+                    message: format!("fsmeta write failed: {e}"),
+                    source: None,
+                })?;
+
+            std::fs::rename(&temp_fsmeta, &fsmeta_path_for_write).map_err(|e| {
+                ImageError::Cache {
+                    path: fsmeta_path_for_write.clone(),
+                    source: e,
+                }
+            })?;
+
+            // Write VMDK descriptor.
+            if let Some(ref p) = stitch_progress {
+                p.send(PullProgress::StitchWritingVmdk);
+            }
+            let temp_vmdk = work_dir.join("rootfs.vmdk");
+            let mut extents: Vec<&std::path::Path> = vec![&fsmeta_path_for_write];
+            extents.extend(layer_erofs_paths.iter().map(|p| p.as_path()));
+
+            crate::stitch::write_vmdk_descriptor(&temp_vmdk, &extents).map_err(|e| {
+                ImageError::Materialize {
+                    digest: manifest_digest_str.clone(),
+                    message: format!("VMDK write failed: {e}"),
+                    source: None,
+                }
+            })?;
+
+            std::fs::rename(&temp_vmdk, &vmdk_path_for_write).map_err(|e| ImageError::Cache {
+                path: vmdk_path_for_write.clone(),
+                source: e,
+            })?;
+
+            Ok::<(), ImageError>(())
+        })
+        .await
+        .map_err(|e| ImageError::Io(io::Error::other(e)))??;
+
+        if let Some(ref p) = progress {
+            p.send(PullProgress::StitchComplete);
+        }
+
+        Ok(())
+    }
+
+    /// Re-stitch the VMDK descriptor from an existing fsmeta + layer EROFS files.
+    ///
+    /// Called when fsmeta and all layer EROFSes are present but only the VMDK
+    /// descriptor is missing (e.g. the user deleted it manually, or a previous
+    /// pull was interrupted between fsmeta rename and VMDK rename).
+    async fn regenerate_vmdk_only(
+        &self,
+        manifest_digest: &Digest,
+        validated_diff_ids: &[Digest],
+        progress: Option<&PullProgressSender>,
+    ) -> ImageResult<()> {
+        let cache = self.cache.clone();
+        cache
+            .write_vmdk_async(
+                manifest_digest,
+                validated_diff_ids,
+                VmdkWriteMode::KeepExisting,
+                progress.cloned(),
+            )
+            .await
+    }
+
+    // NOTE: materialize_flat_image was removed — replaced by fsmeta + VMDK generation
+    // in materialize_layer_stage().
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl<R: AsyncRead + Unpin> AsyncRead for MaterializeProgressReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let bytes_read = (buf.filled().len() - before) as u64;
+                if bytes_read > 0 {
+                    self.bytes_read += bytes_read;
+                    let should_emit_progress =
+                        self.bytes_read.saturating_sub(self.last_emitted_bytes)
+                            >= MATERIALIZE_PROGRESS_EMIT_BYTES
+                            || self.bytes_read >= self.total_bytes;
+
+                    if should_emit_progress {
+                        if let Some(progress) = &self.progress {
+                            progress.send(PullProgress::LayerMaterializeProgress {
+                                layer_index: self.layer_index,
+                                bytes_read: self.bytes_read.min(self.total_bytes),
+                                total_bytes: self.total_bytes,
+                            });
+                        }
+                        self.last_emitted_bytes = self.bytes_read;
+                    }
+                }
+
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
+/// Detect the media type of a manifest from its JSON content.
+fn detect_manifest_media_type(bytes: &[u8]) -> String {
+    // Try to parse the mediaType field from JSON.
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        if let Some(mt) = v.get("mediaType").and_then(|v| v.as_str()) {
+            return mt.to_string();
+        }
+
+        // Heuristic: if it has "manifests" array, it's an index.
+        if v.get("manifests").is_some() {
+            return "application/vnd.oci.image.index.v1+json".to_string();
+        }
+
+        // If it has "layers" array, it's an image manifest.
+        if v.get("layers").is_some() {
+            return "application/vnd.oci.image.manifest.v1+json".to_string();
+        }
+    }
+
+    // Default to OCI image manifest.
+    "application/vnd.oci.image.manifest.v1+json".to_string()
+}
+
+/// Resolve the best matching platform-specific manifest digest.
+pub(super) fn resolve_platform_digest(
+    manifests: &[ImageIndexEntry],
+    target: &Platform,
+) -> Option<String> {
+    let mut arch_only_match: Option<String> = None;
+    let target_os = target.os.to_string();
+    let target_arch = target.arch.to_string();
+
+    for entry in manifests {
+        if entry.media_type.contains("attestation") {
+            continue;
+        }
+
+        let Some(platform) = entry.platform.as_ref() else {
+            continue;
+        };
+        if platform.os.to_string() != target_os || platform.architecture.to_string() != target_arch
+        {
+            continue;
+        }
+
+        match target.variant.as_deref() {
+            Some(target_variant) if platform.variant.as_deref() == Some(target_variant) => {
+                return Some(entry.digest.clone());
+            }
+            Some(_) => {
+                if arch_only_match.is_none() {
+                    arch_only_match = Some(entry.digest.clone());
+                }
+            }
+            None => return Some(entry.digest.clone()),
+        }
+    }
+
+    arch_only_match
+}
+
+/// Build a pull result from cached image metadata.
+async fn verify_staged_layer(
+    path: &Path,
+    media_type: Option<&str>,
+    diff_id: &Digest,
+) -> ImageResult<()> {
+    let file = tokio::fs::File::open(path).await?;
+    let compression = Compression::from_media_type(media_type.unwrap_or_default());
+    let actual =
+        tar::hash_compressed_tar(file, compression, ResourceLimits::default().max_total_size)
+            .await
+            .map_err(|error| ImageError::Materialize {
+                digest: diff_id.to_string(),
+                message: format!("archive layer verification failed: {error}"),
+                source: None,
+            })?;
+    if actual != diff_id.hex() {
+        return Err(ImageError::DigestMismatch {
+            digest: diff_id.to_string(),
+            expected: diff_id.to_string(),
+            actual: format!("sha256:{actual}"),
+        });
+    }
+    Ok(())
+}
+
+fn cached_pull_result(metadata: &CachedImageMetadata) -> ImageResult<PullResult> {
+    let manifest_digest: Digest = metadata.manifest_digest.parse()?;
+    let layer_diff_ids = metadata
+        .layers
+        .iter()
+        .map(|layer| layer.diff_id.parse())
+        .collect::<ImageResult<Vec<Digest>>>()?;
+
+    Ok(PullResult {
+        layer_diff_ids,
+        config: metadata.config.clone(),
+        manifest_digest,
+        cached: true,
+    })
+}
+
+/// Assemble the metadata trees and block maps needed by fsmeta in layer order.
+///
+/// A freshly materialized layer supplies these values directly. Cache hits are
+/// reconstructed from the verified EROFS artifact, so manifest-specific output
+/// generation never requires the discarded registry tarball.
+fn collect_layered_inputs_from_erofs(
+    cache: &GlobalCache,
+    diff_ids: &[String],
+    results: Vec<LayerPipelineTreeSuccess>,
+    manifest_digest: &str,
+) -> ImageResult<(Vec<FileTree>, Vec<erofs::ErofsDataMap>)> {
+    let mut inputs_by_diff_id: HashMap<String, (FileTree, erofs::ErofsDataMap)> = HashMap::new();
+    for mut result in results {
+        match (result.tree.take(), result.data_map.take()) {
+            (Some(tree), Some(data_map)) => {
+                let diff_id =
+                    diff_ids
+                        .get(result.layer_index)
+                        .ok_or_else(|| ImageError::Materialize {
+                            digest: manifest_digest.to_string(),
+                            message: "layer pipeline returned an out-of-range index".into(),
+                            source: None,
+                        })?;
+                inputs_by_diff_id
+                    .entry(diff_id.clone())
+                    .or_insert((tree, data_map));
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ImageError::Materialize {
+                    digest: manifest_digest.to_string(),
+                    message: "layer pipeline returned an incomplete tree/block-map pair".into(),
+                    source: None,
+                });
+            }
+        }
+    }
+
+    for diff_id in diff_ids {
+        if inputs_by_diff_id.contains_key(diff_id) {
+            continue;
+        }
+        let digest: Digest = diff_id.parse().map_err(|_| {
+            ImageError::ManifestParse(format!("invalid cached layer diff_id: {diff_id}"))
+        })?;
+        let path = cache.layer_erofs_path(&digest);
+        let input = read_erofs_layer_metadata(&path).map_err(|source| ImageError::Materialize {
+            digest: diff_id.clone(),
+            message: "failed to reconstruct cached EROFS metadata for fsmeta".into(),
+            source: Some(Box::new(source)),
+        })?;
+        inputs_by_diff_id.insert(diff_id.clone(), input);
+    }
+
+    let mut trees = Vec::with_capacity(diff_ids.len());
+    let mut data_maps = Vec::with_capacity(diff_ids.len());
+    for diff_id in diff_ids {
+        let (tree, data_map) =
+            inputs_by_diff_id
+                .get(diff_id)
+                .ok_or_else(|| ImageError::Materialize {
+                    digest: diff_id.clone(),
+                    message: "missing reconstructed EROFS layer input".into(),
+                    source: None,
+                })?;
+        trees.push(tree.clone());
+        data_maps.push(data_map.clone());
+    }
+
+    Ok((trees, data_maps))
+}
+
+/// Read only the metadata and regular-file block placement needed by fsmeta.
+fn read_erofs_layer_metadata(path: &Path) -> io::Result<(FileTree, erofs::ErofsDataMap)> {
+    let file = std::fs::File::open(path)?;
+    let total_blocks = file
+        .metadata()?
+        .len()
+        .div_ceil(u64::from(crate::erofs::format::EROFS_BLKSIZ));
+    let total_blocks = u32::try_from(total_blocks)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "EROFS layer is too large"))?;
+    let mut reader = erofs::ErofsReader::new(file)?;
+    let (root_metadata, root_xattrs) = reader.root_directory_metadata()?;
+    let mut root = DirectoryNode::new(root_metadata);
+    root.xattrs = root_xattrs;
+    let mut tree = FileTree { root };
+    let mut hardlinks: HashMap<u32, RegularFileId> = HashMap::new();
+    let mut file_blocks = HashMap::new();
+
+    reader.walk_entries_with_path_bytes::<io::Error, _>(|reader, path, entry| {
+        let node = match entry.kind {
+            erofs::ErofsEntryKind::RegularFile => {
+                let id = *hardlinks.entry(entry.nid).or_default();
+                file_blocks.insert(entry.path.clone(), reader.file_block_mapping(entry.nid)?);
+                TreeNode::RegularFile(RegularFileNode {
+                    id,
+                    metadata: entry.metadata,
+                    xattrs: entry.xattrs,
+                    // Fsmeta takes the logical size and source blocks from
+                    // ErofsDataMap, so retaining file contents is unnecessary.
+                    data: FileData::Memory(Vec::new()),
+                    nlink: 1,
+                })
+            }
+            erofs::ErofsEntryKind::Directory => {
+                let mut directory = DirectoryNode::new(entry.metadata);
+                directory.xattrs = entry.xattrs;
+                TreeNode::Directory(directory)
+            }
+            erofs::ErofsEntryKind::Symlink => TreeNode::Symlink(SymlinkNode {
+                metadata: entry.metadata,
+                target: reader.read_link_by_nid(entry.nid)?,
+            }),
+            erofs::ErofsEntryKind::CharDevice | erofs::ErofsEntryKind::BlockDevice => {
+                let (major, minor) = entry.rdev.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "EROFS device entry is missing major/minor",
+                    )
+                })?;
+                let device = DeviceNode {
+                    metadata: entry.metadata,
+                    major,
+                    minor,
+                };
+                if entry.kind == erofs::ErofsEntryKind::CharDevice {
+                    TreeNode::CharDevice(device)
+                } else {
+                    TreeNode::BlockDevice(device)
+                }
+            }
+            erofs::ErofsEntryKind::Fifo => TreeNode::Fifo(entry.metadata),
+            erofs::ErofsEntryKind::Socket => TreeNode::Socket(entry.metadata),
+        };
+        tree.insert(path, node).map_err(io::Error::other)
+    })?;
+
+    Ok((
+        tree,
+        erofs::ErofsDataMap {
+            file_blocks,
+            total_blocks,
+        },
+    ))
+}
+
+fn resolve_cached_pull_result(
+    cache: &GlobalCache,
+    reference: &oci_client::Reference,
+    options: &PullOptions,
+) -> ImageResult<Option<CachedPullInfo>> {
+    resolve_cached_pull_result_for_platform(cache, reference, options, &Platform::host_linux())
+}
+
+fn resolve_cached_pull_result_for_platform(
+    cache: &GlobalCache,
+    reference: &oci_client::Reference,
+    options: &PullOptions,
+    platform: &Platform,
+) -> ImageResult<Option<CachedPullInfo>> {
+    if options.force || options.pull_policy == PullPolicy::Always {
+        return Ok(None);
+    }
+
+    let Some(metadata) = cache.read_image_entry(reference)? else {
+        return Ok(None);
+    };
+    if !metadata.pull_auth.allows_unauthenticated_cache_hit() {
+        return Ok(None);
+    }
+    let metadata = metadata.metadata;
+
+    let _leases = match cache.metadata_paths(&metadata) {
+        Ok(paths) => cache.lease_paths(paths)?,
+        Err(_) => return Ok(None),
+    };
+
+    // Check that all per-layer EROFS images exist.
+    let cached_diff_ids = match metadata
+        .layers
+        .iter()
+        .map(|layer| layer.diff_id.parse())
+        .collect::<ImageResult<Vec<Digest>>>()
+    {
+        Ok(digests) => digests,
+        Err(_) => return Ok(None),
+    };
+    if !cache.all_layers_materialized(&cached_diff_ids) {
+        return Ok(None);
+    }
+
+    let manifest_digest = match metadata.manifest_digest.parse::<Digest>() {
+        Ok(digest) => digest,
+        Err(_) => return Ok(None),
+    };
+    if options.materialization.includes_layered()
+        && (!cache.is_fsmeta_materialized(&manifest_digest)
+            || !cache.is_vmdk_materialized(&manifest_digest))
+    {
+        return Ok(None);
+    }
+    if options.materialization.includes_flat()
+        && flat::read_current_flat_ref(cache, &manifest_digest, &cached_diff_ids, platform)?
+            .is_none()
+    {
+        return Ok(None);
+    }
+
+    let result = match cached_pull_result(&metadata) {
+        Ok(result) => result,
+        Err(_) => return Ok(None),
+    };
+
+    Ok(Some(CachedPullInfo { result, metadata }))
+}
+
+async fn wait_for_layer_tree_pipeline(
+    layer_tasks: Vec<JoinHandle<Result<LayerPipelineTreeSuccess, LayerPipelineFailure>>>,
+) -> ImageResult<Vec<LayerPipelineTreeSuccess>> {
+    let outcomes = futures::future::join_all(layer_tasks).await;
+    let mut results = Vec::new();
+    let mut first_error: Option<ImageError> = None;
+
+    for outcome in outcomes {
+        match outcome {
+            Ok(Ok(result)) => results.push(result),
+            Ok(Err(failure)) => {
+                if first_error.is_none() {
+                    first_error = Some(failure.error);
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(ImageError::Io(io::Error::other(format!(
+                        "layer task failed: {error}"
+                    ))));
+                }
+            }
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    Ok(results)
+}
+
+async fn resolve_cached_pull_result_async(
+    cache: &GlobalCache,
+    reference: &oci_client::Reference,
+    options: &PullOptions,
+    platform: &Platform,
+    auth: &oci_client::secrets::RegistryAuth,
+) -> ImageResult<Option<CachedPullInfo>> {
+    if is_authenticated(auth) || options.force || options.pull_policy == PullPolicy::Always {
+        return Ok(None);
+    }
+
+    let Some(metadata) = cache.read_image_entry_async(reference).await? else {
+        return Ok(None);
+    };
+    if !metadata.pull_auth.allows_unauthenticated_cache_hit() {
+        return Ok(None);
+    }
+    let metadata = metadata.metadata;
+
+    resolve_cached_metadata_pull_result_async(cache, metadata, options.materialization, platform)
+        .await
+}
+
+async fn resolve_cached_pull_result_by_manifest_digest_async(
+    cache: &GlobalCache,
+    manifest_digest: &Digest,
+    metadata_only: bool,
+    allow_restricted_provenance: bool,
+) -> ImageResult<Option<CachedPullInfo>> {
+    let expected = manifest_digest.to_string();
+    let mut entries = tokio::fs::read_dir(cache.manifests_dir())
+        .await
+        .map_err(|e| ImageError::Cache {
+            path: cache.manifests_dir().to_path_buf(),
+            source: e,
+        })?;
+
+    while let Some(entry) = entries.next_entry().await.map_err(|e| ImageError::Cache {
+        path: cache.manifests_dir().to_path_buf(),
+        source: e,
+    })? {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+
+        let Some(metadata) = cache
+            .read_image_metadata_matching_async(path, expected.clone())
+            .await?
+        else {
+            continue;
+        };
+        if !allow_restricted_provenance && !metadata.pull_auth.allows_unauthenticated_cache_hit() {
+            continue;
+        }
+
+        if let Some(cached) =
+            resolve_snapshot_metadata(cache, metadata.metadata, metadata_only).await?
+        {
+            return Ok(Some(cached));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn resolve_snapshot_metadata(
+    cache: &GlobalCache,
+    metadata: CachedImageMetadata,
+    metadata_only: bool,
+) -> ImageResult<Option<CachedPullInfo>> {
+    if metadata_only {
+        return Ok(cached_pull_result(&metadata)
+            .ok()
+            .map(|result| CachedPullInfo { result, metadata }));
+    }
+    resolve_cached_metadata_pull_result_async(
+        cache,
+        metadata,
+        RootfsMaterialization::Layered,
+        &Platform::host_linux(),
+    )
+    .await
+}
+
+async fn resolve_cached_metadata_pull_result_async(
+    cache: &GlobalCache,
+    metadata: CachedImageMetadata,
+    materialization: RootfsMaterialization,
+    platform: &Platform,
+) -> ImageResult<Option<CachedPullInfo>> {
+    let _leases = match cache.metadata_paths(&metadata) {
+        Ok(paths) => cache.lease_paths_async(paths).await?,
+        Err(_) => return Ok(None),
+    };
+    let cached_diff_ids = match metadata
+        .layers
+        .iter()
+        .map(|layer| layer.diff_id.parse())
+        .collect::<ImageResult<Vec<Digest>>>()
+    {
+        Ok(digests) => digests,
+        Err(_) => return Ok(None),
+    };
+    if !all_layers_materialized_async(cache, &cached_diff_ids).await {
+        return Ok(None);
+    }
+
+    let manifest_digest = match metadata.manifest_digest.parse::<Digest>() {
+        Ok(digest) => digest,
+        Err(_) => return Ok(None),
+    };
+    if materialization.includes_layered()
+        && (!cache::is_valid_erofs_artifact_async(&cache.fsmeta_erofs_path(&manifest_digest)).await
+            || !path_exists_async(&cache.vmdk_path(&manifest_digest)).await)
+    {
+        return Ok(None);
+    }
+    if materialization.includes_flat()
+        && flat::read_current_flat_ref(cache, &manifest_digest, &cached_diff_ids, platform)?
+            .is_none()
+    {
+        return Ok(None);
+    }
+
+    let result = match cached_pull_result(&metadata) {
+        Ok(result) => result,
+        Err(_) => return Ok(None),
+    };
+
+    Ok(Some(CachedPullInfo { result, metadata }))
+}
+
+async fn all_layers_materialized_async(cache: &GlobalCache, diff_ids: &[Digest]) -> bool {
+    for diff_id in diff_ids {
+        if !cache::is_valid_erofs_artifact_async(&cache.layer_erofs_path(diff_id)).await {
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn path_exists_async(path: &Path) -> bool {
+    tokio::fs::metadata(path).await.is_ok()
+}
+
+fn layer_pipeline_concurrency(layer_count: usize) -> usize {
+    let host_limit = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_mul(2))
+        .unwrap_or(8)
+        .clamp(4, MAX_LAYER_PIPELINE_CONCURRENCY);
+
+    host_limit.min(layer_count.max(1))
+}
+
+fn layer_work_path(tmp_dir: &Path, diff_id: &Digest, suffix: &str) -> PathBuf {
+    tmp_dir.join(format!("{}.{}", diff_id.to_path_safe(), suffix))
+}
+
+fn is_authenticated(auth: &oci_client::secrets::RegistryAuth) -> bool {
+    !matches!(auth, oci_client::secrets::RegistryAuth::Anonymous)
+}
+
+fn pull_auth_provenance(auth: &oci_client::secrets::RegistryAuth) -> CacheAuthProvenance {
+    if is_authenticated(auth) {
+        CacheAuthProvenance::Authenticated
+    } else {
+        CacheAuthProvenance::Anonymous
+    }
+}
+
+fn json_bytes_to_string(bytes: &[u8], context: &str) -> ImageResult<String> {
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|e| ImageError::ConfigParse(format!("{context} is not UTF-8 JSON: {e}")))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use oci_client::manifest::{ImageIndexEntry, Platform as OciPlatform};
+
+    use super::{
+        LayerDescriptor, MaterializeLayersRequest, Platform, layer_work_path,
+        read_erofs_layer_metadata, resolve_cached_metadata_pull_result_async,
+        resolve_cached_pull_result, resolve_platform_digest,
+    };
+    use crate::{
+        cache::{CacheAuthProvenance, CachedImageMetadata, CachedLayerMetadata, GlobalCache},
+        config::ImageConfig,
+        digest::Digest,
+        erofs,
+        error::ImageError,
+        ext4::EXT4_ROOTFS_MATERIALIZER_ABI,
+        pull::{PullOptions, PullPolicy, RootfsMaterialization},
+        tree::{
+            FileData, FileTree, InodeMetadata, RegularFileId, RegularFileNode, TreeNode, Xattr,
+        },
+    };
+
+    #[test]
+    fn test_platform_resolver_prefers_exact_variant() {
+        let manifests = vec![
+            ImageIndexEntry {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:arch-only".into(),
+                size: 1,
+                platform: Some(OciPlatform {
+                    architecture: "arm".into(),
+                    os: "linux".into(),
+                    os_version: None,
+                    os_features: None,
+                    variant: None,
+                    features: None,
+                }),
+                annotations: None,
+                artifact_type: None,
+            },
+            ImageIndexEntry {
+                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+                digest: "sha256:exact".into(),
+                size: 1,
+                platform: Some(OciPlatform {
+                    architecture: "arm".into(),
+                    os: "linux".into(),
+                    os_version: None,
+                    os_features: None,
+                    variant: Some("v7".into()),
+                    features: None,
+                }),
+                annotations: None,
+                artifact_type: None,
+            },
+        ];
+
+        let digest =
+            resolve_platform_digest(&manifests, &Platform::with_variant("linux", "arm", "v7"));
+        assert_eq!(digest.as_deref(), Some("sha256:exact"));
+    }
+
+    #[test]
+    fn test_layer_work_path_uses_path_safe_digest() {
+        let temp = tempdir().unwrap();
+        let digest = Digest::new("sha256", "abc123");
+
+        let path = layer_work_path(temp.path(), &digest, "erofs.part");
+        let file_name = path.file_name().unwrap().to_string_lossy();
+
+        assert_eq!(file_name, "sha256_abc123.erofs.part");
+        assert!(!file_name.contains(':'));
+    }
+
+    #[test]
+    fn test_resolve_cached_pull_result_if_missing_uses_complete_cache() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/alpine".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true, true]);
+
+        let cached = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::IfMissing,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("expected cached pull result");
+
+        assert!(cached.result.cached);
+        assert_eq!(cached.result.layer_diff_ids.len(), 2);
+        assert_eq!(
+            cached.result.manifest_digest.to_string(),
+            metadata.manifest_digest
+        );
+        assert_eq!(cached.result.config.env, metadata.config.env);
+        assert_eq!(
+            cached.result.layer_diff_ids[0].to_string(),
+            metadata.layers[0].diff_id
+        );
+        assert_eq!(
+            cached.result.layer_diff_ids[1].to_string(),
+            metadata.layers[1].diff_id
+        );
+    }
+
+    #[test]
+    fn test_resolve_cached_pull_result_never_uses_complete_cache() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/busybox:latest".parse().unwrap();
+        write_cached_image_fixture(&cache, &reference, &[true]);
+
+        let cached = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::Never,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cached.is_some());
+        assert!(cached.unwrap().result.cached);
+    }
+
+    #[test]
+    fn test_pull_cached_uses_complete_cache() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/alpine".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+
+        let cached = super::Registry::pull_cached(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::IfMissing,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("expected cached pull result");
+
+        assert!(cached.0.cached);
+        assert_eq!(
+            cached.0.manifest_digest.to_string(),
+            metadata.manifest_digest
+        );
+        assert_eq!(cached.1.manifest_digest, metadata.manifest_digest);
+    }
+
+    #[tokio::test]
+    async fn test_pull_cached_by_manifest_digest_finds_tag_keyed_metadata() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/python:3.12".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true, true]);
+        let manifest_digest = parse_digest(&metadata.manifest_digest);
+
+        let cached = super::Registry::pull_cached_by_manifest_digest(&cache, &manifest_digest)
+            .await
+            .unwrap()
+            .expect("expected cached pull result by manifest digest");
+
+        assert!(cached.0.cached);
+        assert_eq!(
+            cached.0.manifest_digest.to_string(),
+            metadata.manifest_digest
+        );
+        assert_eq!(cached.1.manifest_digest, metadata.manifest_digest);
+    }
+
+    #[tokio::test]
+    async fn snapshot_flat_metadata_does_not_require_disks_or_accept_moved_tags() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/alpine:latest".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[false, false]);
+        let digest = parse_digest(&metadata.manifest_digest);
+        for refs in [vec![reference.clone()], vec![]] {
+            let found = super::Registry::pull_snapshot_cached(
+                &cache,
+                &refs,
+                &digest,
+                RootfsMaterialization::Flat,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(found.0.manifest_digest, digest);
+            assert_eq!(found.0.config.env, metadata.config.env);
+            assert!(
+                super::Registry::pull_snapshot_cached(
+                    &cache,
+                    &refs,
+                    &digest,
+                    RootfsMaterialization::Layered
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+        }
+        let other = parse_digest(&format!("sha256:{}", "f".repeat(64)));
+        assert!(
+            super::Registry::pull_snapshot_cached(
+                &cache,
+                &[reference],
+                &other,
+                RootfsMaterialization::Flat
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pull_cached_by_manifest_digest_requires_complete_artifacts() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/python:3.12".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true, false]);
+        let manifest_digest = parse_digest(&metadata.manifest_digest);
+
+        let cached = super::Registry::pull_cached_by_manifest_digest(&cache, &manifest_digest)
+            .await
+            .unwrap();
+
+        assert!(cached.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pull_never_returns_not_cached_when_any_layer_is_missing() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/debian:stable".parse().unwrap();
+        write_cached_image_fixture(&cache, &reference, &[true, false]);
+
+        let cached = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::Never,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(cached.is_none());
+
+        let registry = super::Registry::new(Platform::default(), cache).unwrap();
+        let err = registry
+            .pull(
+                &reference,
+                &PullOptions {
+                    pull_policy: PullPolicy::Never,
+                    force: false,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(err, Err(ImageError::NotCached { .. })));
+    }
+
+    #[test]
+    fn test_resolve_cached_pull_result_ignores_corrupt_metadata_file() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/ubuntu:latest".parse().unwrap();
+        let metadata_path = image_metadata_path(temp.path(), &reference);
+        std::fs::write(&metadata_path, b"{ definitely not json").unwrap();
+
+        let cached = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::IfMissing,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cached.is_none());
+    }
+
+    #[test]
+    fn test_resolve_cached_pull_result_skips_cache_for_force_and_always() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/fedora:latest".parse().unwrap();
+        write_cached_image_fixture(&cache, &reference, &[true]);
+
+        let forced = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::IfMissing,
+                force: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(forced.is_none());
+
+        let always = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::Always,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(always.is_none());
+    }
+
+    #[test]
+    fn test_resolve_cached_pull_result_ignores_invalid_digest_metadata() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/redis:latest".parse().unwrap();
+        let mut metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+        metadata.layers[0].diff_id = "not-a-digest".into();
+        // Corrupt the on-disk fixture directly; validated publication rejects this metadata.
+        std::fs::write(
+            cache.image_metadata_path(&reference),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let cached = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::IfMissing,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cached.is_none());
+    }
+
+    #[test]
+    fn test_resolve_cached_pull_result_requires_fsmeta_and_vmdk() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/alpine:latest".parse().unwrap();
+        // Create layers but no fsmeta/VMDK.
+        let metadata = write_cached_image_fixture(&cache, &reference, &[false, false]);
+        let manifest_digest = parse_digest(&metadata.manifest_digest);
+        // Manually create layer files without fsmeta/VMDK.
+        for (index, _) in metadata.layers.iter().enumerate() {
+            let diff_id = parse_digest(&format!("sha256:{:064x}", index as u64 + 1000));
+            write_valid_erofs_layer(&cache, &diff_id, b"cached fixture layer");
+        }
+        // Delete fsmeta/VMDK if they were created by the fixture.
+        let _ = std::fs::remove_file(cache.fsmeta_erofs_path(&manifest_digest));
+        let _ = std::fs::remove_file(cache.vmdk_path(&manifest_digest));
+
+        let cached = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::IfMissing,
+                force: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(cached.is_none(), "should not be cached without fsmeta+VMDK");
+    }
+
+    #[tokio::test]
+    async fn test_pull_never_treats_invalid_digest_metadata_as_not_cached() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/httpd:latest".parse().unwrap();
+        let mut metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+        metadata.layers[0].diff_id = "not-a-digest".into();
+        // Corrupt the on-disk fixture directly; validated publication rejects this metadata.
+        std::fs::write(
+            cache.image_metadata_path(&reference),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+
+        let registry = super::Registry::new(Platform::default(), cache).unwrap();
+        let result = registry
+            .pull(
+                &reference,
+                &PullOptions {
+                    pull_policy: PullPolicy::Never,
+                    force: false,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(ImageError::NotCached { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_pull_with_progress_cached_if_missing_emits_only_summary_events() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "docker.io/library/nginx:latest".parse().unwrap();
+        write_cached_image_fixture(&cache, &reference, &[true, true]);
+        let registry = super::Registry::new(Platform::default(), cache).unwrap();
+
+        let (mut handle, task) = registry.pull_with_progress(
+            &reference,
+            &PullOptions {
+                pull_policy: PullPolicy::IfMissing,
+                force: false,
+                ..Default::default()
+            },
+        );
+
+        let result = task.await.unwrap().unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = handle.recv().await {
+            events.push(event);
+        }
+
+        assert!(result.cached);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            &events[0],
+            crate::progress::PullProgress::Resolving { reference: event_ref }
+                if event_ref.as_ref() == reference.to_string()
+        ));
+        assert!(matches!(
+            &events[1],
+            crate::progress::PullProgress::Resolved {
+                reference: event_ref,
+                layer_count: 2,
+                ..
+            } if event_ref.as_ref() == reference.to_string()
+        ));
+        assert!(matches!(
+            &events[2],
+            crate::progress::PullProgress::Complete {
+                reference: event_ref,
+                layer_count: 2,
+            } if event_ref.as_ref() == reference.to_string()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_flat_cache_hit_does_not_require_layered_outputs() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference =
+            "docker.io/library/shared-base:flat".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+        let diff_id = parse_digest(&metadata.layers[0].diff_id);
+        write_valid_erofs_layer(&cache, &diff_id, b"shared flat contents");
+        let manifest_digest = parse_digest(&metadata.manifest_digest);
+        let registry = super::Registry::new(Platform::default(), cache.clone()).unwrap();
+        registry
+            .materialize_flat_rootfs(&manifest_digest, std::slice::from_ref(&diff_id), false)
+            .await
+            .unwrap();
+        std::fs::remove_file(cache.fsmeta_erofs_path(&manifest_digest)).unwrap();
+        std::fs::remove_file(cache.vmdk_path(&manifest_digest)).unwrap();
+
+        let flat = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                materialization: RootfsMaterialization::Flat,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let layered = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                materialization: RootfsMaterialization::Layered,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let all = resolve_cached_pull_result(
+            &cache,
+            &reference,
+            &PullOptions {
+                materialization: RootfsMaterialization::All,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(flat.is_some(), "flat should not depend on fsmeta or VMDK");
+        assert!(layered.is_none(), "layered still requires fsmeta and VMDK");
+        assert!(all.is_none(), "all requires both representations");
+    }
+
+    #[tokio::test]
+    async fn test_flat_cache_hit_rejects_stale_materializer_inputs() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference =
+            "docker.io/library/shared-base:stale-flat".parse().unwrap();
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+        let diff_id = parse_digest(&metadata.layers[0].diff_id);
+        write_valid_erofs_layer(&cache, &diff_id, b"shared flat contents");
+        let manifest_digest = parse_digest(&metadata.manifest_digest);
+        let platform = Platform::default();
+        let registry = super::Registry::new(platform.clone(), cache.clone()).unwrap();
+        let current = registry
+            .materialize_flat_rootfs(&manifest_digest, std::slice::from_ref(&diff_id), false)
+            .await
+            .unwrap();
+        let options = PullOptions {
+            materialization: RootfsMaterialization::Flat,
+            ..Default::default()
+        };
+
+        let mut stale_abi = current.clone();
+        stale_abi.materializer_abi = EXT4_ROOTFS_MATERIALIZER_ABI.saturating_sub(1);
+        cache.write_flat_ref(&manifest_digest, &stale_abi).unwrap();
+        assert!(
+            resolve_cached_pull_result(&cache, &reference, &options)
+                .unwrap()
+                .is_none(),
+            "the synchronous cache path must reject an older materializer ABI"
+        );
+        assert!(
+            resolve_cached_metadata_pull_result_async(
+                &cache,
+                metadata.clone(),
+                RootfsMaterialization::Flat,
+                &platform,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the asynchronous cache path must reject an older materializer ABI"
+        );
+
+        let mut stale_derivation = current;
+        stale_derivation.derivation_digest = format!("sha256:{}", "f".repeat(64));
+        cache
+            .write_flat_ref(&manifest_digest, &stale_derivation)
+            .unwrap();
+        assert!(
+            resolve_cached_pull_result(&cache, &reference, &options)
+                .unwrap()
+                .is_none(),
+            "the synchronous cache path must reject a different derivation"
+        );
+        assert!(
+            resolve_cached_metadata_pull_result_async(
+                &cache,
+                metadata,
+                RootfsMaterialization::Flat,
+                &platform,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "the asynchronous cache path must reject a different derivation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flat_layer_stage_reuses_erofs_and_skips_layered_outputs() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let registry = super::Registry::new(Platform::default(), cache.clone()).unwrap();
+        let reference: oci_client::Reference =
+            "docker.io/library/shared-base:flat".parse().unwrap();
+        let manifest_digest = parse_digest(&format!("sha256:{}", "a".repeat(64)));
+        let diff_id = parse_digest(&format!("sha256:{}", "b".repeat(64)));
+        let descriptor_digest = parse_digest(&format!("sha256:{}", "c".repeat(64)));
+        let tar_path = cache.tar_path(&descriptor_digest);
+        write_valid_erofs_layer(&cache, &diff_id, b"cached shared layer");
+
+        registry
+            .materialize_layer_stage(MaterializeLayersRequest {
+                oci_ref: &reference,
+                manifest_digest: &manifest_digest,
+                layer_descriptors: &[LayerDescriptor {
+                    digest: descriptor_digest,
+                    media_type: Some("application/vnd.oci.image.layer.v1.tar+gzip".into()),
+                    size: Some(1024),
+                }],
+                diff_ids: &[diff_id.to_string()],
+                force: false,
+                materialization: RootfsMaterialization::Flat,
+                progress: None,
+                staged_layers: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(!cache.is_fsmeta_materialized(&manifest_digest));
+        assert!(!cache.is_vmdk_materialized(&manifest_digest));
+        assert!(!tar_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_layered_target_rebuilds_fsmeta_from_cached_erofs() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let registry = super::Registry::new(Platform::default(), cache.clone()).unwrap();
+        let reference: oci_client::Reference =
+            "docker.io/library/shared-base:layered".parse().unwrap();
+        let manifest_digest = parse_digest(&format!("sha256:{}", "d".repeat(64)));
+        let diff_id = parse_digest(&format!("sha256:{}", "e".repeat(64)));
+        let descriptor_digest = parse_digest(&format!("sha256:{}", "f".repeat(64)));
+        let tar_path = cache.tar_path(&descriptor_digest);
+        write_valid_erofs_layer(&cache, &diff_id, b"reused without source tar");
+
+        registry
+            .materialize_layer_stage(MaterializeLayersRequest {
+                oci_ref: &reference,
+                manifest_digest: &manifest_digest,
+                layer_descriptors: &[LayerDescriptor {
+                    digest: descriptor_digest,
+                    media_type: Some("application/vnd.oci.image.layer.v1.tar+gzip".into()),
+                    size: Some(2048),
+                }],
+                diff_ids: &[diff_id.to_string()],
+                force: false,
+                materialization: RootfsMaterialization::Layered,
+                progress: None,
+                staged_layers: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(cache.is_fsmeta_materialized(&manifest_digest));
+        assert!(cache.is_vmdk_materialized(&manifest_digest));
+        assert!(!tar_path.exists());
+
+        let mut reader = erofs::ErofsReader::new(
+            std::fs::File::open(cache.fsmeta_erofs_path(&manifest_digest)).unwrap(),
+        )
+        .unwrap();
+        let file = reader.inode_debug_info("/shared.txt").unwrap();
+        assert_eq!(file.size, b"reused without source tar".len() as u64);
+    }
+
+    #[test]
+    fn test_erofs_metadata_reconstruction_preserves_hardlinks_and_blocks() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("layer.erofs");
+        let id = RegularFileId::new();
+        let node = || {
+            TreeNode::RegularFile(RegularFileNode {
+                id,
+                metadata: InodeMetadata::default(),
+                xattrs: Vec::new(),
+                data: FileData::Memory(b"shared hardlink data".to_vec()),
+                nlink: 2,
+            })
+        };
+        let mut tree = FileTree::new();
+        tree.root.metadata.uid = 42;
+        tree.root.xattrs.push(Xattr {
+            name: b"user.root-test".to_vec(),
+            value: b"preserved".to_vec(),
+        });
+        tree.insert(b"nested/alpha", node()).unwrap();
+        tree.insert(b"nested/beta", node()).unwrap();
+        erofs::write_erofs(&tree, &path).unwrap();
+
+        let (reconstructed, data_map) = read_erofs_layer_metadata(&path).unwrap();
+        let TreeNode::RegularFile(alpha) = reconstructed.get(b"nested/alpha").unwrap() else {
+            panic!("alpha should be a regular file");
+        };
+        let TreeNode::RegularFile(beta) = reconstructed.get(b"nested/beta").unwrap() else {
+            panic!("beta should be a regular file");
+        };
+
+        assert_eq!(alpha.id, beta.id);
+        assert_eq!(reconstructed.root.metadata.uid, 42);
+        assert_eq!(reconstructed.root.xattrs.len(), 1);
+        assert_eq!(reconstructed.root.xattrs[0].name, b"user.root-test");
+        assert_eq!(reconstructed.root.xattrs[0].value, b"preserved");
+        assert_eq!(
+            data_map
+                .file_blocks
+                .get(std::path::Path::new("nested/alpha")),
+            data_map
+                .file_blocks
+                .get(std::path::Path::new("nested/beta"))
+        );
+        assert_eq!(
+            data_map.file_blocks[std::path::Path::new("nested/alpha")].1,
+            b"shared hardlink data".len() as u64
+        );
+    }
+
+    fn write_valid_erofs_layer(cache: &GlobalCache, diff_id: &Digest, contents: &[u8]) {
+        let mut tree = FileTree::new();
+        tree.insert(
+            b"shared.txt",
+            TreeNode::RegularFile(RegularFileNode {
+                id: RegularFileId::new(),
+                metadata: InodeMetadata::default(),
+                xattrs: Vec::new(),
+                data: FileData::Memory(contents.to_vec()),
+                nlink: 1,
+            }),
+        )
+        .unwrap();
+        erofs::write_erofs(&tree, &cache.layer_erofs_path(diff_id)).unwrap();
+    }
+
+    fn write_cached_image_fixture(
+        cache: &GlobalCache,
+        reference: &oci_client::Reference,
+        materialized_layers: &[bool],
+    ) -> CachedImageMetadata {
+        let metadata = CachedImageMetadata {
+            manifest_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            config_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            raw_manifest_json: r#"{"schemaVersion":2,"layers":[]}"#.to_string(),
+            raw_config_json:
+                r#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
+                    .to_string(),
+            config: ImageConfig {
+                env: vec!["PATH=/usr/bin".into()],
+                ..Default::default()
+            },
+            layers: materialized_layers
+                .iter()
+                .enumerate()
+                .map(|(index, _)| CachedLayerMetadata {
+                    digest: layer_digest(index),
+                    media_type: Some("application/vnd.oci.image.layer.v1.tar+gzip".into()),
+                    size_bytes: Some((index as u64 + 1) * 100),
+                    diff_id: format!("sha256:{:064x}", index as u64 + 1000),
+                })
+                .collect(),
+        };
+
+        cache.write_image_metadata(reference, &metadata).unwrap();
+
+        // Create EROFS files keyed by diff_id for cache hit detection.
+        let all_materialized = materialized_layers.iter().all(|m| *m);
+        for (index, materialized) in materialized_layers.iter().copied().enumerate() {
+            let diff_id = parse_digest(&format!("sha256:{:064x}", index as u64 + 1000));
+            if materialized {
+                write_valid_erofs_layer(cache, &diff_id, b"cached fixture layer");
+            }
+        }
+
+        // Create fsmeta + VMDK when all layers are present (fsmerge pipeline).
+        if all_materialized && !materialized_layers.is_empty() {
+            let manifest_digest = parse_digest(&metadata.manifest_digest);
+            erofs::write_erofs(&FileTree::new(), &cache.fsmeta_erofs_path(&manifest_digest))
+                .unwrap();
+            std::fs::write(cache.vmdk_path(&manifest_digest), b"# VMDK fixture").unwrap();
+        }
+
+        metadata
+    }
+
+    fn layer_digest(index: usize) -> String {
+        format!("sha256:{:064x}", index as u64 + 1)
+    }
+
+    fn parse_digest(digest: &str) -> crate::digest::Digest {
+        digest.parse().unwrap()
+    }
+
+    fn image_metadata_path(
+        cache_root: &std::path::Path,
+        reference: &oci_client::Reference,
+    ) -> std::path::PathBuf {
+        use sha2::{Digest as Sha2Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(reference.to_string().as_bytes());
+        cache_root
+            .join("manifests")
+            .join(format!("{}.json", hex::encode(hasher.finalize())))
+    }
+
+    #[test]
+    fn test_registry_builder_default() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let registry = super::Registry::builder(Platform::default(), cache)
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            registry.auth,
+            oci_client::secrets::RegistryAuth::Anonymous
+        ));
+    }
+
+    #[test]
+    fn test_registry_builder_with_auth() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let registry = super::Registry::builder(Platform::default(), cache)
+            .auth(crate::RegistryAuth::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            })
+            .build()
+            .unwrap();
+
+        assert!(matches!(
+            registry.auth,
+            oci_client::secrets::RegistryAuth::Basic(_, _)
+        ));
+    }
+
+    #[test]
+    fn test_registry_builder_with_insecure_registries() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        // Should build without error — we can't inspect ClientConfig directly,
+        // but we verify it doesn't panic or fail.
+        super::Registry::builder(Platform::default(), cache)
+            .add_insecure_registries(vec!["localhost:5000".into()])
+            .build()
+            .unwrap();
+    }
+
+    /// Generate a self-signed CA certificate and return PEM bytes.
+    fn generate_test_ca_pem() -> Vec<u8> {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key_pair).unwrap();
+        cert.pem().into_bytes()
+    }
+
+    #[test]
+    fn test_registry_builder_with_valid_ca_cert() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let pem = generate_test_ca_pem();
+        super::Registry::builder(Platform::default(), cache)
+            .extra_ca_certs(vec![pem])
+            .build()
+            .unwrap();
+    }
+
+    /// Helper to extract the error from a builder result.
+    fn build_err(result: Result<super::Registry, crate::ImageError>) -> crate::ImageError {
+        match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected build to fail"),
+        }
+    }
+
+    #[test]
+    fn test_registry_builder_rejects_invalid_pem() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let bad_pem = b"not valid PEM data".to_vec();
+        let err = build_err(
+            super::Registry::builder(Platform::default(), cache)
+                .extra_ca_certs(vec![bad_pem])
+                .build(),
+        );
+
+        assert!(
+            err.to_string().contains("no certificates found"),
+            "expected 'no certificates found', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_registry_builder_rejects_empty_pem() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let err = build_err(
+            super::Registry::builder(Platform::default(), cache)
+                .extra_ca_certs(vec![Vec::new()])
+                .build(),
+        );
+
+        assert!(
+            err.to_string().contains("no certificates found"),
+            "expected 'no certificates found', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_registry_builder_all_options() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let pem = generate_test_ca_pem();
+        super::Registry::builder(Platform::default(), cache)
+            .auth(crate::RegistryAuth::Basic {
+                username: "user".into(),
+                password: "pass".into(),
+            })
+            .add_insecure_registries(vec!["localhost:5000".into()])
+            .extra_ca_certs(vec![pem])
+            .build()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_registry_new_equals_builder_default() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        // Registry::new() should succeed just like builder().build()
+        super::Registry::new(Platform::default(), cache).unwrap();
+    }
+
+    struct MockOciRegistry {
+        addr: std::net::SocketAddr,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        manifest_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        layer_blob_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockOciRegistry {
+        fn start(required_auth_header: Option<&str>) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+            use sha2::{Digest as Sha2Digest, Sha256};
+
+            let mut tar_bytes = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut tar_bytes);
+                let data = b"hello from private layer\n";
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, "etc/greeting.txt", &data[..])
+                    .unwrap();
+                builder.finish().unwrap();
+            }
+
+            let layer_digest = format!("sha256:{}", hex::encode(Sha256::digest(&tar_bytes)));
+            let config_bytes = serde_json::to_vec(&serde_json::json!({
+                "architecture": Platform::host_linux().arch.to_string(),
+                "os": "linux",
+                "config": {
+                    "Env": ["PATH=/usr/bin"]
+                },
+                "rootfs": {
+                    "type": "layers",
+                    "diff_ids": [layer_digest]
+                }
+            }))
+            .unwrap();
+            let config_digest = format!("sha256:{}", hex::encode(Sha256::digest(&config_bytes)));
+            let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": config_digest,
+                    "size": config_bytes.len()
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                    "digest": layer_digest,
+                    "size": tar_bytes.len()
+                }]
+            }))
+            .unwrap();
+            let manifest_digest =
+                format!("sha256:{}", hex::encode(Sha256::digest(&manifest_bytes)));
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let manifest_requests = Arc::new(AtomicUsize::new(0));
+            let layer_blob_requests = Arc::new(AtomicUsize::new(0));
+
+            let thread_stop = Arc::clone(&stop);
+            let thread_manifest_requests = Arc::clone(&manifest_requests);
+            let thread_layer_blob_requests = Arc::clone(&layer_blob_requests);
+            let required_auth = required_auth_header.map(str::to_owned);
+
+            let handle = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::SeqCst) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    if thread_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") && request.len() < 32 * 1024
+                    {
+                        let Ok(n) = stream.read(&mut buf) else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let req_text = String::from_utf8_lossy(&request);
+                    let mut lines = req_text.lines();
+                    let request_line = lines.next().unwrap_or_default();
+                    let mut parts = request_line.split_whitespace();
+                    let _method = parts.next().unwrap_or_default();
+                    let path = parts.next().unwrap_or_default();
+
+                    let auth_header = lines.find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_owned())
+                    });
+
+                    if let Some(expected_auth) = &required_auth
+                        && auth_header.as_deref() != Some(expected_auth.as_str())
+                    {
+                        let body = br#"{"errors":[{"code":"UNAUTHORIZED","message":"authentication required"}]}"#;
+                        let header = format!(
+                            "HTTP/1.1 401 Unauthorized\r\n\
+                             WWW-Authenticate: Basic realm=\"test-registry\"\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(body);
+                        continue;
+                    }
+
+                    if path == "/v2/" {
+                        let header = "HTTP/1.1 200 OK\r\n\
+                                      Docker-Distribution-Api-Version: registry/2.0\r\n\
+                                      Content-Length: 2\r\n\
+                                      Connection: close\r\n\r\n{}";
+                        let _ = stream.write_all(header.as_bytes());
+                    } else if path.contains("/manifests/") {
+                        thread_manifest_requests.fetch_add(1, Ordering::SeqCst);
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/vnd.oci.image.manifest.v1+json\r\n\
+                             Docker-Content-Digest: {manifest_digest}\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            manifest_bytes.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&manifest_bytes);
+                    } else if path.ends_with(&format!("/blobs/{config_digest}")) {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/vnd.oci.image.config.v1+json\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            config_bytes.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&config_bytes);
+                    } else if path.ends_with(&format!("/blobs/{layer_digest}")) {
+                        thread_layer_blob_requests.fetch_add(1, Ordering::SeqCst);
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/vnd.oci.image.layer.v1.tar\r\n\
+                             Content-Length: {}\r\n\
+                             Connection: close\r\n\r\n",
+                            tar_bytes.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&tar_bytes);
+                    } else {
+                        let header = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(header.as_bytes());
+                    }
+                }
+            });
+
+            Self {
+                addr,
+                stop,
+                manifest_requests,
+                layer_blob_requests,
+                handle: Some(handle),
+            }
+        }
+
+        fn host(&self) -> String {
+            self.addr.to_string()
+        }
+
+        fn reference(&self, repo_and_tag: &str) -> oci_client::Reference {
+            format!("{}/{repo_and_tag}", self.addr).parse().unwrap()
+        }
+
+        fn manifest_requests(&self) -> usize {
+            self.manifest_requests
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn layer_blob_requests(&self) -> usize {
+            self.layer_blob_requests
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn stop(mut self) {
+            self.shutdown();
+        }
+
+        fn shutdown(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    impl Drop for MockOciRegistry {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pull_cached_rejects_authenticated_metadata() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "ghcr.io/acme/secret:v1".parse().unwrap();
+
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+        cache
+            .write_image_metadata_with_provenance_async(
+                &reference,
+                &metadata,
+                CacheAuthProvenance::Authenticated,
+            )
+            .await
+            .unwrap();
+
+        let if_missing = PullOptions {
+            pull_policy: PullPolicy::IfMissing,
+            ..Default::default()
+        };
+        assert!(
+            super::Registry::pull_cached(&cache, &reference, &if_missing)
+                .unwrap()
+                .is_none(),
+            "authenticated cache entry must not be served by pull_cached"
+        );
+        assert!(
+            super::Registry::pull_cached_async(&cache, &reference, &if_missing)
+                .await
+                .unwrap()
+                .is_none(),
+            "authenticated cache entry must not be served by pull_cached_async"
+        );
+
+        let never = PullOptions {
+            pull_policy: PullPolicy::Never,
+            ..Default::default()
+        };
+        let anon_registry = super::Registry::new(Platform::host_linux(), cache.clone()).unwrap();
+        assert!(matches!(
+            anon_registry.pull(&reference, &never).await,
+            Err(ImageError::NotCached { .. })
+        ));
+
+        let other_auth_registry = super::Registry::builder(Platform::host_linux(), cache)
+            .auth(crate::RegistryAuth::Basic {
+                username: "tenant-b".into(),
+                password: "wrong".into(),
+            })
+            .build()
+            .unwrap();
+        assert!(matches!(
+            other_auth_registry.pull(&reference, &never).await,
+            Err(ImageError::NotCached { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_pull_blocks_anonymous_and_wrong_tenant_reuse() {
+        // "tenant-a:secret-a" base64-encoded.
+        let server = MockOciRegistry::start(Some("Basic dGVuYW50LWE6c2VjcmV0LWE="));
+        let reference = server.reference("acme/secret:v1");
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let options = PullOptions {
+            pull_policy: PullPolicy::IfMissing,
+            ..Default::default()
+        };
+
+        // 1. Tenant A pulls with valid credentials.
+        let tenant_a = super::Registry::builder(Platform::host_linux(), cache.clone())
+            .auth(crate::RegistryAuth::Basic {
+                username: "tenant-a".into(),
+                password: "secret-a".into(),
+            })
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        let result = tenant_a.pull(&reference, &options).await.unwrap();
+        assert!(!result.cached);
+        assert_eq!(server.layer_blob_requests(), 1);
+
+        let metadata = cache.read_image_entry(&reference).unwrap().unwrap();
+        assert_eq!(metadata.pull_auth, CacheAuthProvenance::Authenticated);
+        let raw_json = std::fs::read_to_string(cache.image_metadata_path(&reference)).unwrap();
+        assert!(raw_json.contains("\"pull_auth\":\"authenticated\""));
+
+        // 2. Unauthenticated cache fast path must refuse the authenticated entry.
+        assert!(
+            super::Registry::pull_cached_async(&cache, &reference, &options)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // 3. Anonymous pull on the same shared cache must contact the registry and fail.
+        let anon = super::Registry::builder(Platform::host_linux(), cache.clone())
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        assert!(
+            anon.pull(&reference, &options).await.is_err(),
+            "anonymous pull must not reuse cached authenticated image"
+        );
+
+        // 4. Tenant B with wrong credentials on the same shared cache must also fail.
+        let tenant_b = super::Registry::builder(Platform::host_linux(), cache.clone())
+            .auth(crate::RegistryAuth::Basic {
+                username: "tenant-b".into(),
+                password: "wrong".into(),
+            })
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        assert!(
+            tenant_b.pull(&reference, &options).await.is_err(),
+            "other-tenant pull must not reuse cached authenticated image"
+        );
+
+        // 5. Tenant A retrying with valid credentials revalidates the manifest
+        //    against the registry but reuses the cached EROFS layer without re-downloading.
+        let manifests_before = server.manifest_requests();
+        let blobs_before = server.layer_blob_requests();
+        tenant_a.pull(&reference, &options).await.unwrap();
+        assert!(server.manifest_requests() > manifests_before);
+        assert_eq!(server.layer_blob_requests(), blobs_before);
+    }
+
+    #[tokio::test]
+    async fn test_anonymous_pull_warm_cache_hit_skips_registry_client() {
+        let server = MockOciRegistry::start(None);
+        let reference = server.reference("library/public:v1");
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let options = PullOptions {
+            pull_policy: PullPolicy::IfMissing,
+            ..Default::default()
+        };
+
+        let registry = super::Registry::builder(Platform::host_linux(), cache.clone())
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        let cold = registry.pull(&reference, &options).await.unwrap();
+        assert!(!cold.cached);
+
+        let metadata = cache.read_image_entry(&reference).unwrap().unwrap();
+        assert_eq!(metadata.pull_auth, CacheAuthProvenance::Anonymous);
+        let raw_json = std::fs::read_to_string(cache.image_metadata_path(&reference)).unwrap();
+        assert!(
+            raw_json.contains("\"pull_auth\":\"anonymous\""),
+            "anonymous metadata should explicitly record anonymous provenance: {raw_json}"
+        );
+
+        // Shut down the server completely so any network attempt would fail.
+        server.stop();
+
+        // Warm anonymous pull resolves directly from cache without building a Registry client.
+        let (warm, warm_meta) = super::Registry::pull_cached_async(&cache, &reference, &options)
+            .await
+            .unwrap()
+            .expect("public image should hit pull_cached_async");
+        assert!(warm.cached);
+        assert_eq!(warm.manifest_digest, cold.manifest_digest);
+        assert_eq!(warm_meta.manifest_digest, cold.manifest_digest.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_legacy_unknown_provenance_revalidates_once_then_caches_anonymously() {
+        let server = MockOciRegistry::start(None);
+        let reference = server.reference("library/legacy:v1");
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let options = PullOptions {
+            pull_policy: PullPolicy::IfMissing,
+            ..Default::default()
+        };
+
+        let registry = super::Registry::builder(Platform::host_linux(), cache.clone())
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        let initial = registry.pull(&reference, &options).await.unwrap();
+        assert_eq!(server.layer_blob_requests(), 1);
+
+        // Simulate a legacy cache entry written before `pull_auth` existed (field omitted).
+        let legacy = cache.read_image_metadata(&reference).unwrap().unwrap();
+        cache
+            .write_image_metadata_async(&reference, &legacy)
+            .await
+            .unwrap();
+        let raw = std::fs::read_to_string(cache.image_metadata_path(&reference)).unwrap();
+        assert!(!raw.contains("pull_auth"));
+
+        // Unauthenticated fast path refuses unknown provenance.
+        assert!(
+            super::Registry::pull_cached_async(&cache, &reference, &options)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Next anonymous pull revalidates once with the registry (reusing cached layer blobs),
+        // then stamps explicit Anonymous provenance.
+        let manifests_before = server.manifest_requests();
+        let blobs_before = server.layer_blob_requests();
+        let revalidated = registry.pull(&reference, &options).await.unwrap();
+        assert_eq!(revalidated.manifest_digest, initial.manifest_digest);
+        assert!(server.manifest_requests() > manifests_before);
+        assert_eq!(server.layer_blob_requests(), blobs_before);
+        assert_eq!(
+            cache
+                .read_image_entry(&reference)
+                .unwrap()
+                .unwrap()
+                .pull_auth,
+            CacheAuthProvenance::Anonymous
+        );
+
+        // Subsequent anonymous pulls now hit the zero-network cache fast path.
+        server.stop();
+        assert!(
+            super::Registry::pull_cached_async(&cache, &reference, &options)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_digest_and_snapshot_cache_lookups_reject_authenticated_and_unknown_entries() {
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let reference: oci_client::Reference = "ghcr.io/acme/private:v1".parse().unwrap();
+
+        let metadata = write_cached_image_fixture(&cache, &reference, &[true]);
+        let manifest_digest: Digest = metadata.manifest_digest.parse().unwrap();
+
+        for provenance in [
+            CacheAuthProvenance::Authenticated,
+            CacheAuthProvenance::Unknown,
+        ] {
+            cache
+                .write_image_metadata_with_provenance_async(&reference, &metadata, provenance)
+                .await
+                .unwrap();
+
+            assert!(
+                super::Registry::pull_cached_by_manifest_digest(&cache, &manifest_digest)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{provenance:?} metadata must not be served by pull_cached_by_manifest_digest"
+            );
+            assert!(
+                super::Registry::pull_snapshot_cached(
+                    &cache,
+                    std::slice::from_ref(&reference),
+                    &manifest_digest,
+                    RootfsMaterialization::Layered,
+                )
+                .await
+                .unwrap()
+                .is_none(),
+                "{provenance:?} metadata must not be served by pull_snapshot_cached"
+            );
+            assert!(
+                super::Registry::pull_snapshot_cached_allow_restricted(
+                    &cache,
+                    std::slice::from_ref(&reference),
+                    &manifest_digest,
+                    RootfsMaterialization::Layered,
+                )
+                .await
+                .unwrap()
+                .is_some(),
+                "restricted lookup should succeed when caller explicitly owns isolated/bundled cache"
+            );
+        }
+
+        cache.write_image_metadata(&reference, &metadata).unwrap();
+        assert!(
+            super::Registry::pull_cached_by_manifest_digest(&cache, &manifest_digest)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            super::Registry::pull_snapshot_cached(
+                &cache,
+                std::slice::from_ref(&reference),
+                &manifest_digest,
+                RootfsMaterialization::Layered,
+            )
+            .await
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_explicit_credentials_skip_anonymous_cache_entry_in_registry_pull() {
+        let server = MockOciRegistry::start(None);
+        let reference = server.reference("library/shared:v1");
+        let temp = tempdir().unwrap();
+        let cache = GlobalCache::new(temp.path()).unwrap();
+        let options = PullOptions {
+            pull_policy: PullPolicy::IfMissing,
+            ..Default::default()
+        };
+
+        // Populate cache anonymously.
+        let anon = super::Registry::builder(Platform::host_linux(), cache.clone())
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        anon.pull(&reference, &options).await.unwrap();
+        let manifests_after_anon = server.manifest_requests();
+
+        // Pulling with explicit credentials must not shortcut through the anonymous cache entry.
+        let authed = super::Registry::builder(Platform::host_linux(), cache.clone())
+            .auth(crate::RegistryAuth::Basic {
+                username: "tenant-a".into(),
+                password: "secret".into(),
+            })
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        authed.pull(&reference, &options).await.unwrap();
+        assert!(
+            server.manifest_requests() > manifests_after_anon,
+            "authenticated Registry::pull must revalidate against the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_isolated_caches_do_not_leak_across_directories() {
+        let server = MockOciRegistry::start(None);
+        let reference = server.reference("acme/org-image:v1");
+        let temp = tempdir().unwrap();
+        let shared_cache = GlobalCache::new(&temp.path().join("shared")).unwrap();
+        let org_a_cache = GlobalCache::new(&temp.path().join("orgs/org-a")).unwrap();
+        let org_b_cache = GlobalCache::new(&temp.path().join("orgs/org-b")).unwrap();
+        let options = PullOptions {
+            pull_policy: PullPolicy::IfMissing,
+            ..Default::default()
+        };
+
+        let org_a_registry = super::Registry::builder(Platform::host_linux(), org_a_cache.clone())
+            .add_insecure_registries(vec![server.host()])
+            .build()
+            .unwrap();
+        let pulled = org_a_registry.pull(&reference, &options).await.unwrap();
+        assert!(org_a_cache.vmdk_path(&pulled.manifest_digest).exists());
+
+        // Neither org-b nor the shared cache sees org-a's cached image.
+        assert!(
+            super::Registry::pull_cached_async(&org_b_cache, &reference, &options)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::Registry::pull_cached_async(&shared_cache, &reference, &options)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!org_b_cache.vmdk_path(&pulled.manifest_digest).exists());
+        assert!(!shared_cache.vmdk_path(&pulled.manifest_digest).exists());
+    }
+}

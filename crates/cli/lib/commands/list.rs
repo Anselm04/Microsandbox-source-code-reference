@@ -1,0 +1,181 @@
+//! `msb list` command — list all sandboxes.
+
+use clap::Args;
+use microsandbox::ContextKind;
+use microsandbox::sandbox::{SandboxConfig, SandboxRecord, SandboxStatus};
+
+use crate::ui::{self, OutputFormat};
+
+use super::common;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// List all stored sandboxes.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Show only running sandboxes.
+    #[arg(long)]
+    pub running: bool,
+
+    /// Show only stopped sandboxes.
+    #[arg(long)]
+    pub stopped: bool,
+
+    /// Show only sandboxes carrying this label (`KEY=VALUE`). Repeatable;
+    /// AND-matched.
+    #[arg(long)]
+    pub label: Vec<String>,
+
+    /// Output format (json).
+    #[arg(long, value_name = "FORMAT", value_enum)]
+    pub format: Option<OutputFormat>,
+
+    /// Show only sandbox names.
+    #[arg(short, long)]
+    pub quiet: bool,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Execute the `msb list` command.
+pub async fn run(args: ListArgs) -> anyhow::Result<()> {
+    let sandboxes = common::list_sandboxes(&args.label).await?;
+
+    let filtered: Vec<_> = sandboxes
+        .into_iter()
+        .filter(|s| {
+            if args.running {
+                s.status_snapshot() == SandboxStatus::Running
+            } else if args.stopped {
+                s.status_snapshot() == SandboxStatus::Stopped
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if args.format == Some(OutputFormat::Json) {
+        print_json(&filtered)?;
+        return Ok(());
+    }
+
+    if args.quiet {
+        for s in &filtered {
+            println!("{}", s.name());
+        }
+        return Ok(());
+    }
+
+    if filtered.is_empty() {
+        eprintln!("No sandboxes found.");
+        return Ok(());
+    }
+
+    let mut table = ui::Table::new(&["NAME", "IMAGE", "STATUS", "CREATED"]);
+
+    for s in &filtered {
+        let image = extract_image(s.config_json(), s.context_kind());
+        let status = format!("{:?}", s.status_snapshot());
+        let created = s
+            .created_at()
+            .as_ref()
+            .map(ui::format_datetime)
+            .unwrap_or_else(|| "-".to_string());
+
+        table.add_row(vec![
+            s.name().to_string(),
+            image,
+            ui::format_status(&status),
+            created,
+        ]);
+    }
+
+    table.print();
+    Ok(())
+}
+
+/// Extract image name from config JSON.
+fn extract_image(config_json: &str, backend: ContextKind) -> String {
+    if backend == ContextKind::Remote {
+        // Cloud inspection returns a curated projection, not a serialized local
+        // SandboxConfig. Do not fill absent cloud fields with local defaults.
+        return serde_json::from_str::<serde_json::Value>(config_json)
+            .ok()
+            .and_then(|spec| {
+                spec.get("image")
+                    .and_then(|image| image.as_str())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "-".to_string());
+    }
+    serde_json::from_str::<SandboxConfig>(config_json)
+        .ok()
+        .map(|c| match c.spec.image {
+            microsandbox::sandbox::RootfsSource::Oci(ref oci) => oci.reference.clone(),
+            microsandbox::sandbox::RootfsSource::Bind { ref path, .. } => {
+                path.display().to_string()
+            }
+            microsandbox::sandbox::RootfsSource::DiskImage { ref path, .. } => {
+                path.display().to_string()
+            }
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn print_json(sandboxes: &[SandboxRecord]) -> anyhow::Result<()> {
+    let entries: Vec<serde_json::Value> = sandboxes
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name(),
+                "status": format!("{:?}", s.status_snapshot()),
+                "created_at": s.created_at().map(|dt| ui::format_json_datetime(&dt)),
+                "image": extract_image(s.config_json(), s.context_kind()),
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&entries)?);
+    Ok(())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use microsandbox::sandbox::RootfsSource;
+    use microsandbox_types::OciRootfsSource;
+
+    #[test]
+    fn cloud_image_uses_the_curated_inspection_projection() {
+        assert_eq!(
+            extract_image(
+                r#"{"image":"python:3.12","memory_mib":512}"#,
+                ContextKind::Remote
+            ),
+            "python:3.12"
+        );
+        for json in ["null", "{}", r#"{"image":null}"#, "invalid"] {
+            assert_eq!(extract_image(json, ContextKind::Remote), "-");
+        }
+    }
+
+    #[test]
+    fn local_image_keeps_the_local_config_contract() {
+        let mut config = SandboxConfig::default();
+        config.spec.image = RootfsSource::Oci(OciRootfsSource {
+            reference: "node:22".into(),
+            root_disk: None,
+        });
+        assert_eq!(
+            extract_image(&serde_json::to_string(&config).unwrap(), ContextKind::Local),
+            "node:22"
+        );
+    }
+}

@@ -1,0 +1,374 @@
+"""Exception hierarchy for microsandbox errors.
+
+All classes accept a single string message (for FFI from Rust) or their
+documented keyword arguments (for direct Python construction).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from microsandbox._microsandbox import CheckpointRemoveResult, SnapshotRemoveResult
+
+    from .types import ResourceResizeStatus
+
+from microsandbox.types import ChangeState, ServiceErrorReason
+
+
+class MicrosandboxError(Exception):
+    """Base exception for all microsandbox errors.
+
+    ``changed`` is set on every error raised by Service create, update, enable,
+    disable, and remove. ``ChangeState.UNKNOWN`` means the change may have been
+    applied, so get and check the Service; it is ``None`` for other calls.
+    """
+
+    code: str = "microsandbox-error"
+    changed: ChangeState | None = None
+
+
+class RuntimeNotInstalledError(MicrosandboxError):
+    """No complete host runtime pair could be found."""
+    code = "runtime-not-installed"
+
+
+class RuntimeIncompleteError(MicrosandboxError):
+    """The selected host runtime is partial or an explicit binary path is invalid."""
+    code = "runtime-incomplete"
+
+
+class InvalidConfigError(MicrosandboxError):
+    """Invalid sandbox configuration."""
+    code = "invalid-config"
+
+
+class NoDefaultCommandError(MicrosandboxError):
+    """Sandbox configuration does not provide an executable default command."""
+    code = "no-default-command"
+
+
+class CloudHttpError(MicrosandboxError):
+    """Cloud control-plane request failed."""
+    code = "cloud-http"
+
+
+class ModificationNotConfirmedError(MicrosandboxError):
+    """A Cloud change did not complete as asked: saved but not in effect, or result unknown."""
+    code = "modification-not-confirmed"
+
+
+class SandboxNotFoundError(MicrosandboxError):
+    """Sandbox does not exist."""
+    code = "sandbox-not-found"
+
+
+class SandboxNotRunningError(MicrosandboxError):
+    """Sandbox exists but is not running."""
+    code = "sandbox-not-running"
+
+
+class SandboxAlreadyExistsError(MicrosandboxError):
+    """A sandbox with this name already exists."""
+    code = "sandbox-already-exists"
+
+
+class SandboxReplacedError(MicrosandboxError):
+    """A handle's name now refers to a different persisted sandbox."""
+    code = "sandbox-replaced"
+
+
+class SandboxStillRunningError(MicrosandboxError):
+    """Cannot perform operation because sandbox is still running."""
+    code = "sandbox-still-running"
+
+
+class SandboxStopTimedOutError(MicrosandboxError):
+    """Sandbox stop was not observed before its deadline and may still complete."""
+    code = "sandbox-stop-timed-out"
+
+
+class ExecTimeoutError(MicrosandboxError):
+    """Command execution timed out."""
+    code = "exec-timeout"
+
+
+class StopTimeoutError(MicrosandboxError, TimeoutError):
+    """Graceful shutdown did not complete within its budget; no kill was requested."""
+    code = "stop-timeout"
+
+
+class ResizeTimeoutError(MicrosandboxError, TimeoutError):
+    """A live resize did not converge within its budget; completion is unconfirmed.
+
+    The resize is not undone.
+
+    ``status`` is the last observed resize status, empty when no read completed
+    before the deadline.
+    """
+    code = "resize-timeout"
+
+    def __init__(
+        self, message: str, *, status: list[ResourceResizeStatus] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status: list[ResourceResizeStatus] = list(status) if status is not None else []
+
+
+ResizeWaitFailure = Literal[
+    "superseded", "interrupted", "history_unavailable",
+    "invalid_response", "observation_unavailable",
+]
+
+
+class ResizeWaitError(MicrosandboxError):
+    """Observation failed; this does not undo a resize or establish its final outcome."""
+    code = "resize-wait"
+
+    def __init__(
+        self, message: str, *, reason: ResizeWaitFailure, sandbox: str | None = None,
+        operation_id: str | None = None, status: list[ResourceResizeStatus] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.sandbox = sandbox
+        self.operation_id = operation_id
+        self.status = list(status) if status is not None else []
+
+    @classmethod
+    def _from_native(cls, payload: dict) -> ResizeWaitError:
+        return cls(**payload)
+
+
+class ExecFailedError(MicrosandboxError):
+    """Command execution failed."""
+    code = "exec-failed"
+
+
+class FilesystemError(MicrosandboxError):
+    """Filesystem operation failed."""
+    code = "filesystem-error"
+
+
+class PathNotFoundError(MicrosandboxError):
+    """Path does not exist in the sandbox."""
+    code = "path-not-found"
+
+
+class VolumeNotFoundError(MicrosandboxError):
+    """Volume does not exist."""
+    code = "volume-not-found"
+
+
+class ServiceNotFoundError(MicrosandboxError):
+    """No visible Service has this slug."""
+    code = "service-not-found"
+
+
+class ServiceAlreadyExistsError(MicrosandboxError):
+    """The slug is unavailable."""
+    code = "service-already-exists"
+
+
+class ServiceError(MicrosandboxError):
+    """A Service change was refused, or its outcome is unknown.
+
+    Get and check the Service when ``changed`` is ``ChangeState.UNKNOWN``.
+    For ``ServiceErrorReason.OTHER``, ``raw_code``, ``raw_status``, and
+    ``raw_message`` hold the unrecognized refusal's code, HTTP status, and message.
+    ``retry_after`` is the retry delay in seconds returned with the refusal, or ``None``.
+    """
+
+    code = "service"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        slug: str,
+        reason: str,
+        retry_after: float | None,
+        changed: str,
+        raw_code: str | None = None,
+        raw_status: int | None = None,
+        raw_message: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.slug = slug
+        self.reason = ServiceErrorReason(reason)
+        self.retry_after = retry_after
+        self.changed = ChangeState(changed)
+        self.raw_code = raw_code
+        self.raw_status = raw_status
+        self.raw_message = raw_message
+
+
+class ImageNotFoundError(MicrosandboxError):
+    """Image reference could not be resolved."""
+    code = "image-not-found"
+
+
+class ImageInUseError(MicrosandboxError):
+    """Image is still referenced by one or more sandboxes."""
+    code = "image-in-use"
+
+
+class ImagePullFailedError(MicrosandboxError):
+    """Image pull failed."""
+    code = "image-pull-failed"
+
+
+class NetworkPolicyError(MicrosandboxError):
+    """Network policy violation or configuration error."""
+    code = "network-policy-error"
+
+
+class SecretViolationError(MicrosandboxError):
+    """Secret was sent to a disallowed host."""
+    code = "secret-violation"
+
+
+class TlsError(MicrosandboxError):
+    """TLS interception error."""
+    code = "tls-error"
+
+
+class IoError(MicrosandboxError):
+    """I/O error."""
+    code = "io-error"
+
+
+class MetricsDisabledError(MicrosandboxError):
+    """Metrics sampling is disabled for this sandbox."""
+    code = "metrics-disabled"
+
+
+class MetricsUnavailableError(MicrosandboxError):
+    """Metrics are not available for the sandbox's current run."""
+    code = "metrics-unavailable"
+
+
+class UnsupportedOperationError(MicrosandboxError):
+    """The sandbox runtime is too old for the requested operation."""
+    code = "unsupported-operation"
+
+
+class UnsupportedError(MicrosandboxError):
+    """The selected backend does not support a requested feature yet."""
+    code = "unsupported"
+
+
+class SnapshotMigrationError(MicrosandboxError):
+    """A snapshot could not complete its adjacent-release migration."""
+    code = "snapshot-migration"
+
+
+@dataclass(frozen=True)
+class PublishedSnapshotArtifact:
+    """A completed snapshot retained after source recovery failed."""
+
+    kind: Literal["installed", "archive"]
+    path: str
+    snapshot_id: str
+    digest: str
+    # Missing in older producers and archive-only captures. Never inferred from current head.
+    head_update: dict | None = None
+
+
+class SnapshotRemovalRecoveryError(MicrosandboxError):
+    """Removal committed; result is authoritative even though cleanup needs recovery."""
+
+    code = "snapshot-removal-recovery"
+
+    def __init__(self, message: str, result: CheckpointRemoveResult, detail: str) -> None:
+        super().__init__(message)
+        self.result = result
+        self.detail = detail
+
+
+class SnapshotGroupRemovalRecoveryError(MicrosandboxError):
+    """Removal committed; result is authoritative even though cleanup needs recovery."""
+
+    code = "snapshot-group-removal-recovery"
+
+    def __init__(self, message: str, result: SnapshotRemoveResult, detail: str) -> None:
+        super().__init__(message)
+        self.result = result
+        self.detail = detail
+
+
+class SnapshotVerificationError(MicrosandboxError):
+    """Verification failed; report retains every selected member and its findings."""
+    code = "snapshot-verification"
+
+    def __init__(self, message: str, report: dict) -> None:
+        super().__init__(message)
+        self.report = report
+
+
+class SnapshotImportError(MicrosandboxError):
+    """An import failure retaining whether the entire batch committed.
+
+    ``unknown`` requires recovery before assuming either success or no changes.
+    """
+
+    code = "snapshot-import"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        operation_id: str,
+        archives: list[str],
+        group_path: str | None,
+        outcome: Literal["not_committed", "committed", "unknown"],
+        detail: str,
+    ) -> None:
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.archives = list(archives)
+        self.group_path = group_path
+        self.outcome = outcome
+        self.detail = detail
+
+
+class SnapshotSourceRecoveryError(MicrosandboxError):
+    """Capture completed, but the source requires recovery before further use.
+
+    ``artifact`` is set only when the requested snapshot was published. Otherwise,
+    ``checkpoint_path`` identifies the retained runtime-local checkpoint; removing
+    the source may remove it. This error does not imply that ordinary resume is safe.
+    """
+
+    code = "snapshot-source-recovery"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        source_sandbox: str,
+        checkpoint_id: str,
+        checkpoint_root: str,
+        checkpoint_path: str,
+        artifact: dict | None,
+        detail: str,
+        publication_error: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.source_sandbox = source_sandbox
+        self.checkpoint_id = checkpoint_id
+        self.checkpoint_root = checkpoint_root
+        self.checkpoint_path = checkpoint_path
+        self.artifact = PublishedSnapshotArtifact(**artifact) if artifact is not None else None
+        self.detail = detail
+        self.publication_error = publication_error
+
+
+class JobError(MicrosandboxError):
+    """Managed-job refusal or failure. An uncertain launch retains its recoverable ID."""
+
+    def __init__(self, code: str, message: str, job_id: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.job_id = job_id
