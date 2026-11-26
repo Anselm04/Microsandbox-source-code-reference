@@ -7,7 +7,6 @@ f8b798841a4e544abb5207615e00800299c6fd2c  .gitattributes
 0618b4d29670e80d391f3b94dbea080bdd2a104d  .github/ISSUE_TEMPLATE/bug_report.md
 4baa0b841b5f851a5bcd940432c4f5ba9d792a39  .github/ISSUE_TEMPLATE/feature_request.md
 b17316993477cb93a63407e166ff97d02d8e2d16  .github/actions/cache-libkrunfw-kernel/action.yml
-79bb954532292a1599d4dd68d2568d205837f97d  .github/dependabot.yml
 ac8e88f50685cecfad106839b9da442005f03bad  .github/release-inventory.yml
 a13c9cf2c8241386dd9e544ef07fe74f7054e0b4  .github/release.yml
 8ce020eaa03c13b3f556b969acf854cd3a870d99  .gitignore

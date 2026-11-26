@@ -1,3 +1,4 @@
+.github/dependabot.yml
 .github/workflows/apt-mirrors.yml
 .github/workflows/audit.yml
 .github/workflows/check-platform.yml
